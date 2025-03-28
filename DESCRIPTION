@@ -1,0 +1,24 @@
+Package: MIAnalysis
+Title: Multiple imputation Analysis
+Version: 0.1.0
+Authors@R: 
+    person("Samuel", "Mailhot-Larouche", , "mais5340@usherbrooke.ca", role = c("aut", "cre"))
+Description: Tools for multiple imputation analysis, including functions for 
+    estimation, model performance evaluation, and model comparison.
+License: MIT
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Imports: 
+    dplyr,
+    MASS,
+    mice,
+    rlang,
+    survival,
+    splines,
+    Hmisc,
+    stats
+Suggests: 
+    rms,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
