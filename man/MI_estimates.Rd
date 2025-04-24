@@ -2,49 +2,82 @@
 % Please edit documentation in R/MI_estimates.R
 \name{MI_estimates}
 \alias{MI_estimates}
-\title{Compute Adjusted Risk Ratios (aRR) or Other Estimates for Multiple Imputed Data}
+\title{Compute Estimates for Multiple Imputed Data}
 \usage{
 MI_estimates(
   data,
-  variables,
+  outcome_var,
+  predictor_vars,
   imp_col = ".imp",
-  followup_col = NULL,
-  trial_col = NULL,
-  trial_factor = NULL,
-  offset_FU = NULL,
   imp_n = NULL,
   model_type = "nb",
-  family = NULL,
-  custom_model_func = NULL
+  followup_offset = "No",
+  followup_col = NULL,
+  trial_factor = "No",
+  trial_col = NULL,
+  time_col = NULL,
+  event_col = NULL,
+  formula_string = NULL,
+  highlight_interactions = TRUE,
+  spline_terms = NULL,
+  poly_terms = NULL,
+  include_spline_terms = FALSE,
+  include_poly_terms = TRUE
 )
 }
 \arguments{
 \item{data}{A data frame containing the imputed dataset.}
 
-\item{variables}{A vector of variable names to include in the model.}
+\item{outcome_var}{The dependent variable for GLM models.}
+
+\item{predictor_vars}{A vector of predictor variables to include in the model. Can include interaction terms with : notation.}
 
 \item{imp_col}{The column name indicating imputation indices (default is ".imp").}
 
-\item{followup_col}{The column representing follow-up duration (optional).}
+\item{imp_n}{Number of imputations (if NULL, it is detected automatically).}
 
-\item{trial_col}{The column for trial factor adjustment (optional).}
+\item{model_type}{The model type:
+\itemize{
+\item "nb" for Negative Binomial regression
+\item "lm" for Linear regression
+\item "bin" for Logistic regression (binomial family)
+\item "poisson" for Poisson regression
+\item "gamma" for Gamma regression
+\item "quasipoisson" for Overdispersed Poisson regression
+\item "quasibinomial" for Overdispersed logistic regression
+\item "cox" for Cox Proportional Hazards regression
+}}
+
+\item{followup_offset}{Whether to include offset for follow-up duration ("Yes" or "No").}
+
+\item{followup_col}{The column representing follow-up duration (optional, required if followup_offset = "Yes").}
 
 \item{trial_factor}{Whether to include trial as a factor ("Yes" or "No").}
 
-\item{offset_FU}{Whether to include offset for follow-up duration ("Yes" or "No").}
+\item{trial_col}{The column for trial factor adjustment (optional).}
 
-\item{imp_n}{Number of imputations (if NULL, it is detected automatically).}
+\item{time_col}{The time variable for Cox regression (only required if model_type = "cox").}
 
-\item{model_type}{The model type ("nb" for negative binomial, "glm", or "custom").}
+\item{event_col}{The event variable for Cox regression (only required if model_type = "cox").}
 
-\item{family}{The family for GLM models (e.g., "binomial", "poisson", etc.).}
+\item{formula_string}{Optional custom formula string. If provided, overrides the formula created from predictor_vars.}
 
-\item{custom_model_func}{A custom function for fitting a model (if needed).}
+\item{highlight_interactions}{Whether to flag interaction terms in the output (default: TRUE).}
+
+\item{spline_terms}{A named list to specify variables to be modeled with restricted cubic splines. Each element should be a list with 'var' (variable name) and 'knots' (number of knots or explicit knot positions).}
+
+\item{poly_terms}{A named list to specify variables to be modeled with polynomial terms. Each element should be a list with 'var' (variable name) and 'degree' (2 for quadratic, 3 for cubic).}
+
+\item{include_spline_terms}{Whether to include the individual spline terms in the output (default: FALSE).}
+
+\item{include_poly_terms}{Whether to include the individual polynomial terms in the output (default: TRUE).}
 }
 \value{
-A data frame with estimates, confidence intervals, and p-values.
+A data frame with model estimates, confidence intervals, and p-values.
+If the model type supports exponentiation, exponentiated estimates (e.g., odds ratios, rate ratios, hazard ratios) are provided.
 }
 \description{
-This function estimates adjusted risk ratios (aRR) using negative binomial regression
-across multiple imputations and applies Rubin’s Rules for pooling results.
+This function fits statistical models to multiply imputed datasets and pools the results using Rubin's Rules.
+It supports various regression models, including negative binomial, logistic, Poisson, linear, and Cox regression.
+Enhanced to handle interaction terms, restricted cubic splines (rcs), and polynomial terms.
 }

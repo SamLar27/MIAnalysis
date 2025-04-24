@@ -390,12 +390,11 @@ MI_estimates <- function(data,
   # Determine if exponentiation is needed
   exp_required <- model_type %in% c("nb", "bin", "poisson", "quasipoisson", "quasibinomial", "cox")
 
-  # Construct final results table, dynamically removing terms based on trial_col and spline terms
   Results_multivariate_analysis <- summary_pool %>%
     mutate(exp_estimate = exp(estimate),
            exp_CI95_lower = exp(`2.5 %`),
            exp_CI95_upper = exp(`97.5 %`)) %>%
-    select(term, estimate, `2.5 %`, `97.5 %`, exp_estimate, exp_CI95_lower, exp_CI95_upper, p.value)
+    select(term, estimate, std.error, `2.5 %`, `97.5 %`, exp_estimate, exp_CI95_lower, exp_CI95_upper, p.value)
 
   # Filter out trial terms if needed
   if (!is.null(trial_col)) {
