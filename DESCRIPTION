@@ -1,6 +1,6 @@
 Package: MIAnalysis
 Title: Multiple imputation Analysis
-Version: 0.1.0
+Version: 0.2.0
 Authors@R: 
     person("Samuel", "Mailhot-Larouche", , "mais5340@usherbrooke.ca", role = c("aut", "cre"))
 Description: Tools for multiple imputation analysis, including functions for 
