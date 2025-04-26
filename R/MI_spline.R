@@ -191,9 +191,9 @@ MI_spline <- function(data,
     expanded_covariables <- unlist(lapply(covariables, expand_terms))
     expanded_covariables <- unique(expanded_covariables)
 
-    # Helper function to extract variable names from spline terms
+    # Helper function to extract variable names from spline terms and polynomial
     extract_variables_cov <- function(term) {
-      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term)) {
+      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term) || grepl("^poly\\(", term)) {
         inside <- sub("^[^\\(]+\\(([^,]+),.*$", "\\1", term)
         return(trimws(inside))
       } else {
@@ -325,7 +325,7 @@ MI_spline <- function(data,
   if (!is.null(expanded_covariables)) {
     # Helper to extract the variable name from rcs(...) or bs(...) if needed
     extract_variables_cov <- function(term) {
-      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term)) {
+      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term) || grepl("^poly\\(", term)) {
         inside <- sub("^[^\\(]+\\(([^,]+),.*$", "\\1", term)
         return(trimws(inside))
       } else {

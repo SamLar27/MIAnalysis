@@ -185,7 +185,7 @@ MI_model_performance <- function(data,
 
     # Helper function to extract variables from a term
     extract_variables <- function(term) {
-      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term)) {
+      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term) || grepl("^poly\\(", term)) {
         inside <- sub("^[^\\(]+\\(([^,]+),.*$", "\\1", term)
         return(trimws(inside))
       } else {
@@ -365,6 +365,18 @@ MI_model_performance <- function(data,
     terms <- trimws(terms)
     # Find terms containing "poly("
     poly_terms_detected <- terms[grepl("poly\\(", terms)]
+  }
+
+  # Fix extraction of degrees in polynomial terms (safe parsing)
+  extract_degree <- function(poly_term) {
+    degree_match <- regmatches(poly_term, regexpr("degree\\s*=\\s*[0-9]+", poly_term))
+    if (length(degree_match) > 0 && nchar(degree_match) > 0) {
+      degree_val <- as.numeric(gsub("degree\\s*=\\s*", "", degree_match))
+      if (is.na(degree_val)) degree_val <- 2  # fallback if parsing failed
+    } else {
+      degree_val <- 2  # default degree
+    }
+    return(degree_val)
   }
 
   model_formula <- stats::as.formula(formula_string)

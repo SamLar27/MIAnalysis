@@ -216,7 +216,7 @@ MI_estimates <- function(data,
 
     # Validate that all variables involved exist in data
     extract_variables <- function(term) {
-      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term)) {
+      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term) || grepl("^poly\\(", term)) {
         inside <- sub("^[^\\(]+\\(([^,]+),.*$", "\\1", term)
         return(trimws(inside))
       } else {
@@ -730,7 +730,12 @@ MI_estimates <- function(data,
           if (grepl("poly\\(", poly_term)) {
             var_name <- gsub("poly\\(([^,]+),.*", "\\1", poly_term)
             var_name <- trimws(var_name)
-            degree <- as.numeric(gsub(".*degree = ([0-9]+).*", "\\1", poly_term))
+            degree_match <- regmatches(poly_term, regexpr("degree\\s*=\\s*[0-9]+", poly_term))
+            if (length(degree_match) > 0) {
+              degree <- as.numeric(gsub("degree\\s*=\\s*", "", degree_match))
+            } else {
+              degree <- 2  # Default to degree 2 if not found
+            }
             # Check for each possible polynomial component
             for (d in 1:degree) {
               if (grepl(paste0("poly\\(", var_name, ".*\\)", d), t)) return(TRUE)
