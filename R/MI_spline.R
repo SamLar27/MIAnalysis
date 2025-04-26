@@ -1,8 +1,8 @@
-#' Create Spline Plots from Multiple Imputed Data
+#' Create Spline Plots from Multiple Imputed Data (with Random Effects Support)
 #'
 #' This function fits restricted cubic spline models to multiply imputed datasets and creates
 #' visualization of the relationships between a continuous predictor and an outcome, with optional
-#' stratification by subgroups.
+#' stratification by subgroups. The function now supports random effects models.
 #'
 #' @param data A data frame containing the imputed dataset.
 #' @param outcome_var The dependent variable for the model.
@@ -18,6 +18,8 @@
 #' @param trial_col The column for trial factor adjustment (required if trial_factor = "Yes").
 #' @param time_col The time variable for Cox regression (only required if model_type = "cox").
 #' @param event_col The event variable for Cox regression (only required if model_type = "cox").
+#' @param random_intercept Whether to include a random intercept in the model ("Yes" or "No").
+#' @param random_intercept_var The grouping variable for the random intercept (required if random_intercept = "Yes").
 #' @param plot_options List of options for plot customization.
 #' @param subgroup_as_factor Whether to convert subgroups to factors (default is TRUE).
 #' @param subgroup_labels Optional labels for subgroup levels.
@@ -33,6 +35,9 @@
 #' @importFrom rms rcs
 #' @importFrom ggplot2 ggplot aes_string geom_line geom_ribbon xlab ylab labs scale_x_log10 scale_x_continuous scale_y_continuous coord_cartesian scale_color_manual scale_fill_manual scale_linetype_manual guides guide_legend facet_wrap theme_minimal element_rect element_text margin element_blank element_line unit annotate
 #' @importFrom dplyr %>%
+#' @importFrom lme4 lmer glmer fixef ranef
+#' @importFrom glmmTMB glmmTMB
+#' @importFrom coxme coxme
 #' @export
 MI_spline <- function(data,
                       outcome_var,
@@ -48,6 +53,8 @@ MI_spline <- function(data,
                       trial_col = NULL,
                       time_col = NULL,
                       event_col = NULL,
+                      random_intercept = "No",  # Added parameter
+                      random_intercept_var = NULL,  # Added parameter
                       plot_options = NULL,
                       subgroup_as_factor = TRUE,
                       subgroup_labels = NULL,
@@ -60,9 +67,26 @@ MI_spline <- function(data,
   requireNamespace("ggplot2", quietly = TRUE)
   requireNamespace("dplyr", quietly = TRUE)
 
+  # Load packages for random effects models if needed
+  if (random_intercept == "Yes") {
+    requireNamespace("lme4", quietly = TRUE)
+
+    if (model_type == "nb") {
+      if (!requireNamespace("glmmTMB", quietly = TRUE)) {
+        warning("Package 'glmmTMB' not available. Using lme4 with Poisson family as approximation for negative binomial with random effects.")
+      }
+    }
+
+    if (model_type == "cox") {
+      if (!requireNamespace("coxme", quietly = TRUE)) {
+        stop("Package 'coxme' is required for Cox models with random effects.")
+      }
+    }
+  }
+
   # Input validation
-  if (!model_type %in% c("nb", "poisson", "cox", "logistic")) {
-    stop("model_type must be one of 'nb', 'poisson', 'cox', or 'logistic'")
+  if (!model_type %in% c("nb", "poisson", "cox", "logistic", "lm")) {
+    stop("model_type must be one of 'nb', 'poisson', 'cox', 'logistic', or 'lm'")
   }
 
   if (followup_offset == "Yes" && is.null(followup_col)) {
@@ -75,6 +99,19 @@ MI_spline <- function(data,
 
   if (model_type == "cox" && (is.null(time_col) || is.null(event_col))) {
     stop("time_col and event_col must be provided for Cox models")
+  }
+
+  # Validate random intercept parameters
+  if (!random_intercept %in% c("Yes", "No")) {
+    stop("random_intercept must be either 'Yes' or 'No'")
+  }
+
+  if (random_intercept == "Yes" && is.null(random_intercept_var)) {
+    stop("If random_intercept = 'Yes', random_intercept_var must be provided")
+  }
+
+  if (random_intercept == "Yes" && !random_intercept_var %in% names(data)) {
+    stop("random_intercept_var not found in data")
   }
 
   # Validate prediction_range parameter
@@ -148,24 +185,59 @@ MI_spline <- function(data,
     offset_str <- paste0(" + offset(log(", followup_col, "))")
   }
 
+  # Add random intercept if requested
+  random_effect_str <- ""
+  if (random_intercept == "Yes") {
+    random_effect_str <- paste0(" + (1 | ", random_intercept_var, ")")
+  }
+
   # Build the complete formula
-  formula_str <- paste0(outcome_var, " ~ ", spline_term, covariates_str, trial_str, offset_str)
+  if (model_type == "cox") {
+    # Cox models need a different formula structure
+    formula_str <- paste0("Surv(", time_col, ", ", event_col, ") ~ ",
+                          spline_term, covariates_str, trial_str, random_effect_str)
+  } else {
+    formula_str <- paste0(outcome_var, " ~ ", spline_term, covariates_str,
+                          trial_str, offset_str, random_effect_str)
+  }
+
   formula_obj <- as.formula(formula_str)
 
-  # Fit the model based on the specified type
+  # Fit the model based on the specified type and random effects
   model <- NULL
-  if (model_type == "nb") {
-    requireNamespace("MASS", quietly = TRUE)
-    model <- MASS::glm.nb(formula_obj, data = Data_Subset)
-  } else if (model_type == "poisson") {
-    model <- glm(formula_obj, family = poisson(link = "log"), data = Data_Subset)
-  } else if (model_type == "logistic") {
-    model <- glm(formula_obj, family = binomial(link = "logit"), data = Data_Subset)
-  } else if (model_type == "cox") {
-    requireNamespace("survival", quietly = TRUE)
-    formula_cox <- as.formula(paste0("Surv(", time_col, ", ", event_col, ") ~ ",
-                                     spline_term, covariates_str, trial_str))
-    model <- survival::coxph(formula_cox, data = Data_Subset)
+  if (random_intercept == "Yes") {
+    # Models with random effects
+    if (model_type == "nb") {
+      if (requireNamespace("glmmTMB", quietly = TRUE)) {
+        model <- glmmTMB::glmmTMB(formula_obj, family = glmmTMB::nbinom2, data = Data_Subset)
+      } else {
+        warning("Using Poisson mixed model as approximation for negative binomial.")
+        model <- lme4::glmer(formula_obj, family = poisson(link = "log"), data = Data_Subset)
+      }
+    } else if (model_type == "poisson") {
+      model <- lme4::glmer(formula_obj, family = poisson(link = "log"), data = Data_Subset)
+    } else if (model_type == "logistic") {
+      model <- lme4::glmer(formula_obj, family = binomial(link = "logit"), data = Data_Subset)
+    } else if (model_type == "lm") {
+      model <- lme4::lmer(formula_obj, data = Data_Subset)
+    } else if (model_type == "cox") {
+      model <- coxme::coxme(formula_obj, data = Data_Subset)
+    }
+  } else {
+    # Standard models without random effects
+    if (model_type == "nb") {
+      requireNamespace("MASS", quietly = TRUE)
+      model <- MASS::glm.nb(formula_obj, data = Data_Subset)
+    } else if (model_type == "poisson") {
+      model <- glm(formula_obj, family = poisson(link = "log"), data = Data_Subset)
+    } else if (model_type == "logistic") {
+      model <- glm(formula_obj, family = binomial(link = "logit"), data = Data_Subset)
+    } else if (model_type == "lm") {
+      model <- glm(formula_obj, family = gaussian(), data = Data_Subset)
+    } else if (model_type == "cox") {
+      requireNamespace("survival", quietly = TRUE)
+      model <- survival::coxph(formula_obj, data = Data_Subset)
+    }
   }
 
   # Create prediction data
@@ -229,35 +301,116 @@ MI_spline <- function(data,
     pred_data[[followup_col]] <- 365  # 1 year follow-up for standardized predictions
   }
 
+  # 6. Add random effect variable but set to reference level for population-level predictions
+  if (random_intercept == "Yes") {
+    # For prediction with mixed models, we use the most common level or an "average" random effect
+    # This is for population-level (marginal) predictions
+    pred_data[[random_intercept_var]] <- names(which.max(table(Data_Subset[[random_intercept_var]])))
+  }
+
   # Get predictions with standard errors
   preds <- NULL
-  if (model_type == "cox") {
-    # For Cox models, we need to use survfit to get predictions
-    preds <- list()
-    preds$fit <- predict(model, newdata = pred_data, type = "lp")
-    preds$se.fit <- rep(NA, length(preds$fit))  # Cox models don't provide SE directly
 
-    # Transform to hazard ratio
-    pred_data$prediction <- exp(preds$fit)
-    pred_data$lower_ci <- NA
-    pred_data$upper_ci <- NA
-  } else {
-    # For GLMs, we can get predictions with SEs
-    preds <- predict(model, newdata = pred_data, type = "link", se.fit = TRUE)
+  # Function to handle predictions from mixed models
+  get_mixed_model_predictions <- function(model, newdata, type = "link") {
+    if (inherits(model, "merMod")) {
+      # For lme4 models, use predict with re.form=NA for population-level predictions
+      preds <- predict(model, newdata = newdata, re.form = NA, type = type)
+      # For standard errors, we need a more complex approach since predict doesn't provide SEs
+      # We'll use a bootstrap approach or approximate method based on the fixed effects variance-covariance matrix
 
-    # Transform to response scale and calculate CIs
-    if (model_type %in% c("nb", "poisson")) {
-      # For count models: exponentiate for rate/count
+      # Get the fixed-effects design matrix for new data
+      mm <- model.matrix(formula(model, fixed.only = TRUE), newdata)
+
+      # Get the variance-covariance matrix of fixed effects
+      vcov_fixed <- as.matrix(vcov(model))
+
+      # Calculate standard errors for fixed effects predictions
+      se_fixed <- sqrt(diag(mm %*% vcov_fixed %*% t(mm)))
+
+      return(list(fit = preds, se.fit = se_fixed))
+    } else if (inherits(model, "glmmTMB")) {
+      # For glmmTMB models
+      preds <- predict(model, newdata = newdata, re.form = NA, type = type, se.fit = TRUE)
+      return(list(fit = preds$fit, se.fit = preds$se.fit))
+    } else if (inherits(model, "coxme")) {
+      # For coxme models, predict linear predictor
+      preds <- predict(model, newdata = newdata, type = "lp")
+      # Standard error not directly available, use fixed effects se as approximation
+      mm <- model.matrix(formula(model, fixed.only = TRUE), newdata)
+      vcov_fixed <- as.matrix(vcov(model))
+      se_fixed <- sqrt(diag(mm %*% vcov_fixed %*% t(mm)))
+
+      return(list(fit = preds, se.fit = se_fixed))
+    }
+  }
+
+  # Get predictions based on model type
+  if (random_intercept == "Yes") {
+    # For mixed models
+    if (model_type == "cox") {
+      # For Cox mixed models
+      preds <- get_mixed_model_predictions(model, pred_data)
+
+      # Transform to hazard ratio
       pred_data$prediction <- exp(preds$fit)
       pred_data$lower_ci <- exp(preds$fit - 1.96 * preds$se.fit)
       pred_data$upper_ci <- exp(preds$fit + 1.96 * preds$se.fit)
-    } else if (model_type == "logistic") {
-      # For logistic: inverse logit for probability
-      pred_data$prediction <- plogis(preds$fit)
-      pred_data$lower_ci <- plogis(preds$fit - 1.96 * preds$se.fit)
-      pred_data$upper_ci <- plogis(preds$fit + 1.96 * preds$se.fit)
+    } else {
+      # For other mixed models
+      preds <- get_mixed_model_predictions(model, pred_data)
+
+      # Transform to response scale
+      if (model_type %in% c("nb", "poisson")) {
+        # For count models: exponentiate for rate/count
+        pred_data$prediction <- exp(preds$fit)
+        pred_data$lower_ci <- exp(preds$fit - 1.96 * preds$se.fit)
+        pred_data$upper_ci <- exp(preds$fit + 1.96 * preds$se.fit)
+      } else if (model_type == "logistic") {
+        # For logistic: inverse logit for probability
+        pred_data$prediction <- plogis(preds$fit)
+        pred_data$lower_ci <- plogis(preds$fit - 1.96 * preds$se.fit)
+        pred_data$upper_ci <- plogis(preds$fit + 1.96 * preds$se.fit)
+      } else if (model_type == "lm") {
+        # For linear models: no transformation
+        pred_data$prediction <- preds$fit
+        pred_data$lower_ci <- preds$fit - 1.96 * preds$se.fit
+        pred_data$upper_ci <- preds$fit + 1.96 * preds$se.fit
+      }
+    }
+  } else {
+    # Original code for standard models
+    if (model_type == "cox") {
+      # For Cox models
+      preds <- list()
+      preds$fit <- predict(model, newdata = pred_data, type = "lp")
+      preds$se.fit <- rep(NA, length(preds$fit))  # Cox models don't provide SE directly
+
+      # Transform to hazard ratio
+      pred_data$prediction <- exp(preds$fit)
+      pred_data$lower_ci <- NA
+      pred_data$upper_ci <- NA
+    } else {
+      # For GLMs
+      preds <- predict(model, newdata = pred_data, type = "link", se.fit = TRUE)
+
+      # Transform to response scale
+      if (model_type %in% c("nb", "poisson")) {
+        pred_data$prediction <- exp(preds$fit)
+        pred_data$lower_ci <- exp(preds$fit - 1.96 * preds$se.fit)
+        pred_data$upper_ci <- exp(preds$fit + 1.96 * preds$se.fit)
+      } else if (model_type == "logistic") {
+        pred_data$prediction <- plogis(preds$fit)
+        pred_data$lower_ci <- plogis(preds$fit - 1.96 * preds$se.fit)
+        pred_data$upper_ci <- plogis(preds$fit + 1.96 * preds$se.fit)
+      } else if (model_type == "lm") {
+        pred_data$prediction <- preds$fit
+        pred_data$lower_ci <- preds$fit - 1.96 * preds$se.fit
+        pred_data$upper_ci <- preds$fit + 1.96 * preds$se.fit
+      }
     }
   }
+
   # ============= CALCULATE DERIVATIVES IF REQUESTED =============
   derivative_data <- NULL
 
@@ -322,6 +475,11 @@ MI_spline <- function(data,
     # Add follow-up time for offset if needed
     if (followup_offset == "Yes") {
       deriv_data[[followup_col]] <- 365  # Same as in prediction
+    }
+
+    # Add random intercept variable if needed
+    if (random_intercept == "Yes") {
+      deriv_data[[random_intercept_var]] <- pred_data[[random_intercept_var]][1]
     }
 
     # Use finite differences to estimate derivatives
