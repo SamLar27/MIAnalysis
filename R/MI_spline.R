@@ -167,10 +167,37 @@ MI_spline <- function(data,
     spline_term <- paste0(spline_term, " * ", subgroups)
   }
 
-  # Add covariates if provided
-  covariates_str <- ""
+  # Expand covariables if interaction '*' is used
+  expand_terms <- function(term) {
+    if (grepl("\\*", term)) {
+      vars_split <- unlist(strsplit(term, "\\*"))
+      vars_split <- trimws(vars_split)
+      all_combinations <- lapply(1:length(vars_split), function(k) {
+        combn(vars_split, k, FUN = function(x) paste(x, collapse = ":"))
+      })
+      unlist(all_combinations)
+    } else {
+      term
+    }
+  }
+
+  expanded_covariables <- NULL
   if (!is.null(covariables)) {
-    covariates_str <- paste0(" + ", paste(covariables, collapse = " + "))
+    expanded_covariables <- unlist(lapply(covariables, expand_terms))
+    expanded_covariables <- unique(expanded_covariables)
+
+    # Validate that all base variables exist in data
+    all_base_vars_cov <- unique(unlist(strsplit(gsub(":", "*", expanded_covariables), "\\*")))
+    all_base_vars_cov <- trimws(all_base_vars_cov)
+
+    missing_vars_cov <- all_base_vars_cov[!all_base_vars_cov %in% names(Data_Subset)]
+    if (length(missing_vars_cov) > 0) {
+      stop(paste("Covariates not found in data:", paste(missing_vars_cov, collapse = ", ")))
+    }
+
+    covariates_str <- paste0(" + ", paste(expanded_covariables, collapse = " + "))
+  } else {
+    covariates_str <- ""
   }
 
   # Add trial factor if requested
@@ -279,8 +306,8 @@ MI_spline <- function(data,
   }
 
   # 3. Add median/mode values for covariates
-  if (!is.null(covariables)) {
-    for (cov in covariables) {
+  if (!is.null(expanded_covariables)) {
+    for (cov in unique(unlist(strsplit(gsub(":", "*", expanded_covariables), "\\*")))) {
       if (cov %in% colnames(Data_Subset)) {
         if (is.factor(Data_Subset[[cov]])) {
           pred_data[[cov]] <- as.factor(names(which.max(table(Data_Subset[[cov]]))))
