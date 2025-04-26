@@ -192,37 +192,30 @@ MI_estimates <- function(data,
 
   # Check if formula_string is provided, otherwise validate predictor_vars
   if (is.null(formula_string)) {
-    # Check for interaction terms in predictor_vars
-    has_interactions <- any(grepl(":", predictor_vars))
+    # Expand predictor_vars if interaction '*' is used
+    expand_terms <- function(term) {
+      if (grepl("\\*", term)) {
+        vars_split <- unlist(strsplit(term, "\\*"))
+        vars_split <- trimws(vars_split)
+        all_combinations <- lapply(1:length(vars_split), function(k) {
+          combn(vars_split, k, FUN = function(x) paste(x, collapse = ":"))
+        })
+        unlist(all_combinations)
+      } else {
+        term
+      }
+    }
 
-    if (!has_interactions) {
-      # Regular variable check if no interactions
-      if (!all(predictor_vars %in% names(data))) {
-        missing_vars <- predictor_vars[!predictor_vars %in% names(data)]
-        stop(paste("Predictor variables not found in data:", paste(missing_vars, collapse = ", ")))
-      }
-    } else {
-      # For interactions, we need to parse them more carefully
-      # Extract all unique variable names from interaction terms
-      all_vars <- character(0)
-      for (term in predictor_vars) {
-        if (grepl(":", term)) {
-          # Split interaction terms
-          interaction_vars <- unlist(strsplit(term, ":"))
-          # Clean up any whitespace
-          interaction_vars <- trimws(interaction_vars)
-          all_vars <- c(all_vars, interaction_vars)
-        } else {
-          all_vars <- c(all_vars, term)
-        }
-      }
-      all_vars <- unique(all_vars)
+    expanded_predictors <- unlist(lapply(predictor_vars, expand_terms))
+    expanded_predictors <- unique(expanded_predictors)
 
-      # Check if all extracted variables exist
-      if (!all(all_vars %in% names(data))) {
-        missing_vars <- all_vars[!all_vars %in% names(data)]
-        stop(paste("Variables not found in data:", paste(missing_vars, collapse = ", ")))
-      }
+    # Validate that all variables involved exist in data
+    all_base_vars <- unique(unlist(strsplit(gsub(":", "*", expanded_predictors), "\\*")))
+    all_base_vars <- trimws(all_base_vars)
+
+    if (!all(all_base_vars %in% names(data))) {
+      missing_vars <- all_base_vars[!all_base_vars %in% names(data)]
+      stop(paste("Variables not found in data:", paste(missing_vars, collapse = ", ")))
     }
   }
 
@@ -343,7 +336,7 @@ MI_estimates <- function(data,
   # Define model formula
   if (is.null(formula_string)) {
     # Combine regular predictors, spline terms, and polynomial terms
-    all_terms <- c(predictor_vars, spline_formula_parts, poly_formula_parts)
+    all_terms <- c(expanded_predictors, spline_formula_parts, poly_formula_parts)
 
     if (model_type == "cox") {
       if (is.null(time_col) || is.null(event_col)) {
@@ -444,10 +437,12 @@ MI_estimates <- function(data,
 
   model_formula <- as.formula(formula_string)
 
+
+
   # Fit models to each imputed dataset
 
   if (random_intercept == "Yes") {
-    # For models with random effects
+    # Approach models with random effects
     models_list <- vector("list", imp_n)
 
     # Fit the model to each imputation
@@ -608,6 +603,8 @@ MI_estimates <- function(data,
       select(term, estimate, `std.error`, `2.5 %`, `97.5 %`, exp_estimate, exp_CI95_lower, exp_CI95_upper, p.value)
   }
 
+  Results_multivariate_analysis$term <- gsub("poly\\(([^,]+), degree = ([0-9]+), raw = TRUE\\)", "poly(\\1, \\2, raw = TRUE)", Results_multivariate_analysis$term)
+
   # Filter out trial terms if needed
   if (!is.null(trial_col)) {
     Results_multivariate_analysis <- Results_multivariate_analysis %>%
@@ -674,6 +671,7 @@ MI_estimates <- function(data,
         filter(!grepl(pattern, term))
     }
   }
+
 
   # Add indicator for interaction terms if requested
   if (highlight_interactions && length(interaction_terms) > 0) {
