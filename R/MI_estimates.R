@@ -562,7 +562,7 @@ MI_estimates <- function(data,
     Results_multivariate_analysis <- pooled_results
 
   } else {
-    # Original approach for non-mixed models
+    # Approach for non-mixed models
     res_comb <- vector("list", length(actual_imps))
     for (i in seq_along(actual_imps)) {
       imp_val <- actual_imps[i]
