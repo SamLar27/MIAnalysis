@@ -194,6 +194,11 @@ MI_estimates <- function(data,
   if (is.null(formula_string)) {
     # Expand predictor_vars if interaction '*' is used
     expand_terms <- function(term) {
+      if (grepl("^rcs\\(|^bs\\(", term)) {
+        # If it is already a spline function, don't expand
+        return(term)
+      }
+
       if (grepl("\\*", term)) {
         vars_split <- unlist(strsplit(term, "\\*"))
         vars_split <- trimws(vars_split)
@@ -210,8 +215,18 @@ MI_estimates <- function(data,
     expanded_predictors <- unique(expanded_predictors)
 
     # Validate that all variables involved exist in data
+    extract_variables <- function(term) {
+      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term)) {
+        inside <- sub("^[^\\(]+\\(([^,]+),.*$", "\\1", term)
+        return(trimws(inside))
+      } else {
+        return(term)
+      }
+    }
+
     all_base_vars <- unique(unlist(strsplit(gsub(":", "*", expanded_predictors), "\\*")))
     all_base_vars <- trimws(all_base_vars)
+    all_base_vars <- sapply(all_base_vars, extract_variables)
 
     if (!all(all_base_vars %in% names(data))) {
       missing_vars <- all_base_vars[!all_base_vars %in% names(data)]

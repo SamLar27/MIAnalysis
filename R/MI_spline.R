@@ -169,6 +169,11 @@ MI_spline <- function(data,
 
   # Expand covariables if interaction '*' is used
   expand_terms <- function(term) {
+    if (grepl("^rcs\\(", term) || grepl("^bs\\(", term)) {
+      # If the term already starts with rcs( or bs(, do not expand it
+      return(term)
+    }
+
     if (grepl("\\*", term)) {
       vars_split <- unlist(strsplit(term, "\\*"))
       vars_split <- trimws(vars_split)
@@ -186,9 +191,20 @@ MI_spline <- function(data,
     expanded_covariables <- unlist(lapply(covariables, expand_terms))
     expanded_covariables <- unique(expanded_covariables)
 
+    # Helper function to extract variable names from spline terms
+    extract_variables_cov <- function(term) {
+      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term)) {
+        inside <- sub("^[^\\(]+\\(([^,]+),.*$", "\\1", term)
+        return(trimws(inside))
+      } else {
+        return(term)
+      }
+    }
+
     # Validate that all base variables exist in data
     all_base_vars_cov <- unique(unlist(strsplit(gsub(":", "*", expanded_covariables), "\\*")))
     all_base_vars_cov <- trimws(all_base_vars_cov)
+    all_base_vars_cov <- sapply(all_base_vars_cov, extract_variables_cov)
 
     missing_vars_cov <- all_base_vars_cov[!all_base_vars_cov %in% names(Data_Subset)]
     if (length(missing_vars_cov) > 0) {
@@ -307,7 +323,21 @@ MI_spline <- function(data,
 
   # 3. Add median/mode values for covariates
   if (!is.null(expanded_covariables)) {
-    for (cov in unique(unlist(strsplit(gsub(":", "*", expanded_covariables), "\\*")))) {
+    # Helper to extract the variable name from rcs(...) or bs(...) if needed
+    extract_variables_cov <- function(term) {
+      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term)) {
+        inside <- sub("^[^\\(]+\\(([^,]+),.*$", "\\1", term)
+        return(trimws(inside))
+      } else {
+        return(term)
+      }
+    }
+
+    covariate_vars_for_prediction <- unique(unlist(strsplit(gsub(":", "*", expanded_covariables), "\\*")))
+    covariate_vars_for_prediction <- trimws(covariate_vars_for_prediction)
+    covariate_vars_for_prediction <- sapply(covariate_vars_for_prediction, extract_variables_cov)
+
+    for (cov in covariate_vars_for_prediction) {
       if (cov %in% colnames(Data_Subset)) {
         if (is.factor(Data_Subset[[cov]])) {
           pred_data[[cov]] <- as.factor(names(which.max(table(Data_Subset[[cov]]))))
