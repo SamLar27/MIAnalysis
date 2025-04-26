@@ -1,4 +1,4 @@
-#' Create Spline Plots from Multiple Imputed Data (with Random Effects Support)
+#' #' Create Spline Plots from Multiple Imputed Data (with Random Effects Support)
 #'
 #' This function fits restricted cubic spline models to multiply imputed datasets and creates
 #' visualization of the relationships between a continuous predictor and an outcome, with optional
@@ -46,6 +46,7 @@ MI_spline <- function(data,
                       covariables = NULL,
                       knot_n = 4,
                       imp_col = ".imp",
+                      MI_method = "first",
                       model_type = "nb",
                       followup_offset = "No",
                       followup_col = NULL,
@@ -128,7 +129,13 @@ MI_spline <- function(data,
   }
 
   # Select only the first imputation
-  Data_Subset <- subset(data, get(imp_col) == 1)
+  if (MI_method == "first") {
+    Data_Subset <- subset(data, get(imp_col) == 1)
+  } else if (MI_method == "average") {
+    Data_Subset <- data  # Keep all imputations
+  } else {
+    stop("Invalid MI_method. Choose 'first' or 'average'.")
+  }
 
   # Store original subgroup values before conversion, if available
   original_subgroup_values <- NULL
@@ -401,70 +408,139 @@ MI_spline <- function(data,
       return(list(fit = preds, se.fit = se_fixed))
     }
   }
+  # Get predictions with standard errors
+  preds <- NULL
 
-  # Get predictions based on model type
-  if (random_intercept == "Yes") {
-    # For mixed models
-    if (model_type == "cox") {
-      # For Cox mixed models
-      preds <- get_mixed_model_predictions(model, pred_data)
-
-      # Transform to hazard ratio
-      pred_data$prediction <- exp(preds$fit)
-      pred_data$lower_ci <- exp(preds$fit - 1.96 * preds$se.fit)
-      pred_data$upper_ci <- exp(preds$fit + 1.96 * preds$se.fit)
-    } else {
-      # For other mixed models
-      preds <- get_mixed_model_predictions(model, pred_data)
-
-      # Transform to response scale
-      if (model_type %in% c("nb", "poisson")) {
-        # For count models: exponentiate for rate/count
+  # If MI_method = first, keep existing behavior
+  if (MI_method == "first") {
+    if (random_intercept == "Yes") {
+      # Mixed models prediction
+      if (model_type == "cox") {
+        preds <- get_mixed_model_predictions(model, pred_data)
         pred_data$prediction <- exp(preds$fit)
         pred_data$lower_ci <- exp(preds$fit - 1.96 * preds$se.fit)
         pred_data$upper_ci <- exp(preds$fit + 1.96 * preds$se.fit)
-      } else if (model_type == "logistic") {
-        # For logistic: inverse logit for probability
-        pred_data$prediction <- plogis(preds$fit)
-        pred_data$lower_ci <- plogis(preds$fit - 1.96 * preds$se.fit)
-        pred_data$upper_ci <- plogis(preds$fit + 1.96 * preds$se.fit)
-      } else if (model_type == "lm") {
-        # For linear models: no transformation
-        pred_data$prediction <- preds$fit
-        pred_data$lower_ci <- preds$fit - 1.96 * preds$se.fit
-        pred_data$upper_ci <- preds$fit + 1.96 * preds$se.fit
+      } else {
+        preds <- get_mixed_model_predictions(model, pred_data)
+        if (model_type %in% c("nb", "poisson")) {
+          pred_data$prediction <- exp(preds$fit)
+          pred_data$lower_ci <- exp(preds$fit - 1.96 * preds$se.fit)
+          pred_data$upper_ci <- exp(preds$fit + 1.96 * preds$se.fit)
+        } else if (model_type == "logistic") {
+          pred_data$prediction <- plogis(preds$fit)
+          pred_data$lower_ci <- plogis(preds$fit - 1.96 * preds$se.fit)
+          pred_data$upper_ci <- plogis(preds$fit + 1.96 * preds$se.fit)
+        } else if (model_type == "lm") {
+          pred_data$prediction <- preds$fit
+          pred_data$lower_ci <- preds$fit - 1.96 * preds$se.fit
+          pred_data$upper_ci <- preds$fit + 1.96 * preds$se.fit
+        }
+      }
+    } else {
+      # Standard models prediction
+      if (model_type == "cox") {
+        preds <- list()
+        preds$fit <- predict(model, newdata = pred_data, type = "lp")
+        preds$se.fit <- rep(NA, length(preds$fit))
+        pred_data$prediction <- exp(preds$fit)
+        pred_data$lower_ci <- NA
+        pred_data$upper_ci <- NA
+      } else {
+        preds <- predict(model, newdata = pred_data, type = "link", se.fit = TRUE)
+        if (model_type %in% c("nb", "poisson")) {
+          pred_data$prediction <- exp(preds$fit)
+          pred_data$lower_ci <- exp(preds$fit - 1.96 * preds$se.fit)
+          pred_data$upper_ci <- exp(preds$fit + 1.96 * preds$se.fit)
+        } else if (model_type == "logistic") {
+          pred_data$prediction <- plogis(preds$fit)
+          pred_data$lower_ci <- plogis(preds$fit - 1.96 * preds$se.fit)
+          pred_data$upper_ci <- plogis(preds$fit + 1.96 * preds$se.fit)
+        } else if (model_type == "lm") {
+          pred_data$prediction <- preds$fit
+          pred_data$lower_ci <- preds$fit - 1.96 * preds$se.fit
+          pred_data$upper_ci <- preds$fit + 1.96 * preds$se.fit
+        }
       }
     }
-  } else {
-    # Original code for standard models
-    if (model_type == "cox") {
-      # For Cox models
-      preds <- list()
-      preds$fit <- predict(model, newdata = pred_data, type = "lp")
-      preds$se.fit <- rep(NA, length(preds$fit))  # Cox models don't provide SE directly
 
-      # Transform to hazard ratio
-      pred_data$prediction <- exp(preds$fit)
-      pred_data$lower_ci <- NA
-      pred_data$upper_ci <- NA
-    } else {
-      # For GLMs
-      preds <- predict(model, newdata = pred_data, type = "link", se.fit = TRUE)
+  } else if (MI_method == "average") {
+    # For each imputation
+    imputation_ids <- unique(Data_Subset[[imp_col]])
+    all_predictions <- list()
 
-      # Transform to response scale
-      if (model_type %in% c("nb", "poisson")) {
-        pred_data$prediction <- exp(preds$fit)
-        pred_data$lower_ci <- exp(preds$fit - 1.96 * preds$se.fit)
-        pred_data$upper_ci <- exp(preds$fit + 1.96 * preds$se.fit)
-      } else if (model_type == "logistic") {
-        pred_data$prediction <- plogis(preds$fit)
-        pred_data$lower_ci <- plogis(preds$fit - 1.96 * preds$se.fit)
-        pred_data$upper_ci <- plogis(preds$fit + 1.96 * preds$se.fit)
-      } else if (model_type == "lm") {
-        pred_data$prediction <- preds$fit
-        pred_data$lower_ci <- preds$fit - 1.96 * preds$se.fit
-        pred_data$upper_ci <- preds$fit + 1.96 * preds$se.fit
+    for (imp in imputation_ids) {
+      Data_imp <- subset(Data_Subset, get(imp_col) == imp)
+
+      # Refit model
+      if (random_intercept == "Yes") {
+        if (model_type == "nb" && requireNamespace("glmmTMB", quietly = TRUE)) {
+          model_imp <- glmmTMB::glmmTMB(formula_obj, family = glmmTMB::nbinom2, data = Data_imp)
+        } else if (model_type == "poisson") {
+          model_imp <- lme4::glmer(formula_obj, family = poisson(link = "log"), data = Data_imp)
+        } else if (model_type == "logistic") {
+          model_imp <- lme4::glmer(formula_obj, family = binomial(link = "logit"), data = Data_imp)
+        } else if (model_type == "lm") {
+          model_imp <- lme4::lmer(formula_obj, data = Data_imp)
+        } else if (model_type == "cox") {
+          model_imp <- coxme::coxme(formula_obj, data = Data_imp)
+        }
+      } else {
+        if (model_type == "nb") {
+          model_imp <- MASS::glm.nb(formula_obj, data = Data_imp)
+        } else if (model_type == "poisson") {
+          model_imp <- glm(formula_obj, family = poisson(link = "log"), data = Data_imp)
+        } else if (model_type == "logistic") {
+          model_imp <- glm(formula_obj, family = binomial(link = "logit"), data = Data_imp)
+        } else if (model_type == "lm") {
+          model_imp <- glm(formula_obj, family = gaussian(), data = Data_imp)
+        } else if (model_type == "cox") {
+          model_imp <- survival::coxph(formula_obj, data = Data_imp)
+        }
       }
+
+      # Predict
+      if (random_intercept == "Yes") {
+        preds_imp <- get_mixed_model_predictions(model_imp, pred_data)
+      } else {
+        preds_imp <- predict(model_imp, newdata = pred_data, type = "link", se.fit = TRUE)
+      }
+
+      all_predictions[[as.character(imp)]] <- list(
+        fit = if (random_intercept == "Yes") preds_imp$fit else preds_imp$fit,
+        se.fit = if (random_intercept == "Yes") preds_imp$se.fit else preds_imp$se.fit
+      )
+    }
+
+    # Pool predictions
+    n_pred_points <- length(all_predictions[[1]]$fit)
+    mean_fit <- numeric(n_pred_points)
+    mean_var <- numeric(n_pred_points)
+
+    for (i in 1:n_pred_points) {
+      fits_i <- sapply(all_predictions, function(x) x$fit[i])
+      ses_i <- sapply(all_predictions, function(x) x$se.fit[i])
+
+      mean_fit[i] <- mean(fits_i)
+      mean_var[i] <- mean(ses_i^2)
+    }
+
+    # Fill pred_data
+    if (model_type %in% c("nb", "poisson")) {
+      pred_data$prediction <- exp(mean_fit)
+      pred_data$lower_ci <- exp(mean_fit - 1.96 * sqrt(mean_var))
+      pred_data$upper_ci <- exp(mean_fit + 1.96 * sqrt(mean_var))
+    } else if (model_type == "logistic") {
+      pred_data$prediction <- plogis(mean_fit)
+      pred_data$lower_ci <- plogis(mean_fit - 1.96 * sqrt(mean_var))
+      pred_data$upper_ci <- plogis(mean_fit + 1.96 * sqrt(mean_var))
+    } else if (model_type == "cox") {
+      pred_data$prediction <- exp(mean_fit)
+      pred_data$lower_ci <- exp(mean_fit - 1.96 * sqrt(mean_var))
+      pred_data$upper_ci <- exp(mean_fit + 1.96 * sqrt(mean_var))
+    } else if (model_type == "lm") {
+      pred_data$prediction <- mean_fit
+      pred_data$lower_ci <- mean_fit - 1.96 * sqrt(mean_var)
+      pred_data$upper_ci <- mean_fit + 1.96 * sqrt(mean_var)
     }
   }
 
@@ -695,6 +771,20 @@ MI_spline <- function(data,
       for (level in subgroup_levels) {
         derivative_data$threshold[derivative_data[[subgroups]] == level] <- threshold_values[level]
       }
+    } else {
+      # Calculate threshold for non-subgroup case
+      sorted_deriv <- derivative_data[order(derivative_data$x_point), ]
+
+      # Find first point where derivative is significantly positive
+      sig_pos_idx <- which(sorted_deriv$significant_positive)
+
+      if (length(sig_pos_idx) > 0) {
+        threshold <- sorted_deriv$x_point[min(sig_pos_idx)]
+        derivative_data$threshold <- threshold
+      } else {
+        threshold <- NA
+        derivative_data$threshold <- NA
+      }
     }
   }
   # ============= ENHANCED PLOTTING CAPABILITIES =============
@@ -758,15 +848,32 @@ MI_spline <- function(data,
 
   # Initialize the plot
   if (!is.null(subgroups)) {
-    # Count observations in each subgroup
-    if (!is.null(subgroup_mapping) && !is.null(original_subgroup_values)) {
-      # If we have custom labels, count from original values
-      subgroup_counts <- table(original_subgroup_values)
-      # Map the names to the new labels
-      names(subgroup_counts) <- subgroup_mapping[names(subgroup_counts)]
+    # Count observations, but only from the first imputation when using average method
+    if (MI_method == "average") {
+      # Create a subset with only the first imputation for counting
+      count_data <- subset(data, get(imp_col) == 1)
+
+      if (!is.null(subgroup_mapping) && !is.null(original_subgroup_values)) {
+        # If we have custom labels, count from original values in first imputation only
+        orig_subgroup_values_first_imp <- count_data[[subgroups]]
+        subgroup_counts <- table(orig_subgroup_values_first_imp)
+        # Map the names to the new labels
+        names(subgroup_counts) <- subgroup_mapping[names(subgroup_counts)]
+      } else {
+        # Otherwise count from the current subgroup values in first imputation only
+        subgroup_counts <- table(count_data[[subgroups]])
+      }
     } else {
-      # Otherwise count from the current subgroup values in Data_Subset
-      subgroup_counts <- table(Data_Subset[[subgroups]])
+      # For "first" method, use current approach
+      if (!is.null(subgroup_mapping) && !is.null(original_subgroup_values)) {
+        # If we have custom labels, count from original values
+        subgroup_counts <- table(original_subgroup_values)
+        # Map the names to the new labels
+        names(subgroup_counts) <- subgroup_mapping[names(subgroup_counts)]
+      } else {
+        # Otherwise count from the current subgroup values in Data_Subset
+        subgroup_counts <- table(Data_Subset[[subgroups]])
+      }
     }
 
     # Set up legend labels
@@ -1002,7 +1109,6 @@ MI_spline <- function(data,
     }
   }
 
-
   # Add vertical lines if specified
   if (!is.null(plot_options$vline)) {
     for (v in plot_options$vline) {
@@ -1058,8 +1164,6 @@ MI_spline <- function(data,
       )
     }
   }
-
-
 
   # Return results
   return(list(
