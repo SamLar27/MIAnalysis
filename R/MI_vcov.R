@@ -124,6 +124,33 @@ MI_vcov <- function(data,
     imp_n <- length(actual_imps)
   }
 
+  # Check for categorical variables with no variation in some imputations
+  cat_vars <- predictor_vars[sapply(data[predictor_vars], function(x) is.factor(x) || is.character(x))]
+  if (length(cat_vars) > 0) {
+    problem_vars <- c()
+    for (var in cat_vars) {
+      # Check each imputation
+      for (imp in actual_imps) {
+        imp_data <- subset(data, data[[imp_col]] == imp)
+        unique_values <- unique(imp_data[[var]])
+
+        # If only one unique value exists in this imputation
+        if (length(unique_values) == 1) {
+          problem_vars <- c(problem_vars, var)
+          warning(paste0("Variable '", var, "' has only one unique value in imputation ",
+                         imp, ": '", unique_values, "'. This may cause issues with model matrix dimensions."))
+          break  # No need to check other imputations for this variable
+        }
+      }
+    }
+
+    if (length(problem_vars) > 0) {
+      warning(paste0("The following categorical variables have no variation in some imputations: ",
+                     paste(unique(problem_vars), collapse=", "),
+                     ". Consider removing them or combining levels to avoid dimension errors."))
+    }
+  }
+
   # Prepare formula if not provided
   if (is.null(formula_string)) {
     # Process predictor variables for interaction terms and spline terms
