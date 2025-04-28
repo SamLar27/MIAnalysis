@@ -11,6 +11,7 @@
 #' @param covariables Optional vector of covariates to adjust for.
 #' @param knot_n Number of knots for the restricted cubic spline (default is 4).
 #' @param imp_col The column name indicating imputation indices (default is ".imp").
+#' @param MI_method Method for using multiply imputed data: "first" (use only first imputation), "average" (average predictions and variances separately), or "Rubin" (pool predictions using Rubin's rules for total variance).
 #' @param model_type The model type: "nb" for Negative Binomial, "poisson" for Poisson, "cox" for Cox, or "logistic" for Logistic.
 #' @param followup_offset Whether to include offset for follow-up duration ("Yes" or "No").
 #' @param followup_col The column representing follow-up duration (required if followup_offset = "Yes").
@@ -131,10 +132,10 @@ MI_spline <- function(data,
   # Select only the first imputation
   if (MI_method == "first") {
     Data_Subset <- subset(data, get(imp_col) == 1)
-  } else if (MI_method == "average") {
+  } else if (MI_method == "average"|MI_method == "Rubin") {
     Data_Subset <- data  # Keep all imputations
   } else {
-    stop("Invalid MI_method. Choose 'first' or 'average'.")
+    stop("Invalid MI_method. Choose 'first' or 'average' or 'Rubin'.")
   }
 
   # Store original subgroup values before conversion, if available
@@ -380,6 +381,8 @@ MI_spline <- function(data,
     if (inherits(model, "merMod")) {
       # For lme4 models, use predict with re.form=NA for population-level predictions
       preds <- predict(model, newdata = newdata, re.form = NA, type = type)
+
+
       # For standard errors, we need a more complex approach since predict doesn't provide SEs
       # We'll use a bootstrap approach or approximate method based on the fixed effects variance-covariance matrix
 
@@ -463,7 +466,7 @@ MI_spline <- function(data,
       }
     }
 
-  } else if (MI_method == "average") {
+  } else if (MI_method == "average"|MI_method == "Rubin") {
     # For each imputation
     imputation_ids <- unique(Data_Subset[[imp_col]])
     all_predictions <- list()
@@ -502,12 +505,19 @@ MI_spline <- function(data,
       if (random_intercept == "Yes") {
         preds_imp <- get_mixed_model_predictions(model_imp, pred_data)
       } else {
-        preds_imp <- predict(model_imp, newdata = pred_data, type = "link", se.fit = TRUE)
+        if (model_type == "cox") {
+          preds_imp <- list()
+          preds_imp$fit <- predict(model_imp, newdata = pred_data, type = "lp")
+          preds_imp$se.fit <- rep(NA, length(preds_imp$fit))
+        } else {
+          preds_imp <- predict(model_imp, newdata = pred_data, type = "link", se.fit = TRUE)
+        }
       }
 
+      # SAVE properly:
       all_predictions[[as.character(imp)]] <- list(
-        fit = if (random_intercept == "Yes") preds_imp$fit else preds_imp$fit,
-        se.fit = if (random_intercept == "Yes") preds_imp$se.fit else preds_imp$se.fit
+        fit = preds_imp$fit,
+        se.fit = preds_imp$se.fit
       )
     }
 
@@ -521,7 +531,20 @@ MI_spline <- function(data,
       ses_i <- sapply(all_predictions, function(x) x$se.fit[i])
 
       mean_fit[i] <- mean(fits_i)
-      mean_var[i] <- mean(ses_i^2)
+      m <- length(imputation_ids)
+
+      # Mean prediction
+      mean_fit[i] <- mean(fits_i)
+
+      if (MI_method == "Rubin") {
+        # Rubin's rules pooling
+        W <- mean(ses_i^2)
+        B <- var(fits_i)
+        mean_var[i] <- W + (1 + 1/m) * B
+      } else if (MI_method == "average") {
+        # Simple average of variances
+        mean_var[i] <- mean(ses_i^2)
+      }
     }
 
     # Fill pred_data
@@ -822,6 +845,8 @@ MI_spline <- function(data,
       "Predicted Rate"
     } else if (model_type == "logistic") {
       "Predicted Probability"
+    } else if (model_type == "lm") {
+      "Predicted Mean"
     } else {
       "Predicted Hazard Ratio"
     }
@@ -849,7 +874,7 @@ MI_spline <- function(data,
   # Initialize the plot
   if (!is.null(subgroups)) {
     # Count observations, but only from the first imputation when using average method
-    if (MI_method == "average") {
+    if (MI_method == "average"|MI_method == "Rubin") {
       # Create a subset with only the first imputation for counting
       count_data <- subset(data, get(imp_col) == 1)
 
