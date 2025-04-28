@@ -20,7 +20,7 @@
 #' @param random_intercept Whether to include a random intercept in the model ("Yes" or "No").
 #' @param random_intercept_var The grouping variable for the random intercept (required if random_intercept = "Yes").
 #' @param verbose Show progress information (default: FALSE).
-#' @param aic_method Method to compute AIC: \"corrected\" (default) or \"pooled\" (Rubin rule pooling of log_link).
+#' @param aic_method Method to compute AIC: \"Rubin\" (default) or \"Simple_pooled\".
 #' @param r2_method Method to compute R2: \"pseudo\" (default, log-likelihood based) or \"pooled\" (classic pooled predictions).
 #' @return A list containing performance metrics, including degrees of freedom (df).
 #' @import dplyr MASS Hmisc mice survival splines
@@ -45,7 +45,7 @@ MI_model_performance <- function(data,
                                  random_intercept_var = NULL, # Added parameter
                                  custom_model_func = NULL,
                                  verbose = FALSE,
-                                 aic_method = "corrected",
+                                 aic_method = "Rubin",
                                  r2_method = "pseudo") {
 
   # Start timing for performance analysis
@@ -683,7 +683,7 @@ MI_model_performance <- function(data,
     stop("Invalid value for r2_method. Must be 'pseudo' or 'pooled'.")
   }
 
-  if (tolower(aic_method) == "corrected") {
+  if (tolower(aic_method) == "rubin") {
     # AIC using correction for between-imputation variance
     AIC_pooled <- -2 * logL_pooled + 2 * T_logL
     AICc_pooled <- AIC_pooled + (2 * T_logL * (T_logL + 1)) / (n - T_logL - 1)
@@ -691,7 +691,7 @@ MI_model_performance <- function(data,
     BIC_pooled <- -2 * logL_pooled + T_logL * log(n)
     BICc_pooled <- BIC_pooled + (T_logL * (T_logL + 1)) / (n - T_logL - 1)
     AIC_method_used <- "Corrected for between-imputation variance"
-  } else if (tolower(aic_method) == "pooled") {
+  } else if (tolower(aic_method) == "simple_pooled") {
     # AIC based only on pooled logLik and pooled degrees of freedom (K)
     AIC_pooled <- -2 * logL_pooled + 2 * K
     AICc_pooled <- AIC_pooled + (2 * K * (K + 1)) / (n - K - 1)
@@ -700,7 +700,7 @@ MI_model_performance <- function(data,
     BICc_pooled <- BIC_pooled + (K * (K + 1)) / (n - K - 1)
     AIC_method_used <- "Based on pooled logLik and degrees of freedom"
   } else {
-    stop("Invalid value for aic_method. Must be 'corrected' or 'pooled_loglik'.")
+    stop("Invalid value for aic_method. Must be 'Rubin' or 'Simple_pooled'.")
   }
 
   # C-index
