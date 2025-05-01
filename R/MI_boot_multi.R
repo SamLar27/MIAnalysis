@@ -10,13 +10,15 @@ MI_boot_multi <- function(
     random_intercept_var = NULL,
     boot_strata = "No",
     strata_var = NULL,
+    reference_model = NULL,  # Parameter to specify reference model
     R = 1000,
     parallel = TRUE,
     n_cores = NULL,
     suppress_warnings = TRUE,
     progress_bar = TRUE,
     max_model_time = 60,
-    compare_models = TRUE
+    compare_models = TRUE,
+    calculate_delta_metrics = TRUE  # New parameter to calculate delta metrics per sample
 ) {
   # Record start time for total runtime
   total_start_time <- Sys.time()
@@ -24,6 +26,14 @@ MI_boot_multi <- function(
   # Validate models_list
   if (!is.list(models_list) || is.null(names(models_list)) || any(names(models_list) == "")) {
     stop("models_list must be a named list where each element contains predictors for a model")
+  }
+
+  # Set reference model if not specified (use first model by default)
+  if (is.null(reference_model)) {
+    reference_model <- names(models_list)[1]
+    cat("No reference model specified. Using first model (", reference_model, ") as reference.\n")
+  } else if (!reference_model %in% names(models_list)) {
+    stop("Reference model '", reference_model, "' not found in models_list.")
   }
 
   # Load required packages
@@ -240,8 +250,7 @@ MI_boot_multi <- function(
   # Initialize result storage
   all_model_results <- list()
 
-  # Precompute bootstrap indices for each imputation (CRUCIAL for fair model comparisons)
-  # This ensures all models are evaluated on EXACTLY the same bootstrap samples
+  # Precompute bootstrap indices for each imputation (for fair model comparisons)
   cat("\n🔹 Precomputing bootstrap indices for fair model comparison...\n")
   bootstrap_indices <- list()
 
@@ -699,6 +708,99 @@ MI_boot_multi <- function(
     )
   }
 
+  # After all models are processed, calculate delta metrics if requested
+  if (calculate_delta_metrics && length(models_list) > 1) {
+    cat("\n🔹 Calculating delta metrics for each bootstrap sample...\n")
+
+    # Get metrics names (AIC, BIC, etc.)
+    perf_names <- c("R2", "AIC", "AICc", "BIC", "BICc", "C_Index", "RMSE", "MAE")
+
+    # Initialize storage for delta metrics
+    delta_metrics <- list()
+
+    # Process each model (except reference)
+    for (model_name in setdiff(names(models_list), reference_model)) {
+      cat("  Calculating delta metrics for model:", model_name, "vs", reference_model, "\n")
+
+      delta_metrics[[model_name]] <- list()
+
+      # For each imputation
+      for (imp_idx in seq_along(imputations)) {
+        imp <- imputations[imp_idx]
+        imp_name <- paste0("imp_", imp)
+
+        # Get performance metrics for this model and reference model
+        model_perf <- all_model_results[[model_name]]$all_bootstrap_results[[imp_name]]$perf
+        ref_perf <- all_model_results[[reference_model]]$all_bootstrap_results[[imp_name]]$perf
+
+        # Calculate delta metrics (model - reference)
+        delta_perf <- model_perf - ref_perf
+
+        # Store delta metrics for this imputation
+        delta_metrics[[model_name]][[imp_name]] <- delta_perf
+      }
+
+      # Calculate summary statistics for delta metrics
+      delta_summary <- list()
+
+      # For each metric
+      for (metric_idx in seq_along(perf_names)) {
+        metric_name <- perf_names[metric_idx]
+
+        # Collect all delta values for this metric across all imputations and bootstraps
+        all_delta_values <- numeric(0)
+
+        for (imp_name in names(delta_metrics[[model_name]])) {
+          all_delta_values <- c(all_delta_values,
+                                delta_metrics[[model_name]][[imp_name]][, metric_idx])
+        }
+
+        # Calculate summary statistics
+        delta_summary[[metric_name]] <- list(
+          mean = mean(all_delta_values, na.rm = TRUE),
+          median = median(all_delta_values, na.rm = TRUE),
+          sd = sd(all_delta_values, na.rm = TRUE),
+          ci_lower = quantile(all_delta_values, 0.025, na.rm = TRUE),
+          ci_upper = quantile(all_delta_values, 0.975, na.rm = TRUE),
+          p_value = if (metric_name %in% c("AIC", "AICc", "BIC", "BICc")) {
+            # For these metrics, negative values indicate the model is better than reference
+            mean(all_delta_values < 0, na.rm = TRUE)
+          } else {
+            # For these metrics, positive values indicate the model is better than reference
+            mean(all_delta_values > 0, na.rm = TRUE)
+          }
+        )
+      }
+
+      # Store summary in all_model_results for this model
+      all_model_results[[model_name]]$delta_metrics <- delta_metrics[[model_name]]
+      all_model_results[[model_name]]$delta_summary <- delta_summary
+    }
+
+    # Create a summary data frame of delta AIC
+    delta_aic_summary <- data.frame(
+      Model = setdiff(names(models_list), reference_model),
+      Reference = reference_model,
+      Mean_Delta_AIC = sapply(setdiff(names(models_list), reference_model),
+                              function(model) all_model_results[[model]]$delta_summary$AIC$mean),
+      CI_Lower = sapply(setdiff(names(models_list), reference_model),
+                        function(model) all_model_results[[model]]$delta_summary$AIC$ci_lower),
+      CI_Upper = sapply(setdiff(names(models_list), reference_model),
+                        function(model) all_model_results[[model]]$delta_summary$AIC$ci_upper),
+      P_Value = sapply(setdiff(names(models_list), reference_model),
+                       function(model) all_model_results[[model]]$delta_summary$AIC$p_value),
+      Better_Than_Reference = sapply(setdiff(names(models_list), reference_model),
+                                     function(model) all_model_results[[model]]$delta_summary$AIC$p_value > 0.95)
+    )
+
+    # Print delta AIC summary
+    cat("\n📊 Delta AIC Summary (vs. reference model):\n")
+    print(delta_aic_summary)
+
+    # Add delta_aic_summary to all_model_results
+    all_model_results$delta_aic_summary <- delta_aic_summary
+  }
+
   # After all models are processed, perform model comparisons if requested
   if (compare_models && length(models_list) > 1) {
     cat("\n🔍 Performing model comparisons...\n")
@@ -706,100 +808,98 @@ MI_boot_multi <- function(
     # Initialize container for pairwise comparisons
     model_comparisons <- list()
 
-    # Get pairs of models to compare
-    model_names <- names(models_list)
-    model_pairs <- combn(model_names, 2, simplify = FALSE)
+    # Reference model performance matrix
+    ref_model_perf_matrix <- all_model_results[[reference_model]]$pooled_perf_matrix
 
-    for (pair in model_pairs) {
-      model1_name <- pair[1]
-      model2_name <- pair[2]
+    # Calculate delta AIC/BIC values relative to reference model
+    for (model_name in names(models_list)) {
+      if (model_name != reference_model) {
+        cat("  Comparing:", model_name, "vs", reference_model, "(reference)\n")
 
-      cat("  Comparing:", model1_name, "vs", model2_name, "\n")
+        # Extract performance metrics from both models
+        model_perf_matrix <- all_model_results[[model_name]]$pooled_perf_matrix
 
-      # Extract performance metrics from both models
-      model1_perf_matrix <- all_model_results[[model1_name]]$pooled_perf_matrix
-      model2_perf_matrix <- all_model_results[[model2_name]]$pooled_perf_matrix
+        # Run comparison for each criterion
+        metrics_to_compare <- c("AIC", "AICc", "BIC", "BICc", "R2", "C_Index")
+        comparison_results <- list()
 
-      # Run paired comparison for each metric
-      metrics_to_compare <- c("AIC", "BIC", "R2", "C_Index")
-      comparison_results <- list()
+        for (metric in metrics_to_compare) {
+          metric_idx <- which(perf_names == metric)
 
-      for (metric in metrics_to_compare) {
-        metric_idx <- which(perf_names == metric)
+          if (length(metric_idx) == 0) {
+            next
+          }
 
-        if (length(metric_idx) == 0) {
-          next
+          # Extract metric values for each bootstrap sample
+          metric_values <- model_perf_matrix[, metric_idx]
+          ref_metric_values <- ref_model_perf_matrix[, metric_idx]
+
+          # Calculate differences based on whether lower or higher is better
+          if (metric %in% c("AIC", "AICc", "BIC", "BICc")) {
+            # For these metrics, negative differences mean current model is better than reference
+            diff_values <- metric_values - ref_metric_values
+            p_value <- mean(diff_values < 0, na.rm = TRUE)  # Prob current model is better than reference
+            favored_model <- ifelse(mean(diff_values, na.rm = TRUE) < 0, model_name, reference_model)
+          } else {
+            # For these metrics, positive differences mean current model is better than reference
+            diff_values <- metric_values - ref_metric_values
+            p_value <- mean(diff_values > 0, na.rm = TRUE)  # Prob current model is better than reference
+            favored_model <- ifelse(mean(diff_values, na.rm = TRUE) > 0, model_name, reference_model)
+          }
+
+          # Calculate mean difference and confidence interval
+          mean_diff <- mean(diff_values, na.rm = TRUE)
+          ci_lower <- quantile(diff_values, 0.025, na.rm = TRUE)
+          ci_upper <- quantile(diff_values, 0.975, na.rm = TRUE)
+
+          # Store results
+          comparison_results[[metric]] <- list(
+            metric = metric,
+            model_name = model_name,
+            reference_model = reference_model,
+            mean_diff = mean_diff,
+            ci_lower = ci_lower,
+            ci_upper = ci_upper,
+            p_value = p_value,
+            favored_model = favored_model,
+            significant = (p_value < 0.05 || p_value > 0.95),
+            diff_values = diff_values
+          )
         }
 
-        # Extract metric values for each bootstrap sample
-        metric1_values <- model1_perf_matrix[, metric_idx]
-        metric2_values <- model2_perf_matrix[, metric_idx]
+        # Create summary table for this comparison
+        pair_name <- paste(model_name, "vs", reference_model)
+        metrics <- names(comparison_results)
 
-        # Calculate differences (accounting for direction - for AIC/BIC, lower is better)
-        if (metric %in% c("AIC", "BIC", "AICc", "BICc")) {
-          # For these metrics, negative differences mean model2 is better
-          diff_values <- metric1_values - metric2_values
-          p_value <- mean(diff_values > 0, na.rm = TRUE)  # Prob model1 is worse than model2
-          favored_model <- ifelse(mean(diff_values, na.rm = TRUE) < 0, model1_name, model2_name)
-        } else {
-          # For these metrics, positive differences mean model1 is better
-          diff_values <- metric1_values - metric2_values
-          p_value <- mean(diff_values < 0, na.rm = TRUE)  # Prob model1 is worse than model2
-          favored_model <- ifelse(mean(diff_values, na.rm = TRUE) > 0, model1_name, model2_name)
+        if (length(metrics) > 0) {
+          summary_df <- data.frame(
+            Metric = metrics,
+            Mean_Difference = sapply(comparison_results, function(x) x$mean_diff),
+            CI_Lower = sapply(comparison_results, function(x) x$ci_lower),
+            CI_Upper = sapply(comparison_results, function(x) x$ci_upper),
+            P_Value = sapply(comparison_results, function(x) x$p_value),
+            Favored_Model = sapply(comparison_results, function(x) x$favored_model),
+            Significant = sapply(comparison_results, function(x) x$significant)
+          )
+
+          # Print summary
+          cat("\n  Summary for", pair_name, ":\n")
+          print(summary_df)
+
+          # Store results
+          model_comparisons[[pair_name]] <- list(
+            summary_table = summary_df,
+            detailed_results = comparison_results
+          )
         }
-
-        # Calculate mean difference and confidence interval
-        mean_diff <- mean(diff_values, na.rm = TRUE)
-        ci_lower <- quantile(diff_values, 0.025, na.rm = TRUE)
-        ci_upper <- quantile(diff_values, 0.975, na.rm = TRUE)
-
-        # Store results
-        comparison_results[[metric]] <- list(
-          metric = metric,
-          model1_name = model1_name,
-          model2_name = model2_name,
-          mean_diff = mean_diff,
-          ci_lower = ci_lower,
-          ci_upper = ci_upper,
-          p_value = p_value,
-          favored_model = favored_model,
-          significant = (p_value < 0.05),
-          diff_values = diff_values
-        )
-      }
-
-      # Create summary table for this pair
-      pair_name <- paste(model1_name, "vs", model2_name)
-      metrics <- names(comparison_results)
-
-      if (length(metrics) > 0) {
-        summary_df <- data.frame(
-          Metric = metrics,
-          Mean_Difference = sapply(comparison_results, function(x) x$mean_diff),
-          CI_Lower = sapply(comparison_results, function(x) x$ci_lower),
-          CI_Upper = sapply(comparison_results, function(x) x$ci_upper),
-          P_Value = sapply(comparison_results, function(x) x$p_value),
-          Favored_Model = sapply(comparison_results, function(x) x$favored_model),
-          Significant = sapply(comparison_results, function(x) x$significant)
-        )
-
-        # Print summary
-        cat("\n  Summary for", pair_name, ":\n")
-        print(summary_df)
-
-        # Store results
-        model_comparisons[[pair_name]] <- list(
-          summary_table = summary_df,
-          detailed_results = comparison_results
-        )
       }
     }
 
     # Identify best model for each metric
     best_model_summary <- list()
 
-    for (metric in c("AIC", "BIC", "R2", "C_Index")) {
-      all_values <- sapply(model_names, function(model_name) {
+    for (metric in c("AIC", "AICc", "BIC", "BICc", "R2", "C_Index")) {
+      all_values <- sapply(names(models_list), function(model_name) {
         perf_table <- all_model_results[[model_name]]$performance_table
         idx <- which(perf_table$Metric == metric)
         if (length(idx) > 0) perf_table$Estimate[idx] else NA
@@ -810,33 +910,41 @@ MI_boot_multi <- function(
       }
 
       # Determine best model (lower is better for AIC/BIC, higher is better for others)
-      if (metric %in% c("AIC", "BIC", "AICc", "BICc")) {
+      if (metric %in% c("AIC", "AICc", "BIC", "BICc")) {
         best_idx <- which.min(all_values)
-        best_model <- model_names[best_idx]
+        best_model <- names(models_list)[best_idx]
       } else {
         best_idx <- which.max(all_values)
-        best_model <- model_names[best_idx]
+        best_model <- names(models_list)[best_idx]
       }
 
-      # Compare best model to each other model
-      comparison_p_values <- numeric(length(model_names))
-      names(comparison_p_values) <- model_names
+      # Calculate bootstrap p-values for each model vs best model
+      comparison_p_values <- numeric(length(names(models_list)))
+      names(comparison_p_values) <- names(models_list)
 
-      for (i in seq_along(model_names)) {
-        if (i != best_idx) {
-          # Find the comparison with this model
-          pair_name1 <- paste(model_names[best_idx], "vs", model_names[i])
-          pair_name2 <- paste(model_names[i], "vs", model_names[best_idx])
+      # Best model's performance matrix
+      best_perf_matrix <- all_model_results[[best_model]]$pooled_perf_matrix
+      best_metric_values <- best_perf_matrix[, which(perf_names == metric)]
 
-          if (pair_name1 %in% names(model_comparisons)) {
-            p_value <- model_comparisons[[pair_name1]]$detailed_results[[metric]]$p_value
-            comparison_p_values[i] <- p_value
-          } else if (pair_name2 %in% names(model_comparisons)) {
-            p_value <- model_comparisons[[pair_name2]]$detailed_results[[metric]]$p_value
-            comparison_p_values[i] <- p_value
+      for (model_name in names(models_list)) {
+        if (model_name != best_model) {
+          model_perf_matrix <- all_model_results[[model_name]]$pooled_perf_matrix
+          model_metric_values <- model_perf_matrix[, which(perf_names == metric)]
+
+          # Calculate differences and p-values
+          if (metric %in% c("AIC", "AICc", "BIC", "BICc")) {
+            # Lower is better
+            diff_values <- model_metric_values - best_metric_values
+            p_value <- mean(diff_values < 0, na.rm = TRUE)  # Prob model is better than best
+          } else {
+            # Higher is better
+            diff_values <- model_metric_values - best_metric_values
+            p_value <- mean(diff_values > 0, na.rm = TRUE)  # Prob model is better than best
           }
+
+          comparison_p_values[model_name] <- p_value
         } else {
-          comparison_p_values[i] <- NA  # No comparison with itself
+          comparison_p_values[model_name] <- NA  # No comparison with itself
         }
       }
 
@@ -845,7 +953,7 @@ MI_boot_multi <- function(
         best_model = best_model,
         metric_values = all_values,
         comparison_p_values = comparison_p_values,
-        significantly_better = comparison_p_values < 0.05
+        significantly_better = sapply(comparison_p_values, function(p) !is.na(p) && (p < 0.05 || p > 0.95))
       )
     }
 
@@ -854,17 +962,18 @@ MI_boot_multi <- function(
     for (metric in names(best_model_summary)) {
       cat(metric, ": Best model is", best_model_summary[[metric]]$best_model, "\n")
       cat("  Values for all models: \n")
-      for (i in seq_along(model_names)) {
+      for (i in seq_along(names(models_list))) {
+        model_name <- names(models_list)[i]
         value <- best_model_summary[[metric]]$metric_values[i]
-        p_value <- best_model_summary[[metric]]$comparison_p_values[i]
+        p_value <- best_model_summary[[metric]]$comparison_p_values[model_name]
 
         if (is.na(p_value)) {
-          cat("    ", model_names[i], ": ", format(value, digits = 4), " (best)\n", sep = "")
-        } else if (p_value < 0.05) {
-          cat("    ", model_names[i], ": ", format(value, digits = 4),
+          cat("    ", model_name, ": ", format(value, digits = 4), " (best)\n", sep = "")
+        } else if (p_value < 0.05 || p_value > 0.95) {
+          cat("    ", model_name, ": ", format(value, digits = 4),
               " (p = ", format(p_value, digits = 3), ", significantly different)\n", sep = "")
         } else {
-          cat("    ", model_names[i], ": ", format(value, digits = 4),
+          cat("    ", model_name, ": ", format(value, digits = 4),
               " (p = ", format(p_value, digits = 3), ", not significantly different)\n", sep = "")
         }
       }
@@ -874,6 +983,7 @@ MI_boot_multi <- function(
     # Add comparison results to output
     all_model_results$model_comparisons <- model_comparisons
     all_model_results$best_model_summary <- best_model_summary
+    all_model_results$reference_model <- reference_model
   }
 
   # Calculate total execution time
