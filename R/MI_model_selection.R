@@ -238,6 +238,24 @@ MI_model_selection <- function(
     c(core_models, list(model_names = model_names, sort_by = core_selection_criteria))
   )
 
+  # Add core_var_n columns and reorder
+  core_var_names <- names(core_vars_list)
+  for (i in seq_along(core_var_names)) {
+    group_name <- core_var_names[i]
+    core_models_comparison[[group_name]] <- sapply(core_models_comparison$Model_Name, function(model_name) {
+      selected_vars <- core_model_variables[[model_name]]
+      matched <- intersect(selected_vars, core_vars_list[[group_name]])
+      if (length(matched) > 0) matched else NA
+    })
+  }
+
+  # Reorder: move core_var_n columns just after Model_Type
+  first_cols <- c("Model_Name", "Model_Type")
+  insert_cols <- core_var_names
+  remaining_cols <- setdiff(colnames(core_models_comparison), c(first_cols, insert_cols))
+  core_models_comparison <- core_models_comparison[, c(first_cols, insert_cols, remaining_cols)]
+
+
   # Select best core model based on specified criterion
   if (core_selection_criteria %in% c("AIC", "AICc", "BIC", "BICc")) {
     criterion_col <- paste0("Delta_", core_selection_criteria)
@@ -356,6 +374,7 @@ MI_model_selection <- function(
 
   # Strategy-specific implementation
   covariable_models <- list()
+
   covariable_selection_steps <- list()
 
   if (potential_selection_strategy == "forward") {
@@ -966,7 +985,23 @@ MI_model_selection <- function(
       print(top_models_df, row.names = FALSE)
     }
 
-    # Save results for output
+    # Add potential_var_n columns and reorder
+    potential_var_names <- names(potential_vars_list)
+    for (group_name in potential_var_names) {
+      group_vars <- potential_vars_list[[group_name]]
+      model_comparison[[group_name]] <- sapply(model_comparison$Model_Name, function(model_name) {
+        vars <- all_model_vars[[model_name]]
+        selected <- intersect(vars, group_vars)
+        if (length(selected) > 0) selected else "Not included"
+      })
+    }
+
+    # Reorder: move potential_var_n columns just after Model_Type
+    first_cols <- c("Model_Name", "Model_Type")
+    insert_cols <- potential_var_names
+    remaining_cols <- setdiff(colnames(model_comparison), c(first_cols, insert_cols))
+    model_comparison <- model_comparison[, c(first_cols, insert_cols, remaining_cols)]
+
     covariable_selection_steps <- model_comparison
   }
 
