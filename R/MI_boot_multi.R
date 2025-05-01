@@ -1,65 +1,3 @@
-#' Bootstrap Analysis for Multiple Imputation Data with Multiple Models
-#'
-#' @description
-#' Performs bootstrap analysis on multiply imputed data to estimate and compare multiple models
-#' using the same bootstrap samples. This approach ensures fair comparison by testing all models
-#' on identical bootstrap resamples.
-#'
-#' @param data A data frame containing the imputed datasets.
-#' @param outcome_var Character string specifying the name of the outcome variable.
-#' @param models_list A named list where each element contains a character vector of predictor
-#'   variables for a specific model. Names will be used as model identifiers.
-#' @param imp_col Character string specifying the name of the imputation identifier column. Default is ".imp".
-#' @param model_type Character string specifying the type of model to fit: "nb" (negative binomial),
-#'   "lm" (linear model), or "glm" (Poisson). Default is "nb".
-#' @param followup_offset Character string, either "Yes" or "No", indicating whether to include
-#'   an offset term for follow-up duration. Default is "No".
-#' @param followup_col Character string specifying the name of the follow-up duration column.
-#'   Required if followup_offset = "Yes".
-#' @param random_intercept Character string, either "Yes" or "No", indicating whether to include
-#'   a random intercept term. Default is "No".
-#' @param random_intercept_var Character string specifying the grouping variable for random intercepts.
-#'   Required if random_intercept = "Yes".
-#' @param boot_strata Character string, either "Yes" or "No", indicating whether to perform
-#'   stratified bootstrapping. Default is "No".
-#' @param strata_var Character string specifying the stratification variable. Required if
-#'   boot_strata = "Yes".
-#' @param R Integer specifying the number of bootstrap replications. Default is 1000.
-#' @param parallel Logical indicating whether to use parallel processing. Default is TRUE.
-#' @param n_cores Integer specifying the number of cores to use for parallel processing.
-#'   If NULL, uses one less than the available cores. Default is NULL.
-#' @param suppress_warnings Logical indicating whether to suppress warnings. Default is TRUE.
-#' @param progress_bar Logical indicating whether to display a progress bar. Default is TRUE.
-#' @param max_model_time Maximum time in seconds to allow for fitting a single model.
-#'   Default is 60.
-#' @param compare_models Logical indicating whether to compute formal model comparisons. Default is TRUE.
-#'
-#' @return A list containing results for each model, plus model comparison statistics if requested.
-#'   For each model, results include:
-#'   - pooled_bootstrap_matrix: Matrix of pooled bootstrap estimates
-#'   - results_table: Parameter estimates with confidence intervals
-#'   - exp_results_table: Exponentiated estimates (rate ratios) for count models
-#'   - performance_table: Model performance metrics
-#'   - model_tracking: Counts of different model fitting outcomes
-#'
-#'   If compare_models=TRUE, also includes:
-#'   - model_comparisons: Pairwise comparisons between all models
-#'   - best_model: Summary of which model performed best on different metrics
-#'
-#' @importFrom dplyr count arrange
-#' @importFrom MASS glm.nb
-#' @importFrom glmmTMB glmmTMB fixef ranef
-#' @importFrom boot boot
-#' @importFrom pROC roc
-#' @importFrom purrr map2
-#' @importFrom pbapply pblapply pboptions
-#' @importFrom parallel makeCluster stopCluster clusterExport parLapply detectCores
-#' @importFrom doParallel registerDoParallel
-#' @importFrom stats as.formula BIC AIC coef predict quantile
-#' @importFrom utils read.csv
-#'
-#' @export
-
 MI_boot_multi <- function(
     data,
     outcome_var,
@@ -92,6 +30,22 @@ MI_boot_multi <- function(
   required_packages <- c("dplyr", "MASS", "glmmTMB", "boot", "pROC", "purrr")
   if (parallel) required_packages <- c(required_packages, "parallel", "foreach", "doParallel", "pbapply")
 
+  # Check if spline terms are present in any model and load rms if needed
+  has_spline_terms <- FALSE
+  for (model_name in names(models_list)) {
+    if (any(grepl("^rcs\\(", models_list[[model_name]]))) {
+      has_spline_terms <- TRUE
+      break
+    }
+  }
+
+  if (has_spline_terms) {
+    if (!requireNamespace("rms", quietly = TRUE)) {
+      stop("Package 'rms' is needed for restricted cubic splines. Please install it.")
+    }
+    required_packages <- c(required_packages, "rms")
+  }
+
   # Check if R.utils is available, but don't require it
   has_r_utils <- requireNamespace("R.utils", quietly = TRUE)
   if (!has_r_utils) {
@@ -103,7 +57,7 @@ MI_boot_multi <- function(
     if (!requireNamespace(pkg, quietly = TRUE)) stop(paste0("Package '", pkg, "' is required."))
   })
 
-  # Create function to expand interaction terms (e.g., "x1*x2" into c("x1", "x2", "x1:x2"))
+  # Helper function to expand interaction terms (e.g., "x1*x2" into c("x1", "x2", "x1:x2"))
   expand_interaction_terms <- function(term) {
     if (grepl("\\*", term)) {
       # Split by * to get individual variables
@@ -131,13 +85,30 @@ MI_boot_multi <- function(
     }
   }
 
-  # Helper function to extract base variable names (non-interactions)
+  # Helper function to extract base variable names from terms including rcs() functions
   extract_base_vars <- function(terms) {
-    # Split interaction terms by colon
-    all_vars <- unique(unlist(strsplit(terms, ":")))
-    # Trim whitespace
-    all_vars <- trimws(all_vars)
-    return(all_vars)
+    result <- character(0)
+
+    for (term in terms) {
+      if (grepl("^rcs\\(", term)) {
+        # Extract the variable name from rcs() function
+        var_name <- gsub("^rcs\\(([^,]+),.*$", "\\1", term)
+        result <- c(result, trimws(var_name))
+      } else if (grepl(":", term)) {
+        # Handle interaction terms
+        vars <- unlist(strsplit(term, ":"))
+        result <- c(result, trimws(vars))
+      } else if (grepl("\\*", term)) {
+        # Handle interaction terms with *
+        vars <- unlist(strsplit(term, "\\*"))
+        result <- c(result, trimws(vars))
+      } else {
+        # Regular variable
+        result <- c(result, trimws(term))
+      }
+    }
+
+    return(unique(result))
   }
 
   # Function for timeout handling
@@ -210,6 +181,10 @@ MI_boot_multi <- function(
       library(pbapply)
       library(pROC)
       library(dplyr)
+
+      # Load rms if spline terms are present
+      if (requireNamespace("rms", quietly = TRUE)) library(rms)
+
       # Load R.utils if available
       if (requireNamespace("R.utils", quietly = TRUE)) library(R.utils)
     })
@@ -340,10 +315,10 @@ MI_boot_multi <- function(
     expanded_terms_list <- lapply(predictor_vars, expand_interaction_terms)
     expanded_predictors <- unique(unlist(expanded_terms_list))
 
-    # Get all base variables
-    base_vars <- unique(unlist(lapply(expanded_terms_list, extract_base_vars)))
+    # Extract all base variables (including from rcs terms)
+    base_vars <- extract_base_vars(predictor_vars)
 
-    # Validate base variable presence in dataset
+    # Validate that all base variables exist in the dataset
     missing_vars <- base_vars[!base_vars %in% colnames(data)]
     if (length(missing_vars) > 0) {
       stop(paste("Predictor variables not found in dataset:", paste(missing_vars, collapse=", ")))
@@ -352,11 +327,21 @@ MI_boot_multi <- function(
     # Notify user of interaction terms detected
     interaction_terms <- expanded_predictors[grepl(":", expanded_predictors)]
     if (length(interaction_terms) > 0) {
-      cat("Detected interaction terms:", paste(interaction_terms, collapse = ", "), "\n")
+      cat("Detected interaction terms:", paste(interaction_terms, collapse=", "), "\n")
+    }
+
+    # Notify user of spline terms detected
+    spline_terms <- predictor_vars[grepl("^rcs\\(", predictor_vars)]
+    if (length(spline_terms) > 0) {
+      cat("Detected restricted cubic spline terms:", paste(spline_terms, collapse=", "), "\n")
     }
 
     # Generate formula for this model
-    formula_str <- paste(outcome_var, "~", paste(expanded_predictors, collapse = " + "))
+    # First, determine if we need to modify predictor_vars for rcs terms
+    formula_parts <- predictor_vars
+
+    # Create formula string
+    formula_str <- paste(outcome_var, "~", paste(formula_parts, collapse = " + "))
     if (followup_offset == "Yes" && !is.null(followup_col)) {
       formula_str <- paste(formula_str, "+ offset(log(", followup_col, "))")
     }
@@ -364,7 +349,8 @@ MI_boot_multi <- function(
       formula_str <- paste(formula_str, "+ (1|", random_intercept_var, ")")
     }
     formula_obj <- as.formula(formula_str)
-    cat("Formula:", deparse(formula_obj), "\n")
+
+    cat("Formula:", deparse(formula_obj, width.cutoff = 500), "\n")
 
     # Get parameter names from a test model
     get_model_param_names <- function() {
@@ -449,6 +435,11 @@ MI_boot_multi <- function(
       imp <- imputations[imp_idx]
       imp_data <- data[data[[imp_col]] == imp, ]
       n_obs <- nrow(imp_data)
+
+      # Ensure rms package is loaded for spline terms
+      if (length(spline_terms) > 0) {
+        suppressMessages(require(rms))
+      }
 
       # Track model types for this imputation
       local_model_tracking <- list(
@@ -591,7 +582,7 @@ MI_boot_multi <- function(
                                     "random_intercept", "random_intercept_var",
                                     "bootstrap_indices", "formula_str", "formula_obj",
                                     "actual_param_names", "n_actual_params",
-                                    "perf_names", "max_model_time"),
+                                    "perf_names", "max_model_time", "spline_terms"),
                               envir = environment())
 
       all_boot_results <- parallel::parLapply(cl, seq_along(imputations), run_one_imputation)
@@ -626,6 +617,7 @@ MI_boot_multi <- function(
 
     pooled_coef_matrix <- apply(boot_coef_array, c(1,2), mean, na.rm = TRUE)
     pooled_perf_matrix <- apply(boot_perf_array, c(1,2), mean, na.rm = TRUE)
+
     # Create results tables
     results_df <- data.frame(
       Parameter = actual_param_names,
@@ -672,7 +664,6 @@ MI_boot_multi <- function(
       # Clean up the tracking file
       file.remove(model_tracking_file)
     }
-
     # Display model fitting summary
     total_models <- model_counters$mixed_success + model_counters$fixed_fallback + model_counters$total_failure
 
@@ -902,4 +893,3 @@ MI_boot_multi <- function(
   # Return all results
   return(all_model_results)
 }
-
