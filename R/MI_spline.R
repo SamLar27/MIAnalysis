@@ -952,7 +952,12 @@ MI_spline <- function(data,
                                                            linetype = subgroups))
   } else {
     # Simple plot without subgroups
+    # Simple plot without subgroups
     plot <- ggplot2::ggplot(pred_data, ggplot2::aes_string(x = variable_x, y = "prediction"))
+
+    # Set color/fill manually if colors are provided (only for non-subgroup plots)
+    line_color <- if (!is.null(plot_options$colors)) plot_options$colors[1] else "black"
+    fill_color <- if (!is.null(plot_options$fill_colors)) plot_options$fill_colors[1] else "grey70"
   }
 
   # Add lines and ribbons
@@ -960,9 +965,9 @@ MI_spline <- function(data,
   ribbon_alpha <- if (!is.null(plot_options$ribbon_alpha)) plot_options$ribbon_alpha else 0.3
 
   plot <- plot +
-    ggplot2::geom_line(linewidth = line_size) +
+    ggplot2::geom_line(linewidth = line_size, color = line_color) +
     ggplot2::geom_ribbon(ggplot2::aes(ymin = lower_ci, ymax = upper_ci),
-                         alpha = ribbon_alpha, color = NA)
+                         fill = fill_color, alpha = ribbon_alpha)
 
   # Add labels
   plot <- plot +
