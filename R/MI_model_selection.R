@@ -1,14 +1,17 @@
-#' Model Selection for Multiple Imputed Data
+#' Model Selection for Multiple Imputed Data with Grouped Variables
 #'
 #' This function performs systematic model selection on multiply imputed data.
 #' It handles both core model selection and additional covariable selection
-#' through forward, backward, or brute force approaches.
+#' through forward, backward, or brute force approaches. The potential variables
+#' can be grouped into categories, where variables in the same category are considered
+#' alternatives and cannot be included together in the model.
 #'
 #' @param data A data frame containing the imputed dataset.
 #' @param outcome_var The dependent variable for the model.
 #' @param core_vars_list List of core variables or combinations to test for the base model.
 #'        Can be a list of character vectors, each representing a possible core model.
-#' @param potential_vars_list Character vector of additional covariables to test.
+#' @param potential_vars_list Named list of additional covariables to test, grouped by category.
+#'        Variables within the same category are treated as alternatives (can't appear together).
 #' @param imp_col The column name indicating imputation indices (default is ".imp").
 #' @param followup_offset Whether to include an offset for follow-up duration ("Yes" or "No").
 #' @param followup_col The column representing follow-up duration (required if followup_offset = "Yes").
@@ -33,7 +36,6 @@
 #'   \item{final_formula}{Formula of the final selected model}
 #'
 #' @export
-#' @importFrom stats as.formula
 MI_model_selection <- function(
     data,
     outcome_var,
@@ -130,26 +132,35 @@ MI_model_selection <- function(
     return(result_combinations)
   }
 
-  # Process potential_vars_list to flatten if needed
+  # Process potential_vars_list to ensure it's a named list
   if (!is.null(potential_vars_list)) {
     if (!is.list(potential_vars_list)) {
-      # Single vector provided directly
-      potential_vars_list <- list(potential_vars_list)
+      # Single vector provided directly - convert to a single-category list
+      potential_vars_list <- list(potential_vars = potential_vars_list)
+      names(potential_vars_list) <- "potential_vars"
+    } else if (is.null(names(potential_vars_list)) || any(names(potential_vars_list) == "")) {
+      # List without proper names - add default names
+      missing_names <- is.null(names(potential_vars_list)) || names(potential_vars_list) == ""
+      if (all(missing_names)) {
+        names(potential_vars_list) <- paste0("potential_var_", seq_along(potential_vars_list))
+      } else {
+        # Replace only missing names
+        for (i in which(missing_names)) {
+          names(potential_vars_list)[i] <- paste0("potential_var_", i)
+        }
+      }
     }
 
-    # Check if potential_vars_list contains nested lists
-    if (any(sapply(potential_vars_list, is.list))) {
-      # Flatten nested lists
-      potential_vars_flat <- unlist(potential_vars_list, recursive = TRUE)
-      potential_vars_list <- potential_vars_flat
-    } else {
-      # Just unlist to get a character vector
-      potential_vars_list <- unlist(potential_vars_list)
-    }
+    # Flatten any nested lists within categories
+    for (i in seq_along(potential_vars_list)) {
+      if (is.list(potential_vars_list[[i]])) {
+        potential_vars_list[[i]] <- unlist(potential_vars_list[[i]])
+      }
 
-    # Ensure it's a character vector
-    if (!is.character(potential_vars_list)) {
-      stop("Potential variables list must contain character vectors.")
+      # Ensure each entry is a character vector
+      if (!is.character(potential_vars_list[[i]])) {
+        stop(paste("Potential variables in group", names(potential_vars_list)[i], "must be character vectors."))
+      }
     }
   }
 
@@ -158,7 +169,6 @@ MI_model_selection <- function(
 
   # Function to build a model and evaluate performance
   build_model <- function(variables, description = NULL) {
-
     # Add offset parameter for count models
     follow_offset_param <- followup_offset
     if (model_type %in% c("nb", "poisson") && !is.null(followup_col)) {
@@ -303,10 +313,25 @@ MI_model_selection <- function(
                 potential_selection_threshold))
   }
 
-  # Remove any potential variables that are already in the core model
-  potential_vars_clean <- setdiff(potential_vars_list, best_core_vars)
+  # Get all potential variables
+  all_potential_vars <- unlist(potential_vars_list)
 
-  if (length(potential_vars_clean) == 0) {
+  # Remove any potential variables that are already in the core model
+  all_potential_vars_clean <- setdiff(all_potential_vars, best_core_vars)
+
+  # Update the potential_vars_list to remove variables already in the core model
+  for (i in seq_along(potential_vars_list)) {
+    potential_vars_list[[i]] <- setdiff(potential_vars_list[[i]], best_core_vars)
+    # If a category is now empty, remove it
+    if (length(potential_vars_list[[i]]) == 0) {
+      potential_vars_list[[i]] <- NULL
+    }
+  }
+
+  # Filter out any empty categories
+  potential_vars_list <- potential_vars_list[sapply(potential_vars_list, length) > 0]
+
+  if (length(all_potential_vars_clean) == 0) {
     if (verbose) {
       cat("No additional potential covariables available (all already in core model).\n")
     }
@@ -321,9 +346,12 @@ MI_model_selection <- function(
   }
 
   if (verbose) {
-    cat(sprintf("Evaluating %d potential covariables: %s\n",
-                length(potential_vars_clean),
-                paste(potential_vars_clean, collapse = ", ")))
+    cat("Potential variable groups:\n")
+    for (i in seq_along(potential_vars_list)) {
+      cat(sprintf("  Group %s: %s\n",
+                  names(potential_vars_list)[i],
+                  paste(potential_vars_list[[i]], collapse = ", ")))
+    }
   }
 
   # Strategy-specific implementation
@@ -336,7 +364,7 @@ MI_model_selection <- function(
     #####################################################################
     current_model <- best_core_model
     current_vars <- best_core_vars
-    remaining_vars <- potential_vars_clean
+    remaining_vars <- all_potential_vars_clean
     step_counter <- 1
     improvement_found <- TRUE
 
@@ -481,7 +509,16 @@ MI_model_selection <- function(
         # Update current model and variables
         current_model <- step_models[[best_model_name]]
         current_vars <- step_vars[[best_model_name]]
-        remaining_vars <- setdiff(remaining_vars, added_var)
+
+        # Remove the added variable and any others from the same group
+        # Find which group the added variable belongs to
+        for (group_name in names(potential_vars_list)) {
+          if (added_var %in% potential_vars_list[[group_name]]) {
+            # Remove all variables from this group
+            remaining_vars <- setdiff(remaining_vars, potential_vars_list[[group_name]])
+            break
+          }
+        }
 
         # Save model and step information
         covariable_models[[paste("Step", step_counter)]] <- current_model
@@ -505,360 +542,431 @@ MI_model_selection <- function(
     # Backward Selection
     #####################################################################
     # Start with full model (core + all potential vars)
-    full_vars <- c(best_core_vars, potential_vars_clean)
+    # For grouped variables, we need to select one variable from each group
+    # because we can't include all variables if some are alternatives
 
-    # Check if the number of variables is reasonable
-    if (length(full_vars) > 20) {
-      warning("Backward selection with a large number of variables may be computationally intensive.")
+    # Generate all combinations of one variable from each group
+    potential_combinations <- list()
+
+    for (group_name in names(potential_vars_list)) {
+      group_vars <- potential_vars_list[[group_name]]
+      # Create a list with one entry per variable in this group
+      group_combos <- lapply(group_vars, function(var) var)
+      potential_combinations[[group_name]] <- group_combos
     }
 
-    full_model <- build_model(full_vars, description = "Full model (backward start)")
-    current_model <- full_model
-    current_vars <- full_vars
-    step_counter <- 1
+    # Generate the Cartesian product of all group combinations
+    all_potential_combinations <- list()
 
-    covariable_models[["Full"]] <- current_model
-
-    while (length(current_vars) > length(best_core_vars)) {
-      step_models <- list()
-      step_vars <- list()
-
-      # Add current model as baseline for comparison
-      base_model_name <- paste("Step", step_counter, "current")
-      step_models[[base_model_name]] <- current_model
-      step_vars[[base_model_name]] <- current_vars
-
-      # Try removing each potential variable one at a time
-      removable_vars <- setdiff(current_vars, best_core_vars)
-
-      for (var in removable_vars) {
-        test_vars <- setdiff(current_vars, var)
-        model_name <- paste("Step", step_counter, "-", var)
-        test_model <- build_model(test_vars,
-                                  description = paste("Backward", model_name))
-        step_models[[model_name]] <- test_model
-        step_vars[[model_name]] <- test_vars
+    # Helper function to generate Cartesian product recursively
+    generate_combinations <- function(prefix = list(), groups = names(potential_combinations), idx = 1) {
+      if (idx > length(groups)) {
+        # Base case: we've processed all groups
+        all_potential_combinations <<- c(all_potential_combinations, list(unlist(prefix)))
+        return()
       }
 
-      # Directly compare all models to base model
-      base_model <- step_models[[base_model_name]]
+      group_name <- groups[idx]
+      group_vars <- potential_combinations[[group_name]]
 
-      # Create comparison dataframe
-      model_comparison <- data.frame(
-        Model = names(step_models),
-        stringsAsFactors = FALSE
+      # For each variable in this group
+      for (var in group_vars) {
+        # Add this variable to the prefix and recurse
+        generate_combinations(c(prefix, list(var)), groups, idx + 1)
+      }
+    }
+
+    # Generate all combinations
+    generate_combinations()
+
+    # For each combination, we need to fit a model
+    backward_start_models <- list()
+    backward_start_vars <- list()
+
+    # Add the core model with no potential variables
+    backward_start_models[["Core Only"]] <- best_core_model
+    backward_start_vars[["Core Only"]] <- best_core_vars
+
+    # Add the core model + all potential variable combinations
+    for (i in seq_along(all_potential_combinations)) {
+      pot_vars <- all_potential_combinations[[i]]
+      full_vars <- c(best_core_vars, pot_vars)
+      model_name <- paste("Full", i)
+
+      if (verbose) {
+        cat(sprintf("  Fitting potential full model %d: %s\n", i, paste(pot_vars, collapse = ", ")))
+      }
+
+      full_model <- build_model(full_vars, description = paste("Full model", i, "(backward start)"))
+
+      backward_start_models[[model_name]] <- full_model
+      backward_start_vars[[model_name]] <- full_vars
+    }
+
+    # Compare all starting models to find the best one
+    if (length(backward_start_models) > 1) {
+      start_model_names <- names(backward_start_models)
+      start_models_comparison <- do.call(
+        MI_models_comparison,
+        c(backward_start_models, list(model_names = start_model_names, sort_by = potential_selection_term))
       )
 
-      # Add criterion values (AIC, BIC, etc)
-      for (criterion in c("AIC", "AICc", "BIC", "BICc")) {
-        model_comparison[[criterion]] <- sapply(step_models, function(m) m[[criterion]])
-        model_comparison[[paste0("Delta_", criterion)]] <-
-          model_comparison[[criterion]] - model_comparison[[criterion]][model_comparison$Model == base_model_name]
-      }
+      # Find the best starting model
+      if (potential_selection_term %in% c("AIC", "AICc", "BIC", "BICc")) {
+        best_start_idx <- which.min(start_models_comparison[[potential_selection_term]])
+      } else if (potential_selection_term == "p_value") {
+        # For p-value, prefer most complex model with non-significant difference from Core Only
+        p_values <- as.numeric(start_models_comparison$LRT[-1])  # Skip Core Only
+        significant_models <- which(p_values >= potential_selection_threshold) + 1  # Adjust index
 
-      # Calculate p-values from LRT if available
-      if ("logL" %in% names(base_model)) {
-        model_comparison$LRT <- NA
-        base_logL <- base_model$logL
-        base_df <- base_model$df
-
-        for (i in seq_along(step_models)) {
-          if (names(step_models)[i] != base_model_name) {
-            test_model <- step_models[[i]]
-            # LRT statistic
-            test_logL <- test_model$logL
-            test_df <- test_model$df
-            df_diff <- abs(test_df - base_df)
-            if (df_diff == 0) df_diff <- 1
-
-            # Calculate p-value
-            lrt_stat <- 2 * abs(test_logL - base_logL)
-            p_value <- pchisq(lrt_stat, df = df_diff, lower.tail = FALSE)
-            model_comparison$LRT[i] <- p_value
-          } else {
-            model_comparison$LRT[i] <- 1.0  # Base model compared to itself
-          }
+        if (length(significant_models) > 0) {
+          # Find the most complex model among non-significant ones
+          var_counts <- sapply(significant_models, function(idx) {
+            model_name <- start_models_comparison$Model_Name[idx]
+            return(length(backward_start_vars[[model_name]]))
+          })
+          best_start_idx <- significant_models[which.max(var_counts)]
+        } else {
+          # If all are significant, use the most complex model
+          var_counts <- sapply(2:nrow(start_models_comparison), function(idx) {
+            model_name <- start_models_comparison$Model_Name[idx]
+            return(length(backward_start_vars[[model_name]]))
+          })
+          best_start_idx <- which.max(var_counts) + 1  # Adjust index
         }
-        # Format p-values
-        model_comparison$LRT <- format.pval(model_comparison$LRT, digits = 5)
       }
 
-      # Display comparison results
+      best_start_model_name <- start_models_comparison$Model_Name[best_start_idx]
+
       if (verbose) {
-        cat("  Comparison of all models from this step:\n")
-        display_df <- data.frame(
-          Model = model_comparison$Model,
-          Criterion = round(model_comparison[[potential_selection_term]], 2),
-          Delta = round(model_comparison[[paste0("Delta_", potential_selection_term)]], 2)
-        )
-        colnames(display_df)[2] <- potential_selection_term
-        colnames(display_df)[3] <- paste0("Δ", potential_selection_term)
-
-        # Highlight the base model
-        base_idx <- which(display_df$Model == base_model_name)
-        display_df$Model[base_idx] <- paste0(display_df$Model[base_idx], " (reference)")
-
-        print(display_df, row.names = FALSE)
-        cat("\n")
+        cat(sprintf("\nBest starting model: %s\n", best_start_model_name))
+        cat(sprintf("Variables: %s\n", paste(backward_start_vars[[best_start_model_name]], collapse = ", ")))
       }
 
-      # Determine if we can remove a variable
-      can_remove <- FALSE
-      best_idx <- NULL
-
-      if (potential_selection_term == "p_value") {
-        # For p-value, we want variables that can be removed without significantly affecting the model
-        p_idx <- which(model_comparison$Model == base_model_name)
-        p_values <- as.numeric(model_comparison$LRT[-p_idx])
-
-        if (any(p_values > potential_selection_threshold, na.rm = TRUE)) {
-          # Find the variable with the highest p-value (least significant)
-          best_p_idx <- which.max(p_values)
-          best_idx <- setdiff(seq_along(model_comparison$Model), p_idx)[best_p_idx]
-          can_remove <- TRUE
-        }
-      } else {
-        # For information criteria, we want variables that, when removed, don't worsen the model too much
-        term_col <- paste0("Delta_", potential_selection_term)
-        delta_idx <- which(model_comparison$Model == base_model_name)
-        delta_values <- model_comparison[[term_col]][-delta_idx]
-
-        if (any(delta_values < potential_selection_threshold, na.rm = TRUE)) {
-          # Find the model with the best (most negative or least positive) delta
-          best_delta_idx <- which.min(delta_values)
-          best_idx <- setdiff(seq_along(model_comparison$Model), delta_idx)[best_delta_idx]
-          can_remove <- TRUE
-        }
-      }
-
-      # If we can remove a variable, update the model
-      if (can_remove) {
-        best_model_name <- model_comparison$Model[best_idx]
-
-        # Extract the variable name from the model name
-        removed_var <- sub(paste0("Step ", step_counter, " - "), "", best_model_name)
-
-        if (verbose) {
-          cat(sprintf("  Step %d: Removed variable '%s'", step_counter, removed_var))
-
-          if (potential_selection_term == "p_value") {
-            cat(sprintf(" (p-value: %s)\n", model_comparison$LRT[best_idx]))
-          } else {
-            term_col <- paste0("Delta_", potential_selection_term)
-            cat(sprintf(" (%s: %.2f, Δ%s: %.2f)\n",
-                        potential_selection_term,
-                        model_comparison[[potential_selection_term]][best_idx],
-                        potential_selection_term,
-                        model_comparison[[term_col]][best_idx]))
-          }
-        }
-
-        # Update current model and variables
-        current_model <- step_models[[best_model_name]]
-        current_vars <- step_vars[[best_model_name]]
-
-        # Save model and step information
-        covariable_models[[paste("Step", step_counter)]] <- current_model
-        covariable_selection_steps[[step_counter]] <- list(
-          step = step_counter,
-          removed_var = removed_var,
-          model_comparison = model_comparison,
-          best_model_name = best_model_name
-        )
-
-        step_counter <- step_counter + 1
-      } else {
-        if (verbose) {
-          cat("  No variables can be removed without significant impact.\n")
-        }
-        break
-      }
+      current_model <- backward_start_models[[best_start_model_name]]
+      current_vars <- backward_start_vars[[best_start_model_name]]
+    } else {
+      # Only one starting model (core only)
+      current_model <- backward_start_models[[1]]
+      current_vars <- backward_start_vars[[1]]
     }
 
+    # Only proceed with backward selection if we have potential variables
+    if (length(current_vars) > length(best_core_vars)) {
+      step_counter <- 1
+
+      covariable_models[["Start"]] <- current_model
+
+      while (length(current_vars) > length(best_core_vars)) {
+        step_models <- list()
+        step_vars <- list()
+
+        # Add current model as baseline for comparison
+        base_model_name <- paste("Step", step_counter, "current")
+        step_models[[base_model_name]] <- current_model
+        step_vars[[base_model_name]] <- current_vars
+
+        # Try removing each potential variable one at a time
+        removable_vars <- setdiff(current_vars, best_core_vars)
+
+        for (var in removable_vars) {
+          test_vars <- setdiff(current_vars, var)
+          model_name <- paste("Step", step_counter, "-", var)
+          test_model <- build_model(test_vars,
+                                    description = paste("Backward", model_name))
+          step_models[[model_name]] <- test_model
+          step_vars[[model_name]] <- test_vars
+        }
+
+        # Directly compare all models to base model
+        base_model <- step_models[[base_model_name]]
+
+        # Create comparison dataframe
+        model_comparison <- data.frame(
+          Model = names(step_models),
+          stringsAsFactors = FALSE
+        )
+
+        # Add criterion values (AIC, BIC, etc)
+        for (criterion in c("AIC", "AICc", "BIC", "BICc")) {
+          model_comparison[[criterion]] <- sapply(step_models, function(m) m[[criterion]])
+          model_comparison[[paste0("Delta_", criterion)]] <-
+            model_comparison[[criterion]] - model_comparison[[criterion]][model_comparison$Model == base_model_name]
+        }
+
+        # Calculate p-values from LRT if available
+        if ("logL" %in% names(base_model)) {
+          model_comparison$LRT <- NA
+          base_logL <- base_model$logL
+          base_df <- base_model$df
+
+          for (i in seq_along(step_models)) {
+            if (names(step_models)[i] != base_model_name) {
+              test_model <- step_models[[i]]
+              # LRT statistic
+              test_logL <- test_model$logL
+              test_df <- test_model$df
+              df_diff <- abs(test_df - base_df)
+              if (df_diff == 0) df_diff <- 1
+
+              # Calculate p-value
+              lrt_stat <- 2 * abs(test_logL - base_logL)
+              p_value <- pchisq(lrt_stat, df = df_diff, lower.tail = FALSE)
+              model_comparison$LRT[i] <- p_value
+            } else {
+              model_comparison$LRT[i] <- 1.0  # Base model compared to itself
+            }
+          }
+          # Format p-values
+          model_comparison$LRT <- format.pval(model_comparison$LRT, digits = 5)
+        }
+
+        # Display comparison results
+        if (verbose) {
+          cat("  Comparison of all models from this step:\n")
+          display_df <- data.frame(
+            Model = model_comparison$Model,
+            Criterion = round(model_comparison[[potential_selection_term]], 2),
+            Delta = round(model_comparison[[paste0("Delta_", potential_selection_term)]], 2)
+          )
+          colnames(display_df)[2] <- potential_selection_term
+          colnames(display_df)[3] <- paste0("Δ", potential_selection_term)
+
+          # Highlight the base model
+          base_idx <- which(display_df$Model == base_model_name)
+          display_df$Model[base_idx] <- paste0(display_df$Model[base_idx], " (reference)")
+
+          print(display_df, row.names = FALSE)
+          cat("\n")
+        }
+
+        # Determine if we can remove a variable
+        can_remove <- FALSE
+        best_idx <- NULL
+
+        if (potential_selection_term == "p_value") {
+          # For p-value, we want variables that can be removed without significantly affecting the model
+          p_idx <- which(model_comparison$Model == base_model_name)
+          p_values <- as.numeric(model_comparison$LRT[-p_idx])
+
+          if (any(p_values > potential_selection_threshold, na.rm = TRUE)) {
+            # Find the variable with the highest p-value (least significant)
+            best_p_idx <- which.max(p_values)
+            best_idx <- setdiff(seq_along(model_comparison$Model), p_idx)[best_p_idx]
+            can_remove <- TRUE
+          }
+        } else {
+          # For information criteria, we want variables that, when removed, don't worsen the model too much
+          term_col <- paste0("Delta_", potential_selection_term)
+          delta_idx <- which(model_comparison$Model == base_model_name)
+          delta_values <- model_comparison[[term_col]][-delta_idx]
+
+          if (any(delta_values < potential_selection_threshold, na.rm = TRUE)) {
+            # Find the model with the best (most negative or least positive) delta
+            best_delta_idx <- which.min(delta_values)
+            best_idx <- setdiff(seq_along(model_comparison$Model), delta_idx)[best_delta_idx]
+            can_remove <- TRUE
+          }
+        }
+
+        # If we can remove a variable, update the model
+        if (can_remove) {
+          best_model_name <- model_comparison$Model[best_idx]
+
+          # Extract the variable name from the model name
+          removed_var <- sub(paste0("Step ", step_counter, " - "), "", best_model_name)
+
+          if (verbose) {
+            cat(sprintf("  Step %d: Removed variable '%s'", step_counter, removed_var))
+
+            if (potential_selection_term == "p_value") {
+              cat(sprintf(" (p-value: %s)\n", model_comparison$LRT[best_idx]))
+            } else {
+              term_col <- paste0("Delta_", potential_selection_term)
+              cat(sprintf(" (%s: %.2f, Δ%s: %.2f)\n",
+                          potential_selection_term,
+                          model_comparison[[potential_selection_term]][best_idx],
+                          potential_selection_term,
+                          model_comparison[[term_col]][best_idx]))
+            }
+          }
+
+          # Update current model and variables
+          current_model <- step_models[[best_model_name]]
+          current_vars <- step_vars[[best_model_name]]
+
+          # Save model and step information
+          covariable_models[[paste("Step", step_counter)]] <- current_model
+          covariable_selection_steps[[step_counter]] <- list(
+            step = step_counter,
+            removed_var = removed_var,
+            model_comparison = model_comparison,
+            best_model_name = best_model_name
+          )
+
+          step_counter <- step_counter + 1
+        } else {
+          if (verbose) {
+            cat("  No variables can be removed without significant impact.\n")
+          }
+          break
+        }
+      }
+    }
   } else if (potential_selection_strategy == "brute_force") {
     #####################################################################
-    # Brute Force Selection
+    # Brute Force Selection - Modified to handle grouped variables
     #####################################################################
-    # Generate all possible combinations of potential variables
-    n_potential <- length(potential_vars_clean)
-    max_combinations <- 2^n_potential
 
-    if (max_combinations > max_models) {
-      warning(sprintf("The number of potential models (%d) exceeds max_models (%d). ",
-                      max_combinations, max_models),
-              "Using a probabilistic sampling of model space instead.")
-
-      # Randomly sample from model space if too many combinations
-      set.seed(42)  # For reproducibility
-      combinations <- sample(0:(max_combinations-1), min(max_models, max_combinations))
-    } else {
-      combinations <- 0:(max_combinations-1)
-    }
-
-    # Initialize list for all models
+    # First, create the base model (core only)
     all_models <- list()
     all_models[["Core"]] <- best_core_model
+    all_model_vars <- list()
+    all_model_vars[["Core"]] <- best_core_vars
 
     if (verbose) {
-      cat(sprintf("Evaluating %d model combinations\n", length(combinations)))
-      if (length(combinations) > 10) {
-        pb <- txtProgressBar(min = 0, max = length(combinations), style = 3)
+      cat("\nGenerating models for brute force selection:\n")
+      cat("  - Core model (no additional variables)\n")
+    }
+
+    # Add models with variables from single categories
+    model_count <- 1
+
+    # 1. First, add individual variables from all groups
+    for (group_name in names(potential_vars_list)) {
+      group_vars <- potential_vars_list[[group_name]]
+
+      for (var in group_vars) {
+        if (model_count > max_models) {
+          warning("Maximum model count reached. Some combinations will not be tested.")
+          break
+        }
+
+        model_name <- paste0("Model_", model_count)
+        vars <- c(best_core_vars, var)
+
+        if (verbose) {
+          cat(sprintf("  - %s: Core + %s\n", model_name, var))
+        }
+
+        all_models[[model_name]] <- build_model(vars)
+        all_model_vars[[model_name]] <- vars
+        model_count <- model_count + 1
+      }
+
+      if (model_count > max_models) break
+    }
+
+    # 2. Generate combinations between different groups but never from the same group
+    if (length(potential_vars_list) > 1 && model_count <= max_models) {
+      # Create all possible combinations between variables from different groups
+      combinations <- list()
+
+      # For each variable in the first group
+      for (var1 in potential_vars_list[[1]]) {
+        # For each variable in the second group
+        for (var2 in potential_vars_list[[2]]) {
+          combinations[[length(combinations) + 1]] <- c(var1, var2)
+        }
+      }
+
+      # If there are more than 2 groups, we need to handle those combinations too
+      if (length(potential_vars_list) > 2) {
+        warning("More than 2 potential variable groups found. Only combinations between the first two groups will be tested.")
+        # A more general solution would require a recursive approach like before,
+        # but properly tracking the model count
+      }
+
+      # Add each combination as a model
+      for (combo in combinations) {
+        if (model_count > max_models) {
+          warning("Maximum model count reached. Some combinations will not be tested.")
+          break
+        }
+
+        model_name <- paste0("Model_", model_count)
+        vars <- c(best_core_vars, combo)
+
+        if (verbose) {
+          cat(sprintf("  - %s: Core + %s\n",
+                      model_name,
+                      paste(combo, collapse = " + ")))
+        }
+
+        all_models[[model_name]] <- build_model(vars)
+        all_model_vars[[model_name]] <- vars
+        model_count <- model_count + 1
       }
     }
 
-    # Evaluate all selected combinations
-    for (i in seq_along(combinations)) {
-      combo_idx <- combinations[i]
-
-      # Convert index to binary representation for variable selection
-      binary_rep <- integer(n_potential)
-      temp <- combo_idx
-      for (j in 1:n_potential) {
-        binary_rep[j] <- temp %% 2
-        temp <- temp %/% 2
-        if (temp == 0) break
-      }
-      selection <- as.logical(binary_rep)
-
-      if (sum(selection) == 0) {
-        # Skip - this is just the core model
-        next
-      }
-
-      # Get selected variables for this combination
-      selected_vars <- potential_vars_clean[selection]
-      all_vars <- c(best_core_vars, selected_vars)
-
-      # Build the model
-      model_name <- paste("Model", i)
-
-      if (verbose) {
-        description <- paste(model_name, ":", paste(selected_vars, collapse = ", "))
-        all_models[[model_name]] <- build_model(all_vars, description = description)
-      } else {
-        all_models[[model_name]] <- build_model(all_vars)
-      }
-
-      if (verbose && length(combinations) > 10) {
-        setTxtProgressBar(pb, i)
-      }
+    if (verbose) {
+      cat(sprintf("\nGenerated %d models to compare\n", length(all_models)))
     }
 
-    if (verbose && length(combinations) > 10) {
-      close(pb)
-    }
-
-    # Create comparison dataframe
+    # Compare all models
     model_names <- names(all_models)
-    model_comparison <- data.frame(
-      Model = model_names,
-      stringsAsFactors = FALSE
+    model_comparison <- do.call(
+      MI_models_comparison,
+      c(all_models, list(model_names = model_names, sort_by = potential_selection_term))
     )
 
-    # Add criterion values (AIC, BIC, etc)
-    for (criterion in c("AIC", "AICc", "BIC", "BICc")) {
-      model_comparison[[criterion]] <- sapply(all_models, function(m) m[[criterion]])
-      model_comparison[[paste0("Delta_", criterion)]] <-
-        model_comparison[[criterion]] - model_comparison[[criterion]][model_comparison$Model == "Core"]
-    }
-
-    # Calculate p-values from LRT if available
-    base_model <- all_models[["Core"]]
-    if ("logL" %in% names(base_model)) {
-      model_comparison$LRT <- NA
-      base_logL <- base_model$logL
-      base_df <- base_model$df
-
-      for (i in seq_along(all_models)) {
-        if (model_names[i] != "Core") {
-          test_model <- all_models[[i]]
-          # LRT statistic
-          test_logL <- test_model$logL
-          test_df <- test_model$df
-          df_diff <- abs(test_df - base_df)
-          if (df_diff == 0) df_diff <- 1
-
-          # Calculate p-value
-          lrt_stat <- 2 * abs(test_logL - base_logL)
-          p_value <- pchisq(lrt_stat, df = df_diff, lower.tail = FALSE)
-          model_comparison$LRT[i] <- p_value
-        } else {
-          model_comparison$LRT[i] <- 1.0  # Base model compared to itself
-        }
-      }
-      # Format p-values
-      model_comparison$LRT <- format.pval(model_comparison$LRT, digits = 5)
-    }
-
-    # Select best model based on criterion
+    # Determine the best model
     if (potential_selection_term == "p_value") {
-      # For p-value, we select most complex model that's significantly better than core
-      p_idx <- which(model_comparison$Model == "Core")
-      p_values <- as.numeric(model_comparison$LRT[-p_idx])
+      # For p-value, we want the most complex model that's not significantly worse than the reference
+      # The reference will be the Core model (index 1)
+      p_values <- as.numeric(model_comparison$LRT[-1])  # Skip Core
 
-      significant_models <- which(p_values < potential_selection_threshold)
+      significant_models <- which(p_values >= potential_selection_threshold) + 1  # Adjust index
 
       if (length(significant_models) > 0) {
-        # Among significant models, choose one with best information criterion
-        sig_model_indices <- setdiff(seq_along(model_comparison$Model), p_idx)[significant_models]
-        aic_values <- model_comparison$AICc[sig_model_indices]
-        best_idx <- sig_model_indices[which.min(aic_values)]
+        # Find the most complex model among non-significant ones
+        var_counts <- sapply(significant_models, function(idx) {
+          model_name <- model_comparison$Model_Name[idx]
+          return(length(all_model_vars[[model_name]]))
+        })
+
+        best_idx <- significant_models[which.max(var_counts)]
       } else {
-        # If none are significant, stick with core model
-        best_idx <- p_idx
+        # If all are significant, use the core model
+        best_idx <- 1  # Core model index
       }
     } else {
-      # For information criteria, choose model with lowest value
-      term_col <- potential_selection_term
-      best_idx <- which.min(model_comparison[[term_col]])
+      # For information criteria, we want the model with the best criterion
+      best_idx <- which.min(model_comparison[[potential_selection_term]])
     }
 
-    best_model_name <- model_comparison$Model[best_idx]
+    # Select best model
+    best_model_name <- model_comparison$Model_Name[best_idx]
     final_model <- all_models[[best_model_name]]
+    final_vars <- all_model_vars[[best_model_name]]
 
-    # Display results
+    # Identify variables added to the core model
+    added_vars <- setdiff(final_vars, best_core_vars)
+
     if (verbose) {
-      if (best_model_name == "Core") {
-        cat("\nBest model: Core model (no additional covariables selected)\n")
-      } else {
-        # Extract variables from the model formula
-        model_formula <- final_model$Model_Formula
-        added_vars_str <- setdiff(
-          unlist(strsplit(model_formula, "\\s+|\\+|~")),
-          c("", " ", unlist(strsplit(best_core_model$Model_Formula, "\\s+|\\+|~")))
-        )
-        added_vars <- added_vars_str[!grepl("offset|\\(|\\)", added_vars_str)]
-        added_vars <- setdiff(added_vars, c("", " "))
+      cat("\nBrute Force Model Selection Results:\n")
+      cat(sprintf("  Best model: %s\n", best_model_name))
+      cat(sprintf("  %s: %.2f\n", potential_selection_term, model_comparison[[potential_selection_term]][best_idx]))
 
-        cat(sprintf("\nBest model: %s\n", best_model_name))
-        if (length(added_vars) > 0) {
-          cat(sprintf("Added variables: %s\n", paste(added_vars, collapse = ", ")))
-        }
-        cat(sprintf("%s: %.2f\n", potential_selection_term,
-                    model_comparison[[potential_selection_term]][best_idx]))
+      if (length(added_vars) > 0) {
+        cat(sprintf("  Added variables: %s\n", paste(added_vars, collapse = ", ")))
+      } else {
+        cat("  No additional variables were selected (core model only).\n")
       }
 
-      # Print model comparison
-      cat("\nComparison of top models:\n")
-
-      # Sort by criterion and select top models to display
+      # Print top models
+      cat("\nTop 10 models by", potential_selection_term, ":\n")
       sorted_idx <- order(model_comparison[[potential_selection_term]])
       top_n <- min(10, nrow(model_comparison))
 
-      display_df <- data.frame(
-        Model = model_comparison$Model[sorted_idx[1:top_n]],
-        Criterion = round(model_comparison[[potential_selection_term]][sorted_idx[1:top_n]], 2),
-        Delta = round(model_comparison[[paste0("Delta_", potential_selection_term)]][sorted_idx[1:top_n]], 2)
+      top_models_df <- data.frame(
+        Model = model_comparison$Model_Name[sorted_idx[1:top_n]],
+        Criterion = round(model_comparison[[potential_selection_term]][sorted_idx[1:top_n]], 2)
       )
-      colnames(display_df)[2] <- potential_selection_term
-      colnames(display_df)[3] <- paste0("Δ", potential_selection_term)
-
-      print(display_df, row.names = FALSE)
-      cat("\n")
+      print(top_models_df, row.names = FALSE)
     }
 
-    # Set as selected model for output
-    covariable_models <- all_models
+    # Save results for output
     covariable_selection_steps <- model_comparison
   }
 
@@ -918,8 +1026,3 @@ MI_model_selection <- function(
     final_formula = final_model$Model_Formula
   ))
 }
-
-
-
-
-
