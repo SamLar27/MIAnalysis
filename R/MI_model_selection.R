@@ -167,6 +167,40 @@ MI_model_selection <- function(
   # Generate all possible combinations of core variable expressions
   core_combinations <- generate_core_combinations(core_vars_list)
 
+  # Helper function to extract variables from polynomial terms
+  extract_poly_vars <- function(term) {
+    if (grepl("^poly\\(", term)) {
+      var_name <- gsub("^poly\\(([^,]+),.*", "\\1", term)
+      return(trimws(var_name))
+    } else {
+      return(NULL)
+    }
+  }
+
+  # Helper function to check if a term is a polynomial term
+  is_poly_term <- function(term) {
+    return(grepl("^poly\\(", term))
+  }
+
+  # Helper function to extract degree from polynomial terms
+  extract_poly_degree <- function(term) {
+    if (is_poly_term(term)) {
+      # Try to extract degree=X parameter
+      if (grepl("degree\\s*=\\s*\\d+", term)) {
+        degree <- as.numeric(gsub(".*degree\\s*=\\s*(\\d+).*", "\\1", term))
+        return(degree)
+      } else {
+        # Check if there's a simple number as the second argument
+        if (grepl("^poly\\([^,]+,\\s*\\d+", term)) {
+          degree <- as.numeric(gsub("^poly\\([^,]+,\\s*(\\d+).*", "\\1", term))
+          return(degree)
+        }
+      }
+    }
+    # Default to 2 if we can't parse the degree
+    return(2)
+  }
+
   # Function to build a model and evaluate performance
   build_model <- function(variables, description = NULL) {
     # Add offset parameter for count models
@@ -175,10 +209,29 @@ MI_model_selection <- function(
       follow_offset_param <- "Yes"
     }
 
+    # Process polynomial terms for the model
+    polynomial_terms <- NULL
+    variables_to_use <- variables
+
+    # Extract polynomial terms if any
+    poly_vars <- variables_to_use[sapply(variables_to_use, is_poly_term)]
+
+    if (length(poly_vars) > 0) {
+      polynomial_terms <- lapply(poly_vars, function(term) {
+        var_name <- extract_poly_vars(term)
+        degree <- extract_poly_degree(term)
+
+        list(var = var_name, degree = degree)
+      })
+
+      # Remove original poly terms from variables since they will be handled separately
+      variables_to_use <- setdiff(variables_to_use, poly_vars)
+    }
+
     result <- MI_model_performance(
       data = data,
       outcome_var = outcome_var,
-      predictor_vars = variables,
+      predictor_vars = variables_to_use,
       imp_col = imp_col,
       followup_offset = follow_offset_param,
       followup_col = followup_col,
@@ -186,6 +239,7 @@ MI_model_selection <- function(
       trial_col = trial_col,
       imp_n = imp_n,
       model_type = model_type,
+      polynomial_terms = polynomial_terms,  # Pass detected polynomial terms
       random_intercept = random_intercept,
       random_intercept_var = random_intercept_var,
       verbose = FALSE
@@ -334,12 +388,32 @@ MI_model_selection <- function(
   # Get all potential variables
   all_potential_vars <- unlist(potential_vars_list)
 
+  # Helper function to extract base variable names from poly/spline terms
+  extract_base_var_name <- function(var) {
+    if (is_poly_term(var)) {
+      return(extract_poly_vars(var))
+    } else if (grepl("^rcs\\(", var)) {
+      return(gsub("^rcs\\(([^,]+),.*", "\\1", var))
+    } else {
+      return(var)
+    }
+  }
+
   # Remove any potential variables that are already in the core model
-  all_potential_vars_clean <- setdiff(all_potential_vars, best_core_vars)
+  # First convert polynomial/spline terms to their base variable names for comparison
+  best_core_base_vars <- sapply(best_core_vars, extract_base_var_name)
+
+  # Check if a potential variable conflicts with core variables
+  is_var_in_core <- function(var) {
+    base_var <- extract_base_var_name(var)
+    return(base_var %in% best_core_base_vars)
+  }
+
+  all_potential_vars_clean <- all_potential_vars[!sapply(all_potential_vars, is_var_in_core)]
 
   # Update the potential_vars_list to remove variables already in the core model
   for (i in seq_along(potential_vars_list)) {
-    potential_vars_list[[i]] <- setdiff(potential_vars_list[[i]], best_core_vars)
+    potential_vars_list[[i]] <- potential_vars_list[[i]][!sapply(potential_vars_list[[i]], is_var_in_core)]
     # If a category is now empty, remove it
     if (length(potential_vars_list[[i]]) == 0) {
       potential_vars_list[[i]] <- NULL
@@ -621,7 +695,6 @@ MI_model_selection <- function(
       backward_start_models[[model_name]] <- full_model
       backward_start_vars[[model_name]] <- full_vars
     }
-
     # Compare all starting models to find the best one
     if (length(backward_start_models) > 1) {
       start_model_names <- names(backward_start_models)

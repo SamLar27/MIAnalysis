@@ -137,7 +137,7 @@
 #'
 #' @export
 
-MI_boot <- function(
+MI_boot_single <- function(
     data,
     outcome_var,
     predictor_vars,
@@ -904,4 +904,3 @@ MI_boot <- function(
 
   return(all_model_results)
 }
-

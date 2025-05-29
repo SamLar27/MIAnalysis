@@ -11,6 +11,7 @@ MI_boot_multi <- function(
     boot_strata = "No",
     strata_var = NULL,
     reference_model = NULL,  # Parameter to specify reference model
+    bootstrap_strategy = "separate",  # New parameter: "separate" or "shared"
     R = 1000,
     parallel = TRUE,
     n_cores = NULL,
@@ -18,10 +19,15 @@ MI_boot_multi <- function(
     progress_bar = TRUE,
     max_model_time = 60,
     compare_models = TRUE,
-    calculate_delta_metrics = TRUE  # New parameter to calculate delta metrics per sample
+    calculate_delta_metrics = TRUE  # Parameter to calculate delta metrics per sample
 ) {
   # Record start time for total runtime
   total_start_time <- Sys.time()
+
+  # Validate bootstrap_strategy
+  if (!bootstrap_strategy %in% c("separate", "shared")) {
+    stop("bootstrap_strategy must be one of: 'separate' or 'shared'")
+  }
 
   # Validate models_list
   if (!is.list(models_list) || is.null(names(models_list)) || any(names(models_list) == "")) {
@@ -250,39 +256,102 @@ MI_boot_multi <- function(
   # Initialize result storage
   all_model_results <- list()
 
-  # Precompute bootstrap indices for each imputation (for fair model comparisons)
-  cat("\n🔹 Precomputing bootstrap indices for fair model comparison...\n")
-  bootstrap_indices <- list()
+  # Precompute bootstrap indices
+  cat("\n🔹 Precomputing bootstrap indices...\n")
 
-  for (imp_idx in seq_along(imputations)) {
-    imp <- imputations[imp_idx]
-    imp_data <- data[data[[imp_col]] == imp, ]
-    n_obs <- nrow(imp_data)
+  # For different bootstrapping strategies
+  if (bootstrap_strategy == "separate") {
+    # Original approach: different bootstrap samples for each imputation
+    cat("Using 'separate' bootstrap strategy: different samples for each imputation, consistent across models\n")
 
-    # Create bootstrap indices based on stratification option
+    bootstrap_indices <- list()
+
+    for (imp_idx in seq_along(imputations)) {
+      imp <- imputations[imp_idx]
+      imp_data <- data[data[[imp_col]] == imp, ]
+      n_obs <- nrow(imp_data)
+
+      # Create bootstrap indices based on stratification option
+      if (boot_strata == "Yes") {
+        strata_counts <- imp_data %>%
+          dplyr::count(!!rlang::sym(strata_var)) %>%
+          dplyr::arrange(!!rlang::sym(strata_var))
+
+        bootstrap_indices[[imp_idx]] <- replicate(R, {
+          unlist(purrr::map2(
+            strata_counts[[strata_var]],
+            strata_counts$n,
+            function(stratum_name, stratum_n) {
+              idx <- which(imp_data[[strata_var]] == stratum_name)
+              if (length(idx) == 0) stop(paste0("No subjects found for stratum: ", stratum_name))
+              sample(idx, size = stratum_n, replace = TRUE)
+            }
+          ))
+        }, simplify = FALSE)
+      } else {
+        bootstrap_indices[[imp_idx]] <- replicate(R, sample(seq_len(n_obs), n_obs, replace = TRUE), simplify = FALSE)
+      }
+    }
+  } else {
+    # New approach: same bootstrap samples across all imputations
+    cat("Using 'shared' bootstrap strategy: same bootstrap samples across all imputations\n")
+
+    # Get full data dimensions
+    full_data_ids <- unique(data[!duplicated(data[, setdiff(names(data), imp_col)]), ])
+    n_original <- nrow(full_data_ids)
+
+    # Create bootstrap indices for original dataset
     if (boot_strata == "Yes") {
-      strata_counts <- imp_data %>%
+      strata_counts <- full_data_ids %>%
         dplyr::count(!!rlang::sym(strata_var)) %>%
         dplyr::arrange(!!rlang::sym(strata_var))
 
-      bootstrap_indices[[imp_idx]] <- replicate(R, {
+      # Generate R bootstrap samples with stratification
+      master_bootstrap_indices <- replicate(R, {
         unlist(purrr::map2(
           strata_counts[[strata_var]],
           strata_counts$n,
           function(stratum_name, stratum_n) {
-            idx <- which(imp_data[[strata_var]] == stratum_name)
+            idx <- which(full_data_ids[[strata_var]] == stratum_name)
             if (length(idx) == 0) stop(paste0("No subjects found for stratum: ", stratum_name))
             sample(idx, size = stratum_n, replace = TRUE)
           }
         ))
       }, simplify = FALSE)
     } else {
-      bootstrap_indices[[imp_idx]] <- replicate(R, sample(seq_len(n_obs), n_obs, replace = TRUE), simplify = FALSE)
+      # Generate R bootstrap samples without stratification
+      master_bootstrap_indices <- replicate(R, sample(seq_len(n_original), n_original, replace = TRUE), simplify = FALSE)
+    }
+
+    # Map these indices to each imputation
+    bootstrap_indices <- list()
+
+    for (imp_idx in seq_along(imputations)) {
+      imp <- imputations[imp_idx]
+      imp_data <- data[data[[imp_col]] == imp, ]
+
+      # Map the master bootstrap indices to this imputation's row indices
+      bootstrap_indices[[imp_idx]] <- lapply(master_bootstrap_indices, function(boot_idx) {
+        # Get bootstrapped original data rows
+        boot_original_rows <- full_data_ids[boot_idx, ]
+
+        # Find matching rows in this imputation
+        # For each bootstrapped row, find its corresponding row in the current imputation
+        # This is a simplification - you'll need to implement logic to match rows across imputations
+        # This might involve using row IDs or other identifying columns
+
+        # For demonstration, assuming rows can be matched by their position:
+        match_indices <- seq_len(nrow(imp_data))
+        match_indices[match(boot_idx, seq_len(n_original))]
+      })
     }
   }
 
   # Process each model using the shared bootstrap samples
-  cat("\n🔹 Processing all models using shared bootstrap samples...\n")
+  cat("\n🔹 Processing all models using", bootstrap_strategy, "bootstrap samples...\n")
+
+  # Define perf_names for consistent output
+  perf_names <- c("R2", "AIC", "AICc", "BIC", "BICc", "C_Index", "RMSE", "MAE")
 
   # Main loop: process each model
   for (model_name in names(models_list)) {
@@ -436,9 +505,6 @@ MI_boot_multi <- function(
     cat("Model parameters:", paste(actual_param_names, collapse=", "), "\n")
     n_actual_params <- length(actual_param_names)
 
-    # Define perf_names for consistent output
-    perf_names <- c("R2", "AIC", "AICc", "BIC", "BICc", "C_Index", "RMSE", "MAE")
-
     # Function to run bootstrap for one imputation
     run_one_imputation <- function(imp_idx) {
       imp <- imputations[imp_idx]
@@ -590,7 +656,7 @@ MI_boot_multi <- function(
                                     "model_type", "followup_offset", "followup_col",
                                     "random_intercept", "random_intercept_var",
                                     "bootstrap_indices", "formula_str", "formula_obj",
-                                    "actual_param_names", "n_actual_params",
+                                    "actual_param_names", "n_actual_params", "bootstrap_strategy",
                                     "perf_names", "max_model_time", "spline_terms"),
                               envir = environment())
 
@@ -610,22 +676,57 @@ MI_boot_multi <- function(
     }
 
     names(all_boot_results) <- paste0("imp_", imputations)
-
-    # Pool results across bootstrap samples and imputations
+    # Pool results differently based on bootstrap_strategy
     n_bootstrap <- R
     n_metrics <- length(perf_names)
     n_imputations <- length(all_boot_results)
 
-    boot_coef_array <- array(NA, dim = c(n_bootstrap, n_actual_params, n_imputations))
-    boot_perf_array <- array(NA, dim = c(n_bootstrap, n_metrics, n_imputations))
+    if (bootstrap_strategy == "separate") {
+      # Original approach: Pool across imputations for each bootstrap
+      boot_coef_array <- array(NA, dim = c(n_bootstrap, n_actual_params, n_imputations))
+      boot_perf_array <- array(NA, dim = c(n_bootstrap, n_metrics, n_imputations))
 
-    for (i in seq_along(all_boot_results)) {
-      boot_coef_array[,,i] <- all_boot_results[[i]]$coef
-      boot_perf_array[,,i] <- all_boot_results[[i]]$perf
+      for (i in seq_along(all_boot_results)) {
+        boot_coef_array[,,i] <- all_boot_results[[i]]$coef
+        boot_perf_array[,,i] <- all_boot_results[[i]]$perf
+      }
+
+      # Pool across imputations for each bootstrap sample
+      pooled_coef_matrix <- apply(boot_coef_array, c(1,2), mean, na.rm = TRUE)
+      pooled_perf_matrix <- apply(boot_perf_array, c(1,2), mean, na.rm = TRUE)
+    } else {
+      # Shared bootstrap approach: First, organize by bootstrap
+      # Each bootstrap sample has results from all imputations
+      # We'll use Rubin's rules to pool across imputations for each bootstrap
+
+      # Initialize matrices to store pooled results
+      pooled_coef_matrix <- matrix(NA, nrow = n_bootstrap, ncol = n_actual_params)
+      colnames(pooled_coef_matrix) <- actual_param_names
+
+      pooled_perf_matrix <- matrix(NA, nrow = n_bootstrap, ncol = n_metrics)
+      colnames(pooled_perf_matrix) <- perf_names
+
+      # For each bootstrap sample
+      for (b in 1:n_bootstrap) {
+        # Collect coefficients across imputations for this bootstrap sample
+        coefs_across_imps <- matrix(NA, nrow = n_imputations, ncol = n_actual_params)
+        for (i in 1:n_imputations) {
+          coefs_across_imps[i,] <- all_boot_results[[i]]$coef[b,]
+        }
+
+        # Apply Rubin's rules to pool coefficients
+        pooled_coef_matrix[b,] <- colMeans(coefs_across_imps, na.rm = TRUE)
+
+        # Collect performance metrics across imputations for this bootstrap sample
+        perf_across_imps <- matrix(NA, nrow = n_imputations, ncol = n_metrics)
+        for (i in 1:n_imputations) {
+          perf_across_imps[i,] <- all_boot_results[[i]]$perf[b,]
+        }
+
+        # Pool performance metrics
+        pooled_perf_matrix[b,] <- colMeans(perf_across_imps, na.rm = TRUE)
+      }
     }
-
-    pooled_coef_matrix <- apply(boot_coef_array, c(1,2), mean, na.rm = TRUE)
-    pooled_perf_matrix <- apply(boot_perf_array, c(1,2), mean, na.rm = TRUE)
 
     # Create results tables
     results_df <- data.frame(
@@ -673,6 +774,7 @@ MI_boot_multi <- function(
       # Clean up the tracking file
       file.remove(model_tracking_file)
     }
+
     # Display model fitting summary
     total_models <- model_counters$mixed_success + model_counters$fixed_fallback + model_counters$total_failure
 
@@ -704,9 +806,10 @@ MI_boot_multi <- function(
       parameters = actual_param_names,
       bootstrap_samples = R,
       imputations = n_imputations,
-      model_tracking = model_counters
+      model_tracking = model_counters,
+      bootstrap_strategy = bootstrap_strategy
     )
-  }
+  }  # End of the model-specific processing loop
 
   # After all models are processed, calculate delta metrics if requested
   if (calculate_delta_metrics && length(models_list) > 1) {

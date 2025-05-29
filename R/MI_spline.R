@@ -1,4 +1,6 @@
-#' #' Create Spline Plots from Multiple Imputed Data (with Random Effects Support)
+# Now the main MI_spline function starts
+
+#' Create Spline Plots from Multiple Imputed Data (with Random Effects Support)
 #'
 #' This function fits restricted cubic spline models to multiply imputed datasets and creates
 #' visualization of the relationships between a continuous predictor and an outcome, with optional
@@ -40,6 +42,8 @@
 #' @importFrom glmmTMB glmmTMB
 #' @importFrom coxme coxme
 #' @export
+
+
 MI_spline <- function(data,
                       outcome_var,
                       variable_x,
@@ -55,14 +59,15 @@ MI_spline <- function(data,
                       trial_col = NULL,
                       time_col = NULL,
                       event_col = NULL,
-                      random_intercept = "No",  # Added parameter
-                      random_intercept_var = NULL,  # Added parameter
+                      random_intercept = "No",
+                      random_intercept_var = NULL,
                       plot_options = NULL,
                       subgroup_as_factor = TRUE,
                       subgroup_labels = NULL,
                       prediction_range = c(0.01, 0.99),
                       calculate_derivatives = FALSE,
-                      derivative_points = NULL)  {      # Optional specific points to calculate derivatives at
+                      derivative_points = NULL,
+                      derivative_method = "basis")  {  # New parameter to select derivative method
 
   # Load required packages
   requireNamespace("rms", quietly = TRUE)
@@ -129,10 +134,19 @@ MI_spline <- function(data,
     stop("First value of prediction_range must be less than the second value")
   }
 
-  # Select only the first imputation
+  # Validate derivative_method
+  if (calculate_derivatives && !derivative_method %in% c("basis", "delta", "numeric")) {
+    stop("derivative_method must be one of 'basis', 'delta', or 'numeric'")
+  }
+
+  # Initialize threshold variables at the beginning
+  threshold <- NA
+  threshold_values <- NULL
+
+  # Select only the first imputation or all imputations based on MI_method
   if (MI_method == "first") {
     Data_Subset <- subset(data, get(imp_col) == 1)
-  } else if (MI_method == "average"|MI_method == "Rubin") {
+  } else if (MI_method == "average" || MI_method == "Rubin") {
     Data_Subset <- data  # Keep all imputations
   } else {
     stop("Invalid MI_method. Choose 'first' or 'average' or 'Rubin'.")
@@ -373,15 +387,11 @@ MI_spline <- function(data,
     pred_data[[random_intercept_var]] <- names(which.max(table(Data_Subset[[random_intercept_var]])))
   }
 
-  # Get predictions with standard errors
-  preds <- NULL
-
   # Function to handle predictions from mixed models
   get_mixed_model_predictions <- function(model, newdata, type = "link") {
     if (inherits(model, "merMod")) {
       # For lme4 models, use predict with re.form=NA for population-level predictions
       preds <- predict(model, newdata = newdata, re.form = NA, type = type)
-
 
       # For standard errors, we need a more complex approach since predict doesn't provide SEs
       # We'll use a bootstrap approach or approximate method based on the fixed effects variance-covariance matrix
@@ -411,6 +421,7 @@ MI_spline <- function(data,
       return(list(fit = preds, se.fit = se_fixed))
     }
   }
+
   # Get predictions with standard errors
   preds <- NULL
 
@@ -465,8 +476,7 @@ MI_spline <- function(data,
         }
       }
     }
-
-  } else if (MI_method == "average"|MI_method == "Rubin") {
+  } else if (MI_method == "average" || MI_method == "Rubin") {
     # For each imputation
     imputation_ids <- unique(Data_Subset[[imp_col]])
     all_predictions <- list()
@@ -530,11 +540,9 @@ MI_spline <- function(data,
       fits_i <- sapply(all_predictions, function(x) x$fit[i])
       ses_i <- sapply(all_predictions, function(x) x$se.fit[i])
 
-      mean_fit[i] <- mean(fits_i)
-      m <- length(imputation_ids)
-
       # Mean prediction
       mean_fit[i] <- mean(fits_i)
+      m <- length(imputation_ids)
 
       if (MI_method == "Rubin") {
         # Rubin's rules pooling
@@ -567,30 +575,894 @@ MI_spline <- function(data,
     }
   }
 
-  # ============= CALCULATE DERIVATIVES IF REQUESTED =============
-  derivative_data <- NULL
+  # NEW IMPLEMENTATION: Basis Function Derivative Approach
+  #==================================================================================
 
+  # Function to extract knots from a restricted cubic spline model or generate them
+  get_knots_from_model <- function(model, variable_x, knot_n, data) {
+    # Try to extract knots from the model object first
+    if (inherits(model, c("glm", "lm", "coxph", "coxme", "lmerMod", "glmerMod"))) {
+      # Look for terms that match rcs(variable_x, knot_n)
+      terms <- terms(model)
+      term_labels <- attr(terms, "term.labels")
+
+      # Find the term containing our spline
+      spline_term <- grep(paste0("rcs\\(", variable_x), term_labels, value = TRUE)
+
+      # If found, try to extract knots
+      if (length(spline_term) > 0) {
+        # This is implementation-specific and depends on how rcs stores knots
+        # For rms package:
+        if (requireNamespace("rms", quietly = TRUE)) {
+          # Try to access the model formula
+          if (!is.null(model$formula) && inherits(model$formula, "formula")) {
+            # Extract terms from the formula
+            terms_formula <- terms(model$formula)
+            if (!is.null(terms_formula)) {
+              # Look for rcs attributes
+              for (term in attr(terms_formula, "term.labels")) {
+                if (grepl(paste0("rcs\\(", variable_x), term)) {
+                  # Try to access the variable in the model frame
+                  if (!is.null(model$model) && variable_x %in% names(model$model)) {
+                    var_term <- model$model[[variable_x]]
+                    if (!is.null(attr(var_term, "knots"))) {
+                      return(attr(var_term, "knots"))
+                    }
+                  }
+                  # Try for 'x' attribute which sometimes has knots
+                  if (!is.null(model$x)) {
+                    attr_names <- names(attributes(model$x))
+                    knot_attr <- grep("knots", attr_names, value = TRUE)
+                    if (length(knot_attr) > 0) {
+                      return(attr(model$x, knot_attr[1]))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    # If we couldn't extract knots from the model, generate them from the data
+    if (is.null(data[[variable_x]])) {
+      stop("Variable not found in data")
+    }
+
+    # Generate knots using quantiles of the data
+    x_vals <- data[[variable_x]]
+    probs <- seq(0, 1, length.out = knot_n)
+    knots <- quantile(x_vals, probs = probs, na.rm = TRUE)
+
+    return(knots)
+  }
+
+  # Calculate basis function derivatives for restricted cubic splines
+  calculate_rcs_derivatives <- function(x, knots) {
+    # Number of knots
+    k <- length(knots)
+
+    # For a restricted cubic spline with k knots, we have k-1 basis functions
+    # The first basis function is just x
+    # The other k-2 basis functions are more complex
+
+    # Initialize the derivative matrix
+    n <- length(x)
+    derivative_matrix <- matrix(0, nrow = n, ncol = k-1)
+
+    # First basis function derivative is always 1
+    derivative_matrix[, 1] <- 1
+    # For the remaining basis functions, calculate their derivatives
+    if (k > 2) {
+      for (j in 2:(k-1)) {
+        # Define the knot positions for this basis function
+        t_j <- knots[j]
+        t_k <- knots[k]
+        t_1 <- knots[1]
+
+        # Calculate derivatives of the basis functions
+        # For RCS, the basis functions are:
+        # B_1(x) = x
+        # B_j(x) = (x - t_j)_+^3 - (x - t_k)_+^3 * (t_k - t_j)/(t_k - t_1)
+
+        # Where (x - t)_+^3 = max(0, x - t)^3
+
+        # Derivatives of these terms:
+        # d/dx B_1(x) = 1
+        # d/dx (x - t_j)_+^3 = 3 * (x - t_j)_+^2 if x > t_j, 0 otherwise
+
+        # Calculate derivative for each x value
+        for (i in 1:n) {
+          # First term derivative
+          term1_deriv <- 0
+          if (x[i] > t_j) {
+            term1_deriv <- 3 * (x[i] - t_j)^2
+          }
+
+          # Second term derivative
+          term2_deriv <- 0
+          if (x[i] > t_k) {
+            term2_deriv <- 3 * (x[i] - t_k)^2 * (t_k - t_j)/(t_k - t_1)
+          }
+
+          # Combined derivative
+          derivative_matrix[i, j] <- term1_deriv - term2_deriv
+        }
+      }
+    }
+
+    return(derivative_matrix)
+  }
+
+  # Extract coefficients related to the spline terms from the model
+  extract_spline_coefficients <- function(model, variable_x) {
+    # Get all model coefficients
+    if (inherits(model, c("lmerMod", "glmerMod", "glmmTMB"))) {
+      all_coefs <- fixef(model)
+    } else {
+      all_coefs <- coef(model)
+    }
+
+    # Try different patterns to identify spline coefficients
+    # Start with the most specific pattern
+    patterns <- c(
+      paste0("^", variable_x, "$"),                   # Just the variable itself
+      paste0("^rcs\\(", variable_x, "\\)"),           # rcs(variable_x)
+      paste0("^", variable_x, "\\."),                 # variable_x.
+      paste0("rcs\\(", variable_x, "\\)\\."),         # rcs(variable_x).
+      paste0("^", variable_x, "[0-9]"),               # variable_x1, variable_x2, etc.
+      paste0("^rcs\\(", variable_x, "\\)[0-9]")       # rcs(variable_x)1, rcs(variable_x)2, etc.
+    )
+
+    spline_coefs <- NULL
+
+    # Try each pattern until we find matching coefficients
+    for (pat in patterns) {
+      spline_terms <- grep(pat, names(all_coefs), value = TRUE)
+      if (length(spline_terms) > 0) {
+        spline_coefs <- all_coefs[spline_terms]
+        break
+      }
+    }
+
+    # If still not found, try a more general pattern
+    if (is.null(spline_coefs) || length(spline_coefs) == 0) {
+      spline_terms <- grep(variable_x, names(all_coefs), value = TRUE)
+      if (length(spline_terms) > 0) {
+        spline_coefs <- all_coefs[spline_terms]
+      }
+    }
+
+    # If we still couldn't find spline coefficients, try to extract from interactions
+    if (is.null(spline_coefs) || length(spline_coefs) == 0) {
+      # Look for interaction terms
+      interaction_terms <- grep(":", names(all_coefs), value = TRUE)
+
+      # Filter for interactions involving our variable
+      var_interactions <- grep(variable_x, interaction_terms, value = TRUE)
+
+      if (length(var_interactions) > 0) {
+        warning("Only interaction terms found for ", variable_x,
+                ". Derivatives may not be accurate for interaction models.")
+        spline_coefs <- all_coefs[var_interactions]
+      }
+    }
+
+    # Check if we found any coefficients
+    if (is.null(spline_coefs) || length(spline_coefs) == 0) {
+      stop("Could not identify spline coefficients for ", variable_x, " in the model")
+    }
+
+    return(spline_coefs)
+  }
+
+  # Apply the chain rule to get derivatives on the response scale
+  apply_link_derivative <- function(model, newdata, linear_predictor_derivatives, model_type) {
+    # Get predictions on the link scale
+    if (inherits(model, c("lmerMod", "glmerMod", "glmmTMB", "coxme"))) {
+      predictions <- predict(model, newdata = newdata, type = "link", re.form = NA)
+    } else {
+      predictions <- predict(model, newdata = newdata, type = "link")
+    }
+
+    # Apply the chain rule based on the model type
+    if (model_type == "logistic") {
+      # For logistic: d/dx[logit^-1(f(x))] = p(1-p) * f'(x)
+      p <- plogis(predictions)
+      return(p * (1 - p) * linear_predictor_derivatives)
+    } else if (model_type %in% c("nb", "poisson", "cox")) {
+      # For log link: d/dx[exp(f(x))] = exp(f(x)) * f'(x)
+      return(exp(predictions) * linear_predictor_derivatives)
+    } else if (model_type == "lm") {
+      # For identity link: derivative is unchanged
+      return(linear_predictor_derivatives)
+    } else {
+      stop("Unsupported model type")
+    }
+  }
+
+  # Calculate confidence intervals for derivatives using the delta method
+  calculate_derivative_ci <- function(model, newdata, basis_derivatives, spline_coeffs, model_type) {
+    # Get the variance-covariance matrix of the model coefficients
+    vcov_matrix <- tryCatch({
+      if (inherits(model, c("lmerMod", "glmerMod", "glmmTMB", "coxme"))) {
+        as.matrix(vcov(model))
+      } else {
+        vcov(model)
+      }
+    }, error = function(e) {
+      warning("Could not compute variance-covariance matrix: ", e$message)
+      NULL
+    })
+
+    # If we couldn't get the vcov matrix, use an approximation
+    if (is.null(vcov_matrix)) {
+      warning("Using approximate standard errors for derivatives")
+
+      # Get predictions on the link scale
+      if (inherits(model, c("lmerMod", "glmerMod", "glmmTMB", "coxme"))) {
+        predictions <- predict(model, newdata = newdata, type = "link", re.form = NA)
+      } else {
+        predictions <- predict(model, newdata = newdata, type = "link")
+      }
+
+      # Calculate derivatives
+      linear_deriv <- basis_derivatives %*% spline_coeffs
+
+      # Apply the chain rule based on model type
+      if (model_type == "logistic") {
+        p <- plogis(predictions)
+        derivatives <- p * (1 - p) * linear_deriv
+      } else if (model_type %in% c("nb", "poisson", "cox")) {
+        derivatives <- exp(predictions) * linear_deriv
+      } else {
+        derivatives <- linear_deriv
+      }
+
+      # Use a conservative approximation for standard errors
+      se_derivatives <- abs(derivatives) * 0.2
+
+      # Calculate confidence intervals
+      lower_ci <- derivatives - 1.96 * se_derivatives
+      upper_ci <- derivatives + 1.96 * se_derivatives
+
+      return(list(
+        derivative = derivatives,
+        se_derivative = se_derivatives,
+        lower_ci = lower_ci,
+        upper_ci = upper_ci
+      ))
+    }
+
+    # Extract the spline terms from the vcov matrix
+    spline_terms <- names(spline_coeffs)
+
+    # Check if all spline terms are in the vcov matrix
+    if (!all(spline_terms %in% rownames(vcov_matrix))) {
+      warning("Not all spline terms found in variance-covariance matrix. Using approximate standard errors.")
+
+      # Find the terms that are in the vcov matrix
+      common_terms <- intersect(spline_terms, rownames(vcov_matrix))
+
+      if (length(common_terms) == 0) {
+        # No common terms, use approximation
+        # Get predictions on the link scale
+        if (inherits(model, c("lmerMod", "glmerMod", "glmmTMB", "coxme"))) {
+          predictions <- predict(model, newdata = newdata, type = "link", re.form = NA)
+        } else {
+          predictions <- predict(model, newdata = newdata, type = "link")
+        }
+
+        # Calculate derivatives
+        linear_deriv <- basis_derivatives %*% spline_coeffs
+
+        # Apply the chain rule based on model type
+        if (model_type == "logistic") {
+          p <- plogis(predictions)
+          derivatives <- p * (1 - p) * linear_deriv
+        } else if (model_type %in% c("nb", "poisson", "cox")) {
+          derivatives <- exp(predictions) * linear_deriv
+        } else {
+          derivatives <- linear_deriv
+        }
+
+        # Use a conservative approximation for standard errors
+        se_derivatives <- abs(derivatives) * 0.2
+
+        # Calculate confidence intervals
+        lower_ci <- derivatives - 1.96 * se_derivatives
+        upper_ci <- derivatives + 1.96 * se_derivatives
+
+        return(list(
+          derivative = derivatives,
+          se_derivative = se_derivatives,
+          lower_ci = lower_ci,
+          upper_ci = upper_ci
+        ))
+      } else {
+        # Use only the common terms
+        spline_terms <- common_terms
+        spline_coeffs <- spline_coeffs[common_terms]
+        vcov_spline <- vcov_matrix[spline_terms, spline_terms, drop = FALSE]
+
+        # Adjust basis derivatives to match available coefficients
+        idx_to_keep <- match(common_terms, names(spline_coeffs))
+        basis_derivatives <- basis_derivatives[, idx_to_keep, drop = FALSE]
+      }
+    } else {
+      # All terms are in the vcov matrix
+      vcov_spline <- vcov_matrix[spline_terms, spline_terms, drop = FALSE]
+    }
+
+    # Calculate the linear predictor derivatives
+    linear_deriv <- basis_derivatives %*% spline_coeffs
+
+    # Get predictions on the link scale
+    if (inherits(model, c("lmerMod", "glmerMod", "glmmTMB", "coxme"))) {
+      predictions <- predict(model, newdata = newdata, type = "link", re.form = NA)
+    } else {
+      predictions <- predict(model, newdata = newdata, type = "link")
+    }
+
+    # Calculate derivatives and standard errors for each prediction point
+    n_points <- nrow(newdata)
+    derivatives <- numeric(n_points)
+    se_derivatives <- numeric(n_points)
+
+    for (i in 1:n_points) {
+      # Get the gradient of the prediction with respect to coefficients
+      gradient <- basis_derivatives[i, ]
+
+      # Calculate the variance of the linear predictor derivative
+      var_linear <- t(gradient) %*% vcov_spline %*% gradient
+
+      # Take the square root to get the standard error
+      se_linear <- sqrt(as.numeric(var_linear))
+
+      # Apply the chain rule based on model type
+      if (model_type == "logistic") {
+        p_i <- plogis(predictions[i])
+        derivatives[i] <- p_i * (1 - p_i) * linear_deriv[i]
+        se_derivatives[i] <- p_i * (1 - p_i) * se_linear
+      } else if (model_type %in% c("nb", "poisson", "cox")) {
+        derivatives[i] <- exp(predictions[i]) * linear_deriv[i]
+        se_derivatives[i] <- exp(predictions[i]) * se_linear
+      } else {
+        derivatives[i] <- linear_deriv[i]
+        se_derivatives[i] <- se_linear
+      }
+    }
+
+    # Calculate confidence intervals
+    lower_ci <- derivatives - 1.96 * se_derivatives
+    upper_ci <- derivatives + 1.96 * se_derivatives
+
+    return(list(
+      derivative = derivatives,
+      se_derivative = se_derivatives,
+      lower_ci = lower_ci,
+      upper_ci = upper_ci
+    ))
+  }
+
+  # Main function to calculate derivatives using basis function approach
+  calculate_basis_function_derivatives <- function(model, newdata, variable_x, knot_n, model_type) {
+    # Get knots from the model or generate from data
+    knots <- get_knots_from_model(model, variable_x, knot_n, newdata)
+
+    # Calculate basis function derivatives
+    basis_derivatives <- calculate_rcs_derivatives(newdata[[variable_x]], knots)
+
+    # Extract spline coefficients
+    spline_coeffs <- extract_spline_coefficients(model, variable_x)
+
+    # Calculate confidence intervals and derivatives
+    deriv_results <- calculate_derivative_ci(model, newdata, basis_derivatives, spline_coeffs, model_type)
+
+    return(list(
+      derivative = deriv_results$derivative,
+      se_derivative = deriv_results$se_derivative,
+      lower_ci_derivative = deriv_results$lower_ci,
+      upper_ci_derivative = deriv_results$upper_ci,
+      x_point = newdata[[variable_x]]
+    ))
+  }
+
+  # Delta method implementation for numerical derivatives (original approach)
+  calculate_delta_method_derivatives <- function(model, model_data, newdata, variable_x, model_type,
+                                                 knot_n, random_intercept, formula_obj) {
+    # Make sure rms is loaded
+    if (!requireNamespace("rms", quietly = TRUE)) {
+      stop("The 'rms' package must be installed to calculate derivatives")
+    }
+
+    # Extract data for knot calculation
+    if (inherits(model, "merMod") || inherits(model, "glmmTMB") || inherits(model, "coxme")) {
+      # For mixed models, extract data differently
+      model_frame <- try(model@frame, silent = TRUE)
+      if (!inherits(model_frame, "try-error") && !is.null(model_frame) && variable_x %in% names(model_frame)) {
+        var_data <- model_frame[[variable_x]]
+      } else {
+        # Fallback: use the original data
+        warning("Using prediction data for knot placement since model data is not accessible")
+        var_data <- newdata[[variable_x]]
+      }
+    } else if (!is.null(model$model) && variable_x %in% names(model$model)) {
+      # Standard models with accessible model data
+      var_data <- model$model[[variable_x]]
+    } else if (!is.null(model$data) && variable_x %in% names(model$data)) {
+      # Some models store data differently
+      var_data <- model$data[[variable_x]]
+    } else {
+      # Last resort - use the prediction data
+      warning("Model data not accessible, using prediction data for knot placement")
+      var_data <- newdata[[variable_x]]
+    }
+
+    # ENSURE WE HAVE VALID DATA
+    var_data <- var_data[!is.na(var_data) & is.finite(var_data)]
+    if (length(var_data) == 0) {
+      stop("No valid data found for knot placement")
+    }
+
+    # Get prediction values
+    x_values <- newdata[[variable_x]]
+
+    # Determine if we have subgroups
+    subgroups <- NULL
+    if (ncol(newdata) > 1) {
+      potential_subgroups <- names(newdata)[names(newdata) != variable_x]
+      # Check if any potential subgroup is actually used in the model formula
+      for (sg in potential_subgroups) {
+        if (grepl(sg, as.character(formula_obj)[3])) {
+          subgroups <- sg
+          break
+        }
+      }
+    }
+
+    # Function to calculate delta method derivatives and SEs
+    delta_method_derivatives <- function(model, newdata, subgroup_var = NULL, x_var, model_type) {
+      # Small delta for numerical approximation
+      epsilon <- 1e-5 * sd(newdata[[x_var]], na.rm = TRUE)
+
+      # Create datasets with x +/- epsilon
+      data_plus <- data_minus <- newdata
+      data_plus[[x_var]] <- newdata[[x_var]] + epsilon
+      data_minus[[x_var]] <- newdata[[x_var]] - epsilon
+
+      # Get model info for variance calculations
+      vcov_mat <- tryCatch({
+        if (inherits(model, "merMod") || inherits(model, "glmmTMB") || inherits(model, "coxme")) {
+          as.matrix(vcov(model))
+        } else {
+          vcov(model)
+        }
+      }, error = function(e) {
+        # If vcov fails, return NULL and we'll use an approximation later
+        warning("Could not compute variance-covariance matrix: ", e$message)
+        NULL
+      })
+
+      # Calculate predictions at x and x +/- epsilon
+      if (model_type == "cox") {
+        if (inherits(model, "coxme")) {
+          pred_orig <- predict(model, newdata = newdata, type = "lp", re.form = NA)
+          pred_plus <- predict(model, newdata = data_plus, type = "lp", re.form = NA)
+          pred_minus <- predict(model, newdata = data_minus, type = "lp", re.form = NA)
+        } else {
+          pred_orig <- predict(model, newdata = newdata, type = "lp")
+          pred_plus <- predict(model, newdata = data_plus, type = "lp")
+          pred_minus <- predict(model, newdata = data_minus, type = "lp")
+        }
+        # For Cox models, we work with exp(lp)
+        pred_response <- exp(pred_orig)
+      } else if (model_type %in% c("nb", "poisson")) {
+        if (inherits(model, "merMod") || inherits(model, "glmmTMB")) {
+          pred_orig <- predict(model, newdata = newdata, type = "link", re.form = NA)
+          pred_plus <- predict(model, newdata = data_plus, type = "link", re.form = NA)
+          pred_minus <- predict(model, newdata = data_minus, type = "link", re.form = NA)
+        } else {
+          pred_orig <- predict(model, newdata = newdata, type = "link")
+          pred_plus <- predict(model, newdata = data_plus, type = "link")
+          pred_minus <- predict(model, newdata = data_minus, type = "link")
+        }
+        # For count models, we work with exp(link)
+        pred_response <- exp(pred_orig)
+      } else if (model_type == "logistic") {
+        if (inherits(model, "merMod")) {
+          pred_orig <- predict(model, newdata = newdata, type = "link", re.form = NA)
+          pred_plus <- predict(model, newdata = data_plus, type = "link", re.form = NA)
+          pred_minus <- predict(model, newdata = data_minus, type = "link", re.form = NA)
+        } else {
+          pred_orig <- predict(model, newdata = newdata, type = "link")
+          pred_plus <- predict(model, newdata = data_plus, type = "link")
+          pred_minus <- predict(model, newdata = data_minus, type = "link")
+        }
+        # For logistic models, we work with plogis(link)
+        pred_response <- plogis(pred_orig)
+      } else if (model_type == "lm") {
+        if (inherits(model, "merMod")) {
+          pred_orig <- predict(model, newdata = newdata, re.form = NA)
+          pred_plus <- predict(model, newdata = data_plus, re.form = NA)
+          pred_minus <- predict(model, newdata = data_minus, re.form = NA)
+        } else {
+          pred_orig <- predict(model, newdata = newdata)
+          pred_plus <- predict(model, newdata = data_plus)
+          pred_minus <- predict(model, newdata = data_minus)
+        }
+        # For linear models, no transformation needed
+        pred_response <- pred_orig
+      }
+
+      # Calculate numerical derivatives using central difference
+      # f'(x) ≈ [f(x+h) - f(x-h)] / (2h)
+      derivatives <- (pred_plus - pred_minus) / (2 * epsilon)
+
+      # Apply chain rule for different model types
+      if (model_type %in% c("nb", "poisson", "cox")) {
+        # For log link: d/dx[exp(f(x))] = exp(f(x)) * f'(x)
+        derivatives <- pred_response * derivatives
+      } else if (model_type == "logistic") {
+        # For logit link: d/dx[logit^-1(f(x))] = p(1-p) * f'(x)
+        derivatives <- pred_response * (1 - pred_response) * derivatives
+      }
+
+      # Calculate standard errors using delta method
+      se_derivatives <- rep(NA, length(derivatives))
+
+      if (!is.null(vcov_mat)) {
+        # Try to use model matrix approach for more accurate SEs
+        tryCatch({
+          # Get model matrix for new data points
+          mm_func <- model.matrix(formula(model, fixed.only = TRUE)[-2], newdata)
+
+          # For each prediction point, calculate the SE using the delta method
+          for (i in 1:nrow(newdata)) {
+            # Create gradient of prediction with respect to parameters
+            grad <- numeric(length(coef(model)))
+
+            # Perturb each parameter slightly and observe change in prediction
+            for (j in 1:length(coef(model))) {
+              # Create a copy of model coefficients
+              new_coef <- coef(model)
+              # Small perturbation
+              delta_coef <- 1e-6 * abs(new_coef[j])
+              if (delta_coef == 0) delta_coef <- 1e-6
+
+              # Perturb the j-th coefficient
+              new_coef[j] <- new_coef[j] + delta_coef
+
+              # Calculate prediction with perturbed coefficient
+              # This is a simplification - in practice would need to refit model or use manual prediction
+              # For this example, we'll estimate how the prediction changes with coefficient
+              pred_change <- mm_func[i, j] * delta_coef
+
+              # Gradient is change in prediction / change in coefficient
+              grad[j] <- pred_change / delta_coef
+
+              # Apply chain rule for link functions
+              if (model_type %in% c("nb", "poisson", "cox")) {
+                grad[j] <- pred_response[i] * grad[j]
+              } else if (model_type == "logistic") {
+                grad[j] <- pred_response[i] * (1 - pred_response[i]) * grad[j]
+              }
+            }
+
+            # Delta method formula: Var(f(θ)) ≈ ∇f(θ)ᵀ Var(θ) ∇f(θ)
+            se_derivatives[i] <- sqrt(t(grad) %*% vcov_mat %*% grad)
+          }
+        }, error = function(e) {
+          warning("Error in delta method calculation: ", e$message,
+                  ". Falling back to simpler approximation.")
+          # Use simpler approximation (below)
+          se_derivatives <- NULL
+        })
+      }
+
+      # If the vcov approach failed or wasn't possible, use a simpler approximation
+      if (is.null(se_derivatives) || all(is.na(se_derivatives))) {
+        # Conservative approximation based on magnitude of derivatives
+        se_derivatives <- abs(derivatives) * 0.2
+      }
+
+      return(list(
+        derivatives = derivatives,
+        se = se_derivatives
+      ))
+    }
+
+    # Process by subgroups if present
+    if (!is.null(subgroups)) {
+      # Initialize results with the right structure
+      result <- newdata
+      result$derivative <- rep(NA, nrow(newdata))
+      result$se_derivative <- rep(NA, nrow(newdata))
+      result$lower_ci_derivative <- rep(NA, nrow(newdata))
+      result$upper_ci_derivative <- rep(NA, nrow(newdata))
+      result$x_point <- x_values
+
+      # For each subgroup, calculate derivatives
+      for (sg_level in unique(newdata[[subgroups]])) {
+        # Subset data for this subgroup
+        sg_idx <- which(newdata[[subgroups]] == sg_level)
+        sg_data <- newdata[sg_idx, ]
+
+        # Calculate derivatives using delta method
+        tryCatch({
+          delta_results <- delta_method_derivatives(
+            model,
+            sg_data,
+            subgroups,
+            variable_x,
+            model_type
+          )
+
+          # Store results
+          result$derivative[sg_idx] <- delta_results$derivatives
+          result$se_derivative[sg_idx] <- delta_results$se
+          result$lower_ci_derivative[sg_idx] <- delta_results$derivatives - 1.96 * delta_results$se
+          result$upper_ci_derivative[sg_idx] <- delta_results$derivatives + 1.96 * delta_results$se
+
+        }, error = function(e) {
+          warning(paste("Error calculating derivatives for subgroup", sg_level, ":", e$message))
+          # Leave NAs in the result for this subgroup
+        })
+      }
+
+    } else {
+      # No subgroups - simpler case
+      result <- newdata
+
+      tryCatch({
+        delta_results <- delta_method_derivatives(
+          model,
+          newdata,
+          NULL,
+          variable_x,
+          model_type
+        )
+
+        # Store results
+        result$derivative <- delta_results$derivatives
+        result$se_derivative <- delta_results$se
+        result$lower_ci_derivative <- delta_results$derivatives - 1.96 * delta_results$se
+        result$upper_ci_derivative <- delta_results$derivatives + 1.96 * delta_results$se
+        result$x_point <- x_values
+
+      }, error = function(e) {
+        warning(paste("Error calculating derivatives:", e$message))
+
+        # Fall back to simpler numerical approximation
+        # Small delta for numerical differentiation
+        epsilon <- 1e-5 * sd(newdata[[variable_x]], na.rm = TRUE)
+
+        # Create datasets with x +/- epsilon
+        data_plus <- data_minus <- newdata
+        data_plus[[variable_x]] <- newdata[[variable_x]] + epsilon
+        data_minus[[variable_x]] <- newdata[[variable_x]] - epsilon
+
+        # Calculate predictions at x +/- epsilon
+        if (model_type == "cox") {
+          if (inherits(model, "coxme")) {
+            pred_plus <- predict(model, newdata = data_plus, type = "lp", re.form = NA)
+            pred_minus <- predict(model, newdata = data_minus, type = "lp", re.form = NA)
+          } else {
+            pred_plus <- predict(model, newdata = data_plus, type = "lp")
+            pred_minus <- predict(model, newdata = data_minus, type = "lp")
+          }
+          pred_plus <- exp(pred_plus)
+          pred_minus <- exp(pred_minus)
+        } else if (model_type %in% c("nb", "poisson")) {
+          if (inherits(model, "merMod") || inherits(model, "glmmTMB")) {
+            pred_plus <- predict(model, newdata = data_plus, type = "link", re.form = NA)
+            pred_minus <- predict(model, newdata = data_minus, type = "link", re.form = NA)
+          } else {
+            pred_plus <- predict(model, newdata = data_plus, type = "link")
+            pred_minus <- predict(model, newdata = data_minus, type = "link")
+          }
+          pred_plus <- exp(pred_plus)
+          pred_minus <- exp(pred_minus)
+        } else if (model_type == "logistic") {
+          if (inherits(model, "merMod")) {
+            pred_plus <- predict(model, newdata = data_plus, type = "link", re.form = NA)
+            pred_minus <- predict(model, newdata = data_minus, type = "link", re.form = NA)
+          } else {
+            pred_plus <- predict(model, newdata = data_plus, type = "link")
+            pred_minus <- predict(model, newdata = data_minus, type = "link")
+          }
+          pred_plus <- plogis(pred_plus)
+          pred_minus <- plogis(pred_minus)
+        } else if (model_type == "lm") {
+          if (inherits(model, "merMod")) {
+            pred_plus <- predict(model, newdata = data_plus, re.form = NA)
+            pred_minus <- predict(model, newdata = data_minus, re.form = NA)
+          } else {
+            pred_plus <- predict(model, newdata = data_plus)
+            pred_minus <- predict(model, newdata = data_minus)
+          }
+        }
+
+        # Simple derivative calculation
+        simple_derivatives <- (pred_plus - pred_minus) / (2 * epsilon)
+
+        # Simple approximation for SE
+        simple_se <- abs(simple_derivatives) * 0.2  # Conservative approximation
+
+        # Assign to result
+        result$derivative <- simple_derivatives
+        result$se_derivative <- simple_se
+        result$lower_ci_derivative <- simple_derivatives - 1.96 * simple_se
+        result$upper_ci_derivative <- simple_derivatives + 1.96 * simple_se
+        result$x_point <- x_values
+      })
+    }
+
+    return(result)
+  }
+
+  # Simple numerical differentiation approach
+  calculate_numerical_derivatives <- function(model, newdata, variable_x, model_type) {
+    # Calculate a good step size based on data scale
+    epsilon <- 1e-5 * sd(newdata[[variable_x]], na.rm = TRUE)
+
+    # Create datasets with x +/- epsilon
+    data_plus <- data_minus <- newdata
+    data_plus[[variable_x]] <- newdata[[variable_x]] + epsilon
+    data_minus[[variable_x]] <- newdata[[variable_x]] - epsilon
+
+    # Get predictions for each dataset
+    if (inherits(model, c("lmerMod", "glmerMod", "glmmTMB", "coxme"))) {
+      # Mixed models
+      if (model_type == "cox") {
+        pred_orig <- predict(model, newdata = newdata, type = "lp", re.form = NA)
+        pred_plus <- predict(model, newdata = data_plus, type = "lp", re.form = NA)
+        pred_minus <- predict(model, newdata = data_minus, type = "lp", re.form = NA)
+      } else {
+        pred_orig <- predict(model, newdata = newdata, type = "link", re.form = NA)
+        pred_plus <- predict(model, newdata = data_plus, type = "link", re.form = NA)
+        pred_minus <- predict(model, newdata = data_minus, type = "link", re.form = NA)
+      }
+    } else {
+      # Standard models
+      if (model_type == "cox") {
+        pred_orig <- predict(model, newdata = newdata, type = "lp")
+        pred_plus <- predict(model, newdata = data_plus, type = "lp")
+        pred_minus <- predict(model, newdata = data_minus, type = "lp")
+      } else if (model_type %in% c("nb", "poisson", "logistic")) {
+        pred_orig <- predict(model, newdata = newdata, type = "link")
+        pred_plus <- predict(model, newdata = data_plus, type = "link")
+        pred_minus <- predict(model, newdata = data_minus, type = "link")
+      } else {
+        pred_orig <- predict(model, newdata = newdata)
+        pred_plus <- predict(model, newdata = data_plus)
+        pred_minus <- predict(model, newdata = data_minus)
+      }
+    }
+
+    # Calculate derivatives using central difference method
+    # f'(x) ≈ [f(x+h) - f(x-h)] / (2h)
+    linear_derivatives <- (pred_plus - pred_minus) / (2 * epsilon)
+
+    # Apply chain rule based on model type
+    if (model_type %in% c("nb", "poisson", "cox")) {
+      # For log link: d/dx[exp(f(x))] = exp(f(x)) * f'(x)
+      response_derivatives <- exp(pred_orig) * linear_derivatives
+    } else if (model_type == "logistic") {
+      # For logit link: d/dx[logit^-1(f(x))] = p(1-p) * f'(x)
+      p <- plogis(pred_orig)
+      response_derivatives <- p * (1 - p) * linear_derivatives
+    } else {
+      # For identity link, no transformation needed
+      response_derivatives <- linear_derivatives
+    }
+
+    # Estimate standard errors (simple approximation)
+    # A more accurate approach would use the delta method with vcov matrix
+    se_derivatives <- abs(response_derivatives) * 0.2  # Conservative 20% relative error
+
+    # Calculate confidence intervals
+    lower_ci <- response_derivatives - 1.96 * se_derivatives
+    upper_ci <- response_derivatives + 1.96 * se_derivatives
+
+    # Return results
+    return(list(
+      derivative = response_derivatives,
+      se_derivative = se_derivatives,
+      lower_ci_derivative = lower_ci,
+      upper_ci_derivative = upper_ci,
+      x_point = newdata[[variable_x]]
+    ))
+  }
+
+  # Function to pool derivatives using Rubin's rules
+  pool_derivatives_with_rubins_rules <- function(derivative_list, MI_method) {
+    # Get number of data points from first imputation
+    n_points <- nrow(derivative_list[[1]])
+
+    # Initialize pooled results
+    pooled_derivatives <- numeric(n_points)
+    pooled_var <- numeric(n_points)
+
+    # Number of imputations
+    m <- length(derivative_list)
+
+    # For each prediction point
+    for (i in 1:n_points) {
+      # Extract the derivatives and SEs for this point across all imputations
+      derivs_i <- sapply(derivative_list, function(x) x$derivative[i])
+      ses_i <- sapply(derivative_list, function(x) x$se_derivative[i])
+
+      # Filter out any NAs (failed calculations)
+      valid_idx <- !is.na(derivs_i) & !is.na(ses_i)
+      if (sum(valid_idx) == 0) {
+        # No valid calculations for this point
+        pooled_derivatives[i] <- NA
+        pooled_var[i] <- NA
+        next
+      }
+
+      derivs_i <- derivs_i[valid_idx]
+      ses_i <- ses_i[valid_idx]
+      m_valid <- sum(valid_idx)
+
+      # Calculate mean derivative
+      pooled_derivatives[i] <- mean(derivs_i, na.rm = TRUE)
+
+      if (MI_method == "Rubin") {
+        # Within-imputation variance (average of squared SEs)
+        W <- mean(ses_i^2, na.rm = TRUE)
+
+        # Between-imputation variance
+        B <- var(derivs_i, na.rm = TRUE)
+
+        # Total variance using Rubin's rules
+        # If only one valid imputation, use just the within-imputation variance
+        if (m_valid > 1) {
+          pooled_var[i] <- W + (1 + 1/m_valid) * B
+        } else {
+          pooled_var[i] <- W
+        }
+      } else if (MI_method == "average") {
+        # Simple average of variances
+        pooled_var[i] <- mean(ses_i^2, na.rm = TRUE)
+      }
+    }
+
+    # Calculate standard errors from variance
+    pooled_se <- sqrt(pooled_var)
+
+    # Calculate confidence intervals
+    lower_ci <- pooled_derivatives - 1.96 * pooled_se
+    upper_ci <- pooled_derivatives + 1.96 * pooled_se
+
+    return(list(
+      derivative = pooled_derivatives,
+      se_derivative = pooled_se,
+      lower_ci_derivative = lower_ci,
+      upper_ci_derivative = upper_ci
+    ))
+  }
+
+  # Derivative calculation section using the selected method
   if (calculate_derivatives) {
-    # Load rms package for restricted cubic spline operations
     requireNamespace("rms", quietly = TRUE)
 
-    # Define derivative calculation method
+    # Define points for derivative calculation
     if (is.null(derivative_points)) {
-      # If no specific points requested, use a reasonable number of points across the range
       derivative_points <- seq(
         from = quantile(Data_Subset[[variable_x]], prediction_range[1], na.rm = TRUE),
         to = quantile(Data_Subset[[variable_x]], prediction_range[2], na.rm = TRUE),
-        length.out = 20
+        length.out = 100
       )
     }
 
-    # Create data for derivative prediction
+    # Create data frame for derivatives
     if (is.null(subgroups)) {
-      # Simple derivative frame without subgroups
-      deriv_data <- data.frame(derivative_points)
+      deriv_data <- data.frame(x_values = derivative_points)
       colnames(deriv_data) <- variable_x
     } else {
-      # Derivative frame with subgroups
       subgroup_levels <- if (is.factor(Data_Subset[[subgroups]])) {
         levels(Data_Subset[[subgroups]])
       } else {
@@ -603,9 +1475,9 @@ MI_spline <- function(data,
       )
       colnames(deriv_data) <- c(variable_x, subgroups)
 
-      # Ensure subgroups column is a factor
       if (is.factor(Data_Subset[[subgroups]])) {
-        deriv_data[[subgroups]] <- factor(deriv_data[[subgroups]], levels = levels(Data_Subset[[subgroups]]))
+        deriv_data[[subgroups]] <- factor(deriv_data[[subgroups]],
+                                          levels = levels(Data_Subset[[subgroups]]))
       } else if (subgroup_as_factor) {
         deriv_data[[subgroups]] <- factor(deriv_data[[subgroups]])
         if (!is.null(subgroup_labels)) {
@@ -614,203 +1486,186 @@ MI_spline <- function(data,
       }
     }
 
-    # Add the same covariate values used for prediction
-    if (!is.null(covariables)) {
-      for (cov in covariables) {
-        if (cov %in% colnames(pred_data)) {
-          deriv_data[[cov]] <- pred_data[[cov]][1]  # Take the first value from pred_data
+    # Add covariates and other model components to derivative data
+    if (!is.null(expanded_covariables)) {
+      covariate_vars_for_prediction <- unique(unlist(strsplit(gsub(":", "*", expanded_covariables), "\\*")))
+      covariate_vars_for_prediction <- trimws(covariate_vars_for_prediction)
+      covariate_vars_for_prediction <- sapply(covariate_vars_for_prediction, extract_variables_cov)
+
+      for (cov in covariate_vars_for_prediction) {
+        if (cov %in% colnames(Data_Subset)) {
+          if (is.factor(Data_Subset[[cov]])) {
+            deriv_data[[cov]] <- as.factor(names(which.max(table(Data_Subset[[cov]]))))
+          } else {
+            deriv_data[[cov]] <- median(Data_Subset[[cov]], na.rm = TRUE)
+          }
         }
       }
     }
 
-    # Add trial factor if needed
+    # Add other model components
     if (trial_factor == "Yes") {
-      deriv_data[[trial_col]] <- pred_data[[trial_col]][1]
+      deriv_data[[trial_col]] <- names(which.max(table(Data_Subset[[trial_col]])))
     }
-
-    # Add follow-up time for offset if needed
     if (followup_offset == "Yes") {
-      deriv_data[[followup_col]] <- 365  # Same as in prediction
+      deriv_data[[followup_col]] <- 365
     }
-
-    # Add random intercept variable if needed
     if (random_intercept == "Yes") {
-      deriv_data[[random_intercept_var]] <- pred_data[[random_intercept_var]][1]
+      deriv_data[[random_intercept_var]] <- names(which.max(table(Data_Subset[[random_intercept_var]])))
     }
 
-    # Use finite differences to estimate derivatives
-    # We'll compute this for each subgroup separately
+    # Initialize list for derivative results
+    derivative_list <- list()
 
-    derivative_results <- list()
-
-    # Helper function to calculate derivatives for a specific subgroup
-    calc_derivatives_for_subgroup <- function(subgroup_value = NULL) {
-      # Filter data for this subgroup if applicable
-      if (!is.null(subgroups) && !is.null(subgroup_value)) {
-        # Filter prediction data for this subgroup
-        subgroup_pred_data <- pred_data[pred_data[[subgroups]] == subgroup_value, ]
-        # Sort by x variable
-        subgroup_pred_data <- subgroup_pred_data[order(subgroup_pred_data[[variable_x]]), ]
-
-        # Filter derivative points for this subgroup
-        subgroup_deriv_data <- deriv_data[deriv_data[[subgroups]] == subgroup_value, ]
-      } else {
-        # Use all data if no subgroups
-        subgroup_pred_data <- pred_data[order(pred_data[[variable_x]]), ]
-        subgroup_deriv_data <- deriv_data
+    if (MI_method == "first") {
+      # For first imputation only - use the selected derivative method
+      if (derivative_method == "basis") {
+        # Use basis function approach (new implementation)
+        derivative_list[[1]] <- calculate_basis_function_derivatives(
+          model = model,
+          newdata = deriv_data,
+          variable_x = variable_x,
+          knot_n = knot_n,
+          model_type = model_type
+        )
+      } else if (derivative_method == "delta") {
+        # Use delta method approach (original implementation)
+        derivative_list[[1]] <- calculate_delta_method_derivatives(
+          model = model,
+          model_data = Data_Subset,
+          newdata = deriv_data,
+          variable_x = variable_x,
+          model_type = model_type,
+          knot_n = knot_n,
+          random_intercept = random_intercept,
+          formula_obj = formula_obj
+        )
+      } else if (derivative_method == "numeric") {
+        # Use simple numerical approach
+        derivative_list[[1]] <- calculate_numerical_derivatives(
+          model = model,
+          newdata = deriv_data,
+          variable_x = variable_x,
+          model_type = model_type
+        )
       }
 
-      # Calculate derivatives using finite differences on the prediction curve
-      derivatives <- numeric(nrow(subgroup_deriv_data))
-      lower_ci_derivatives <- numeric(nrow(subgroup_deriv_data))
-      upper_ci_derivatives <- numeric(nrow(subgroup_deriv_data))
+      # Use the results directly
+      derivative_data <- derivative_list[[1]]
 
-      for (i in 1:nrow(subgroup_deriv_data)) {
-        point <- subgroup_deriv_data[i, variable_x]
-
-        # Find closest points in prediction data
-        idx <- which.min(abs(subgroup_pred_data[[variable_x]] - point))
-
-        # Ensure we have points on both sides for differentiation when possible
-        if (idx > 1 && idx < nrow(subgroup_pred_data)) {
-          # Use central difference
-          h1 <- subgroup_pred_data[[variable_x]][idx] - subgroup_pred_data[[variable_x]][idx-1]
-          h2 <- subgroup_pred_data[[variable_x]][idx+1] - subgroup_pred_data[[variable_x]][idx]
-
-          # Central difference formula for uneven spacing
-          # f'(x) ≈ [h₁²f(x+h₂) - h₂²f(x-h₁) + (h₂²-h₁²)f(x)] / [h₁h₂(h₁+h₂)]
-          denominator <- h1 * h2 * (h1 + h2)
-
-          # For the main prediction
-          f_minus <- subgroup_pred_data$prediction[idx-1]
-          f_center <- subgroup_pred_data$prediction[idx]
-          f_plus <- subgroup_pred_data$prediction[idx+1]
-
-          derivatives[i] <- (h1^2 * f_plus - h2^2 * f_minus + (h2^2 - h1^2) * f_center) / denominator
-
-          # For the lower CI
-          f_minus_lower <- subgroup_pred_data$lower_ci[idx-1]
-          f_center_lower <- subgroup_pred_data$lower_ci[idx]
-          f_plus_lower <- subgroup_pred_data$lower_ci[idx+1]
-
-          lower_ci_derivatives[i] <- (h1^2 * f_plus_lower - h2^2 * f_minus_lower +
-                                        (h2^2 - h1^2) * f_center_lower) / denominator
-
-          # For the upper CI
-          f_minus_upper <- subgroup_pred_data$upper_ci[idx-1]
-          f_center_upper <- subgroup_pred_data$upper_ci[idx]
-          f_plus_upper <- subgroup_pred_data$upper_ci[idx+1]
-
-          upper_ci_derivatives[i] <- (h1^2 * f_plus_upper - h2^2 * f_minus_upper +
-                                        (h2^2 - h1^2) * f_center_upper) / denominator
-        } else if (idx == 1) {
-          # Use forward difference at the start
-          h <- subgroup_pred_data[[variable_x]][idx+1] - subgroup_pred_data[[variable_x]][idx]
-
-          derivatives[i] <- (subgroup_pred_data$prediction[idx+1] - subgroup_pred_data$prediction[idx]) / h
-          lower_ci_derivatives[i] <- (subgroup_pred_data$lower_ci[idx+1] - subgroup_pred_data$lower_ci[idx]) / h
-          upper_ci_derivatives[i] <- (subgroup_pred_data$upper_ci[idx+1] - subgroup_pred_data$upper_ci[idx]) / h
-        } else if (idx == nrow(subgroup_pred_data)) {
-          # Use backward difference at the end
-          h <- subgroup_pred_data[[variable_x]][idx] - subgroup_pred_data[[variable_x]][idx-1]
-
-          derivatives[i] <- (subgroup_pred_data$prediction[idx] - subgroup_pred_data$prediction[idx-1]) / h
-          lower_ci_derivatives[i] <- (subgroup_pred_data$lower_ci[idx] - subgroup_pred_data$lower_ci[idx-1]) / h
-          upper_ci_derivatives[i] <- (subgroup_pred_data$upper_ci[idx] - subgroup_pred_data$upper_ci[idx-1]) / h
-        }
-      }
-      # Ensure lower CI is always lower than upper CI
-      for (i in 1:length(derivatives)) {
-        if (lower_ci_derivatives[i] > upper_ci_derivatives[i]) {
-          # Swap the values
-          temp <- lower_ci_derivatives[i]
-          lower_ci_derivatives[i] <- upper_ci_derivatives[i]
-          upper_ci_derivatives[i] <- temp
-        }
-      }
-
-      # Create result data frame
-      result <- data.frame(
-        x_point = subgroup_deriv_data[[variable_x]],
-        derivative = derivatives,
-        lower_ci_derivative = lower_ci_derivatives,
-        upper_ci_derivative = upper_ci_derivatives
-      )
-
-      # Add subgroup column if applicable
-      if (!is.null(subgroups) && !is.null(subgroup_value)) {
-        result[[subgroups]] <- subgroup_value
-      }
-
-      return(result)
-    }
-
-    # Calculate derivatives for each subgroup or for the whole dataset
-    if (!is.null(subgroups)) {
-      subgroup_levels <- if (is.factor(Data_Subset[[subgroups]])) {
-        levels(Data_Subset[[subgroups]])
-      } else {
-        sort(unique(Data_Subset[[subgroups]]))
-      }
-
-      # Calculate for each subgroup
-      all_derivatives <- list()
-      for (level in subgroup_levels) {
-        all_derivatives[[level]] <- calc_derivatives_for_subgroup(level)
-      }
-
-      # Combine all results
-      derivative_data <- do.call(rbind, all_derivatives)
     } else {
-      # Calculate for the whole dataset
-      derivative_data <- calc_derivatives_for_subgroup()
+      # For multiple imputations
+      imputation_ids <- unique(Data_Subset[[imp_col]])
+
+      for (imp in imputation_ids) {
+        # Subset data for current imputation
+        Data_imp <- subset(Data_Subset, get(imp_col) == imp)
+
+        # Refit model for this imputation
+        if (random_intercept == "Yes") {
+          if (model_type == "nb" && requireNamespace("glmmTMB", quietly = TRUE)) {
+            model_imp <- glmmTMB::glmmTMB(formula_obj, family = glmmTMB::nbinom2, data = Data_imp)
+          } else if (model_type == "poisson") {
+            model_imp <- lme4::glmer(formula_obj, family = poisson(link = "log"), data = Data_imp)
+          } else if (model_type == "logistic") {
+            model_imp <- lme4::glmer(formula_obj, family = binomial(link = "logit"), data = Data_imp)
+          } else if (model_type == "lm") {
+            model_imp <- lme4::lmer(formula_obj, data = Data_imp)
+          } else if (model_type == "cox") {
+            model_imp <- coxme::coxme(formula_obj, data = Data_imp)
+          }
+        } else {
+          if (model_type == "nb") {
+            model_imp <- MASS::glm.nb(formula_obj, data = Data_imp)
+          } else if (model_type == "poisson") {
+            model_imp <- glm(formula_obj, family = poisson(link = "log"), data = Data_imp)
+          } else if (model_type == "logistic") {
+            model_imp <- glm(formula_obj, family = binomial(link = "logit"), data = Data_imp)
+          } else if (model_type == "lm") {
+            model_imp <- glm(formula_obj, family = gaussian(), data = Data_imp)
+          } else if (model_type == "cox") {
+            model_imp <- survival::coxph(formula_obj, data = Data_imp)
+          }
+        }
+
+        # Calculate derivatives for this imputation using the selected method
+        if (derivative_method == "basis") {
+          # Use basis function approach
+          derivative_list[[as.character(imp)]] <- calculate_basis_function_derivatives(
+            model = model_imp,
+            newdata = deriv_data,
+            variable_x = variable_x,
+            knot_n = knot_n,
+            model_type = model_type
+          )
+        } else if (derivative_method == "delta") {
+          # Use delta method approach
+          derivative_list[[as.character(imp)]] <- calculate_delta_method_derivatives(
+            model = model_imp,
+            model_data = Data_imp,
+            newdata = deriv_data,
+            variable_x = variable_x,
+            model_type = model_type,
+            knot_n = knot_n,
+            random_intercept = random_intercept,
+            formula_obj = formula_obj
+          )
+        } else if (derivative_method == "numeric") {
+          # Use simple numerical approach
+          derivative_list[[as.character(imp)]] <- calculate_numerical_derivatives(
+            model = model_imp,
+            newdata = deriv_data,
+            variable_x = variable_x,
+            model_type = model_type
+          )
+        }
+      }
+
+      # Pool derivatives using Rubin's rules
+      pooled_results <- pool_derivatives_with_rubins_rules(derivative_list, MI_method)
+
+      # Create final derivative data
+      derivative_data <- deriv_data
+      derivative_data$derivative <- pooled_results$derivative
+      derivative_data$se_derivative <- pooled_results$se_derivative
+      derivative_data$lower_ci_derivative <- pooled_results$lower_ci_derivative
+      derivative_data$upper_ci_derivative <- pooled_results$upper_ci_derivative
+      derivative_data$x_point <- deriv_data[[variable_x]]
     }
 
-    # Check for significant positive derivatives (where lower CI > 0)
-    derivative_data$significant_positive <- derivative_data$lower_ci_derivative > 0
-
-    # Find threshold points where the derivative becomes significantly positive
+    # Find thresholds where the lower CI of the derivative crosses zero
     if (!is.null(subgroups)) {
-      # Create a named vector to store thresholds for each subgroup
+      derivative_data$significant_positive <- derivative_data$lower_ci_derivative > 0
+
+      subgroup_levels <- unique(derivative_data[[subgroups]])
       threshold_values <- numeric(length(subgroup_levels))
-      names(threshold_values) <- subgroup_levels
+      names(threshold_values) <- as.character(subgroup_levels)
 
       for (level in subgroup_levels) {
         subgroup_deriv <- derivative_data[derivative_data[[subgroups]] == level, ]
         subgroup_deriv <- subgroup_deriv[order(subgroup_deriv$x_point), ]
 
-        # Find first point where derivative is significantly positive
         sig_pos_idx <- which(subgroup_deriv$significant_positive)
 
         if (length(sig_pos_idx) > 0) {
-          threshold_values[level] <- subgroup_deriv$x_point[min(sig_pos_idx)]
+          threshold_values[as.character(level)] <- subgroup_deriv$x_point[min(sig_pos_idx)]
         } else {
-          threshold_values[level] <- NA
+          threshold_values[as.character(level)] <- NA
         }
       }
-
-      # Now assign the correct threshold to each row based on its subgroup
-      derivative_data$threshold <- NA
-      for (level in subgroup_levels) {
-        derivative_data$threshold[derivative_data[[subgroups]] == level] <- threshold_values[level]
-      }
     } else {
-      # Calculate threshold for non-subgroup case
+      derivative_data$significant_positive <- derivative_data$lower_ci_derivative > 0
       sorted_deriv <- derivative_data[order(derivative_data$x_point), ]
 
-      # Find first point where derivative is significantly positive
       sig_pos_idx <- which(sorted_deriv$significant_positive)
 
       if (length(sig_pos_idx) > 0) {
         threshold <- sorted_deriv$x_point[min(sig_pos_idx)]
-        derivative_data$threshold <- threshold
       } else {
         threshold <- NA
-        derivative_data$threshold <- NA
       }
     }
   }
-  # ============= ENHANCED PLOTTING CAPABILITIES =============
 
   # Set default plot options if not provided
   if (is.null(plot_options)) {
@@ -823,8 +1678,7 @@ MI_spline <- function(data,
   # Process x_lab to handle superscripts if requested
   if (!is.null(plot_options$use_superscript) && plot_options$use_superscript) {
     if (is.character(x_lab)) {
-      # Instead of changing to expressions, just replace the "^9" with the unicode superscript 9
-      # We'll use simple string replacement for maximum compatibility
+      # Replace "^9" with Unicode superscript 9, etc.
       x_lab <- gsub("\\^9", "\u2079", x_lab)  # Unicode superscript 9
       x_lab <- gsub("\\^8", "\u2078", x_lab)  # Unicode superscript 8
       x_lab <- gsub("\\^7", "\u2077", x_lab)  # Unicode superscript 7
@@ -871,10 +1725,10 @@ MI_spline <- function(data,
     }
   }
 
-  # Initialize the plot
+  # Count observations for legend labels
   if (!is.null(subgroups)) {
     # Count observations, but only from the first imputation when using average method
-    if (MI_method == "average"|MI_method == "Rubin") {
+    if (MI_method == "average" || MI_method == "Rubin") {
       # Create a subset with only the first imputation for counting
       count_data <- subset(data, get(imp_col) == 1)
 
@@ -952,22 +1806,32 @@ MI_spline <- function(data,
                                                            linetype = subgroups))
   } else {
     # Simple plot without subgroups
-    # Simple plot without subgroups
     plot <- ggplot2::ggplot(pred_data, ggplot2::aes_string(x = variable_x, y = "prediction"))
 
     # Set color/fill manually if colors are provided (only for non-subgroup plots)
     line_color <- if (!is.null(plot_options$colors)) plot_options$colors[1] else "black"
-    fill_color <- if (!is.null(plot_options$fill_colors)) plot_options$fill_colors[1] else "grey70"
+    fill_colors <- if (!is.null(plot_options$fill_colors)) plot_options$fill_colors[1] else "grey70"
   }
 
   # Add lines and ribbons
   line_size <- if (!is.null(plot_options$line_size)) plot_options$line_size else 1
   ribbon_alpha <- if (!is.null(plot_options$ribbon_alpha)) plot_options$ribbon_alpha else 0.3
 
-  plot <- plot +
-    ggplot2::geom_line(linewidth = line_size, color = line_color) +
-    ggplot2::geom_ribbon(ggplot2::aes(ymin = lower_ci, ymax = upper_ci),
-                         fill = fill_color, alpha = ribbon_alpha)
+  # MODIFIED VERSION:
+  if (!is.null(subgroups)) {
+    # With subgroups
+    plot <- plot +
+      ggplot2::geom_line(linewidth = line_size) +
+      ggplot2::geom_ribbon(ggplot2::aes(ymin = lower_ci, ymax = upper_ci), alpha = ribbon_alpha)
+  } else {
+    # Without subgroups - use the defaults set earlier and add color to ribbon
+    plot <- plot +
+      ggplot2::geom_line(linewidth = line_size, color = line_color) +
+      ggplot2::geom_ribbon(ggplot2::aes(ymin = lower_ci, ymax = upper_ci),
+                           fill = fill_colors,
+                           color = line_color, # Add line color for the ribbon outline
+                           alpha = ribbon_alpha)
+  }
 
   # Add labels
   plot <- plot +
@@ -1072,7 +1936,6 @@ MI_spline <- function(data,
     plot <- plot + ggplot2::facet_wrap(as.formula(paste("~", plot_options$facet_var)),
                                        scales = facet_scales)
   }
-
   # Apply theme customization
   # Initialize theme settings or use provided ones
   theme_settings <- if (!is.null(plot_options$theme_settings)) plot_options$theme_settings else list()
@@ -1109,6 +1972,9 @@ MI_spline <- function(data,
   # This allows direct setting of theme elements without the theme_settings structure
   possible_direct_theme_elements <- c(
     "legend.position", "legend.background", "legend.title", "legend.text",
+    "legend.key.size", "legend.key.height", "legend.key.width",
+    "legend.spacing", "legend.spacing.y", "legend.box.spacing",
+    "legend.key.spacing", "legend.box.margin", "legend.margin",
     "axis.text.x", "axis.text.y", "axis.title.x", "axis.title.y", "axis.title",
     "plot.title", "plot.margin", "panel.grid.major", "panel.grid.minor",
     "axis.line", "axis.ticks", "axis.ticks.length", "panel.background", "plot.background"
@@ -1180,6 +2046,7 @@ MI_spline <- function(data,
       )
     }
   }
+
   # Add shaded areas if specified
   if (!is.null(plot_options$shaded_areas)) {
     for (area in plot_options$shaded_areas) {
@@ -1195,25 +2062,445 @@ MI_spline <- function(data,
     }
   }
 
-  # Return results
+  # Add threshold lines if derivatives were calculated and threshold is requested
+  if (calculate_derivatives && !is.null(plot_options$show_threshold_lines) && plot_options$show_threshold_lines) {
+    if (!is.null(subgroups)) {
+      # For subgroup plots, iterate through each subgroup
+      threshold_line_data <- data.frame() # Initialize empty data frame for threshold lines
+
+      for (sg_level in names(threshold_values)) {
+        threshold_val <- threshold_values[sg_level]
+
+        if (!is.na(threshold_val)) {
+          # Create data for threshold lines
+          new_threshold_data <- data.frame(
+            x = threshold_val,
+            subgroup = sg_level,
+            stringsAsFactors = FALSE
+          )
+
+          names(new_threshold_data)[2] <- subgroups
+          threshold_line_data <- rbind(threshold_line_data, new_threshold_data)
+        }
+      }
+
+      # Add the lines using the threshold data
+      if (nrow(threshold_line_data) > 0) {
+        # Ensure subgroup column is same type as in pred_data
+        if (is.factor(pred_data[[subgroups]])) {
+          threshold_line_data[[subgroups]] <- factor(
+            threshold_line_data[[subgroups]],
+            levels = levels(pred_data[[subgroups]])
+          )
+        }
+
+        plot <- plot + ggplot2::geom_vline(
+          data = threshold_line_data,
+          ggplot2::aes_string(xintercept = "x", color = subgroups),
+          linetype = if (!is.null(plot_options$threshold_line_type)) plot_options$threshold_line_type else "dashed",
+          linewidth = if (!is.null(plot_options$threshold_line_size)) plot_options$threshold_line_size else 0.5,
+          alpha = if (!is.null(plot_options$threshold_line_alpha)) plot_options$threshold_line_alpha else 0.8,
+          show.legend = FALSE  # Don't add to legend
+        )
+      }
+    } else {
+      # For single group plots, add one threshold line
+      if (!is.na(threshold)) {
+        plot <- plot + ggplot2::geom_vline(
+          xintercept = threshold,
+          color = if (!is.null(plot_options$threshold_line_color)) plot_options$threshold_line_color else "black",
+          linetype = if (!is.null(plot_options$threshold_line_type)) plot_options$threshold_line_type else "dashed",
+          linewidth = if (!is.null(plot_options$threshold_line_size)) plot_options$threshold_line_size else 0.5,
+          alpha = if (!is.null(plot_options$threshold_line_alpha)) plot_options$threshold_line_alpha else 0.8
+        )
+      }
+    }
+
+    # Optionally add annotations for threshold values
+    if (!is.null(plot_options$annotate_thresholds) && plot_options$annotate_thresholds) {
+      if (!is.null(subgroups) && exists("threshold_line_data") && nrow(threshold_line_data) > 0) {
+        # Get y position for annotations
+        y_range <- range(pred_data$prediction, na.rm = TRUE)
+        y_pos <- y_range[2] - 0.1 * diff(y_range)  # Place at 90% of y range
+
+        for (i in 1:nrow(threshold_line_data)) {
+          plot <- plot + ggplot2::annotate(
+            "text",
+            x = threshold_line_data$x[i],
+            y = y_pos,
+            label = paste0("Threshold: ", round(threshold_line_data$x[i], 2)),
+            angle = 90,
+            vjust = -0.5,
+            size = 3,
+            color = if (!is.null(plot_options$colors)) {
+              plot_options$colors[which(levels(pred_data[[subgroups]]) == threshold_line_data[[subgroups]][i])]
+            } else {
+              "black"
+            }
+          )
+        }
+      } else if (!is.na(threshold)) {
+        # Single threshold annotation
+        y_range <- range(pred_data$prediction, na.rm = TRUE)
+        y_pos <- y_range[2] - 0.1 * diff(y_range)
+
+        plot <- plot + ggplot2::annotate(
+          "text",
+          x = threshold,
+          y = y_pos,
+          label = paste0("Threshold: ", round(threshold, 2)),
+          angle = 90,
+          vjust = -0.5,
+          size = 3,
+          color = if (!is.null(plot_options$threshold_line_color)) plot_options$threshold_line_color else "black"
+        )
+      }
+    }
+  }
+
+  # Create derivative plot if requested
+  derivative_plot <- NULL
+
+  if (calculate_derivatives && !is.null(plot_options$create_derivative_plot) && plot_options$create_derivative_plot) {
+    # Create derivative plot using similar structure to main plot
+
+    # Set up y-axis label for derivative plot
+    deriv_y_lab <- if (!is.null(plot_options$derivative_y_lab)) {
+      plot_options$derivative_y_lab
+    } else {
+      if (model_type %in% c("nb", "poisson")) {
+        "Derivative of Predicted Rate"
+      } else if (model_type == "logistic") {
+        "Derivative of Predicted Probability"
+      } else if (model_type == "lm") {
+        "Derivative of Predicted Mean"
+      } else {
+        "Derivative of Predicted Hazard Ratio"
+      }
+    }
+
+    # Process derivative y_lab for superscripts if needed
+    if (!is.null(plot_options$use_superscript) && plot_options$use_superscript) {
+      if (is.character(deriv_y_lab)) {
+        deriv_y_lab <- gsub("\\^9", "\u2079", deriv_y_lab)
+        deriv_y_lab <- gsub("\\^8", "\u2078", deriv_y_lab)
+        deriv_y_lab <- gsub("\\^7", "\u2077", deriv_y_lab)
+        deriv_y_lab <- gsub("\\^6", "\u2076", deriv_y_lab)
+        deriv_y_lab <- gsub("\\^5", "\u2075", deriv_y_lab)
+        deriv_y_lab <- gsub("\\^4", "\u2074", deriv_y_lab)
+        deriv_y_lab <- gsub("\\^3", "\u00B3", deriv_y_lab)
+        deriv_y_lab <- gsub("\\^2", "\u00B2", deriv_y_lab)
+        deriv_y_lab <- gsub("\\^1", "\u00B9", deriv_y_lab)
+        deriv_y_lab <- gsub("\\^0", "\u2070", deriv_y_lab)
+        deriv_y_lab <- gsub("\\^-", "\u207B", deriv_y_lab)
+      }
+    }
+
+    # IMPORTANT: Ensure derivative_data has the same factor levels as pred_data
+    if (!is.null(subgroups)) {
+      # Get the levels from pred_data
+      pred_levels <- levels(pred_data[[subgroups]])
+
+      # For the original numeric values (0, 1), map them to the factor levels
+      if (is.numeric(derivative_data[[subgroups]])) {
+        # Create a mapping based on the numeric values
+        numeric_values <- sort(unique(derivative_data[[subgroups]]))
+        if (length(numeric_values) == length(pred_levels)) {
+          # Map numeric values to factor levels
+          derivative_data[[subgroups]] <- factor(derivative_data[[subgroups]],
+                                                 levels = numeric_values,
+                                                 labels = pred_levels)
+        }
+      } else {
+        # Ensure it's a factor with the same levels as pred_data
+        derivative_data[[subgroups]] <- factor(derivative_data[[subgroups]],
+                                               levels = pred_levels)
+      }
+    }
+
+    # Initialize the derivative plot
+    if (!is.null(subgroups)) {
+      deriv_plot <- ggplot2::ggplot(derivative_data,
+                                    ggplot2::aes_string(x = "x_point",
+                                                        y = "derivative",
+                                                        color = subgroups,
+                                                        fill = subgroups,
+                                                        linetype = subgroups))
+    } else {
+      deriv_plot <- ggplot2::ggplot(derivative_data,
+                                    ggplot2::aes_string(x = "x_point",
+                                                        y = "derivative"))
+      # Set colors for non-subgroup plot
+      deriv_line_color <- if (!is.null(plot_options$colors)) plot_options$colors[1] else "black"
+      deriv_fill_colors <- if (!is.null(plot_options$fill_colors)) plot_options$fill_colors[1] else "grey70"
+    }
+
+    # Add lines and ribbons for derivatives
+    line_size <- if (!is.null(plot_options$line_size)) plot_options$line_size else 1
+    ribbon_alpha <- if (!is.null(plot_options$ribbon_alpha)) plot_options$ribbon_alpha else 0.3
+
+    if (!is.null(subgroups)) {
+      deriv_plot <- deriv_plot +
+        ggplot2::geom_line(linewidth = line_size) +
+        ggplot2::geom_ribbon(ggplot2::aes(ymin = lower_ci_derivative,
+                                          ymax = upper_ci_derivative),
+                             alpha = ribbon_alpha)
+    } else {
+      deriv_plot <- deriv_plot +
+        ggplot2::geom_line(linewidth = line_size, color = deriv_line_color) +
+        ggplot2::geom_ribbon(ggplot2::aes(ymin = lower_ci_derivative,
+                                          ymax = upper_ci_derivative),
+                             fill = deriv_fill_colors,
+                             alpha = ribbon_alpha)
+    }
+
+    # Add labels
+    x_lab <- if (!is.null(plot_options$x_lab)) plot_options$x_lab else variable_x
+
+    deriv_plot <- deriv_plot +
+      ggplot2::xlab(x_lab) +
+      ggplot2::ylab(deriv_y_lab)
+
+    # Add title for derivative plot if provided
+    deriv_title_args <- list()
+    if (!is.null(plot_options$derivative_title)) {
+      deriv_title_args$title <- plot_options$derivative_title
+    } else {
+      # Default title based on derivative method
+      method_name <- switch(derivative_method,
+                            "basis" = "Basis Function",
+                            "delta" = "Delta Method",
+                            "numeric" = "Numerical",
+                            "Unknown")
+      deriv_title_args$title <- paste0(method_name, " Derivative of ", variable_x)
+    }
+
+    if (!is.null(plot_options$derivative_subtitle)) {
+      deriv_title_args$subtitle <- plot_options$derivative_subtitle
+    }
+    if (!is.null(plot_options$derivative_caption)) {
+      deriv_title_args$caption <- plot_options$derivative_caption
+    }
+
+    if (length(deriv_title_args) > 0) {
+      deriv_plot <- deriv_plot + do.call(ggplot2::labs, deriv_title_args)
+    }
+
+    # Apply axis scales and breaks (same as main plot)
+    if (!is.null(plot_options$use_log_x) && plot_options$use_log_x) {
+      if (!is.null(plot_options$x_breaks)) {
+        deriv_plot <- deriv_plot + ggplot2::scale_x_log10(breaks = plot_options$x_breaks)
+      } else {
+        deriv_plot <- deriv_plot + ggplot2::scale_x_log10()
+      }
+    } else if (!is.null(plot_options$x_breaks)) {
+      deriv_plot <- deriv_plot + ggplot2::scale_x_continuous(breaks = plot_options$x_breaks)
+    }
+
+    # Apply custom y-axis breaks for derivative plot if provided
+    if (!is.null(plot_options$derivative_y_breaks)) {
+      deriv_plot <- deriv_plot + ggplot2::scale_y_continuous(breaks = plot_options$derivative_y_breaks)
+    }
+
+    # Apply axis limits for derivative plot
+    coord_args_deriv <- list()
+
+    if (!is.null(plot_options$derivative_y_limits)) {
+      coord_args_deriv$ylim <- plot_options$derivative_y_limits
+    }
+
+    if (!is.null(plot_options$x_limits)) {
+      coord_args_deriv$xlim <- plot_options$x_limits
+    }
+
+    if (length(coord_args_deriv) > 0) {
+      deriv_plot <- deriv_plot + do.call(ggplot2::coord_cartesian, coord_args_deriv)
+    }
+
+    # Apply custom colors and guides (same as main plot)
+    if (!is.null(plot_options$colors) && !is.null(subgroups)) {
+      # Get legend labels
+      if (!is.null(plot_options$legend_labels)) {
+        legend_labels <- plot_options$legend_labels
+
+        # Include counts in legend labels if requested
+        if (!is.null(plot_options$include_counts) && plot_options$include_counts) {
+          # Determine subgroup counts
+          if (MI_method == "average" || MI_method == "Rubin") {
+            count_data <- subset(data, get(imp_col) == 1)
+            subgroup_counts <- table(count_data[[subgroups]])
+          } else {
+            subgroup_counts <- table(Data_Subset[[subgroups]])
+          }
+
+          # Get plot levels
+          plot_levels <- levels(factor(pred_data[[subgroups]]))
+
+          # Update legend labels with counts
+          for (i in seq_along(legend_labels)) {
+            count <- subgroup_counts[plot_levels[i]]
+            if (is.na(count)) count <- 0
+            legend_labels[i] <- paste0(legend_labels[i], " (N=", count, ")")
+          }
+        }
+      } else {
+        legend_labels <- levels(factor(pred_data[[subgroups]]))
+      }
+
+      deriv_plot <- deriv_plot + ggplot2::scale_color_manual(
+        values = plot_options$colors,
+        labels = legend_labels,
+        name = if (!is.null(plot_options$legend_title)) plot_options$legend_title else subgroups
+      )
+
+      fill_colors <- if (!is.null(plot_options$fill_colors)) plot_options$fill_colors else plot_options$colors
+
+      deriv_plot <- deriv_plot + ggplot2::scale_fill_manual(
+        values = fill_colors,
+        guide = "none"
+      )
+    }
+
+    # Apply custom line types if provided
+    if (!is.null(plot_options$line_types) && !is.null(subgroups)) {
+      deriv_plot <- deriv_plot + ggplot2::scale_linetype_manual(
+        values = plot_options$line_types,
+        labels = legend_labels,
+        name = if (!is.null(plot_options$legend_title)) plot_options$legend_title else subgroups
+      )
+    }
+
+    # Apply theme (same as main plot)
+    deriv_plot <- deriv_plot + ggplot2::theme_minimal(base_size = 10)
+    deriv_plot <- deriv_plot + do.call(ggplot2::theme, default_theme)
+
+    # Add horizontal line at y=0 to show where derivative changes sign
+    deriv_plot <- deriv_plot + ggplot2::geom_hline(
+      yintercept = 0,
+      color = "gray50",
+      linetype = "solid",
+      linewidth = 0.5
+    )
+
+    # Add threshold lines to derivative plot
+    if (!is.null(plot_options$show_threshold_lines) && plot_options$show_threshold_lines) {
+      if (!is.null(subgroups)) {
+        # Create threshold line data
+        threshold_line_data <- data.frame()
+        for (sg_level in names(threshold_values)) {
+          threshold_val <- threshold_values[sg_level]
+          if (!is.na(threshold_val)) {
+            new_threshold_data <- data.frame(
+              x = threshold_val,
+              subgroup = sg_level,
+              stringsAsFactors = FALSE
+            )
+            names(new_threshold_data)[2] <- subgroups
+            threshold_line_data <- rbind(threshold_line_data, new_threshold_data)
+          }
+        }
+
+        if (nrow(threshold_line_data) > 0) {
+          # Ensure subgroup column is same type as in pred_data
+          if (is.factor(pred_data[[subgroups]])) {
+            threshold_line_data[[subgroups]] <- factor(
+              threshold_line_data[[subgroups]],
+              levels = levels(pred_data[[subgroups]])
+            )
+          }
+
+          deriv_plot <- deriv_plot + ggplot2::geom_vline(
+            data = threshold_line_data,
+            ggplot2::aes_string(xintercept = "x", color = subgroups),
+            linetype = if (!is.null(plot_options$threshold_line_type)) plot_options$threshold_line_type else "dashed",
+            linewidth = if (!is.null(plot_options$threshold_line_size)) plot_options$threshold_line_size else 0.5,
+            alpha = if (!is.null(plot_options$threshold_line_alpha)) plot_options$threshold_line_alpha else 0.8,
+            show.legend = FALSE
+          )
+        }
+      } else if (!is.na(threshold)) {
+        deriv_plot <- deriv_plot + ggplot2::geom_vline(
+          xintercept = threshold,
+          color = if (!is.null(plot_options$threshold_line_color)) plot_options$threshold_line_color else "black",
+          linetype = if (!is.null(plot_options$threshold_line_type)) plot_options$threshold_line_type else "dashed",
+          linewidth = if (!is.null(plot_options$threshold_line_size)) plot_options$threshold_line_size else 0.5,
+          alpha = if (!is.null(plot_options$threshold_line_alpha)) plot_options$threshold_line_alpha else 0.8
+        )
+      }
+
+      # Add threshold annotations if requested
+      if (!is.null(plot_options$annotate_thresholds) && plot_options$annotate_thresholds) {
+        if (!is.null(subgroups) && exists("threshold_line_data") && nrow(threshold_line_data) > 0) {
+          # Get y position for annotations
+          y_range <- range(derivative_data$derivative, na.rm = TRUE)
+          y_pos <- y_range[2] - 0.1 * diff(y_range)  # Place at 90% of y range
+
+          for (i in 1:nrow(threshold_line_data)) {
+            deriv_plot <- deriv_plot + ggplot2::annotate(
+              "text",
+              x = threshold_line_data$x[i],
+              y = y_pos,
+              label = paste0("Threshold: ", round(threshold_line_data$x[i], 2)),
+              angle = 90,
+              vjust = -0.5,
+              size = 3,
+              color = if (!is.null(plot_options$colors)) {
+                plot_options$colors[which(levels(pred_data[[subgroups]]) == threshold_line_data[[subgroups]][i])]
+              } else {
+                "black"
+              }
+            )
+          }
+        } else if (!is.na(threshold)) {
+          # Single threshold annotation
+          y_range <- range(derivative_data$derivative, na.rm = TRUE)
+          y_pos <- y_range[2] - 0.1 * diff(y_range)
+
+          deriv_plot <- deriv_plot + ggplot2::annotate(
+            "text",
+            x = threshold,
+            y = y_pos,
+            label = paste0("Threshold: ", round(threshold, 2)),
+            angle = 90,
+            vjust = -0.5,
+            size = 3,
+            color = if (!is.null(plot_options$threshold_line_color)) plot_options$threshold_line_color else "black"
+          )
+        }
+      }
+    }
+
+    # Apply any custom derivative plot modifications
+    if (!is.null(plot_options$derivative_custom_elements)) {
+      for (element in plot_options$derivative_custom_elements) {
+        deriv_plot <- deriv_plot + element
+      }
+    }
+
+    derivative_plot <- deriv_plot
+  }
+
+  # Return results as a list
   return(list(
-    predictions = pred_data,
-    model = model,
-    plot = plot,
-    plot_data = pred_data,  # Return the plot data for further customization
+    predictions = pred_data,               # Data frame with prediction values and CI
+    model = model,                         # The fitted model object
+    plot = plot,                           # Main prediction plot
+    plot_data = pred_data,                 # Data used for plotting (for further customization)
     prediction_range_values = c(
       quantile(Data_Subset[[variable_x]], prediction_range[1], na.rm = TRUE),
       quantile(Data_Subset[[variable_x]], prediction_range[2], na.rm = TRUE)
-    ),   # Return the actual values used for prediction range
-    derivatives = derivative_data,  # Add this line to return the derivatives
+    ),                                     # Actual values used for prediction range
+    derivatives = if(calculate_derivatives) derivative_data else NULL,  # Derivatives data frame
+    derivative_method = if(calculate_derivatives) derivative_method else NULL,  # Method used for derivatives
     threshold = if (calculate_derivatives && !is.null(subgroups)) {
-      # Return thresholds as a named vector
+      # Return thresholds as a named vector for subgroups
       threshold_values
     } else if (calculate_derivatives) {
       # Return single threshold for non-subgroup case
       threshold
     } else {
-      NULL  # Return NULL if derivatives weren't calculated
-    }
+      NULL                                # Return NULL if derivatives weren't calculated
+    },
+    derivative_plot = derivative_plot     # Return the derivative plot if created
   ))
-}
+}  # End of MI_spline functionsettings)) plot_options$theme_

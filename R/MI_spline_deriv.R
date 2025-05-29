@@ -8,6 +8,8 @@
 #' @param outcome_var The dependent variable for the model.
 #' @param variable_x The continuous predictor variable modeled with splines.
 #' @param subgroups Optional variable for stratification (default is NULL).
+#' @param subgroup_labels Optional labels for subgroup levels.
+#' @param subgroup_as_factor Whether to convert subgroups to factors (default is TRUE).
 #' @param covariables Optional vector of covariates to adjust for.
 #' @param knot_n Number of knots for the restricted cubic spline (default is 4).
 #' @param imp_col The column name indicating imputation indices (default is ".imp").
@@ -35,6 +37,8 @@ MI_spline_deriv <- function(data,
                             outcome_var,
                             variable_x,
                             subgroups = NULL,
+                            subgroup_labels = NULL,
+                            subgroup_as_factor = TRUE,
                             covariables = NULL,
                             knot_n = 4,
                             imp_col = ".imp",
@@ -114,6 +118,24 @@ MI_spline_deriv <- function(data,
     imputations <- imputations[1:n_imputations]
   }
   
+  # Store original subgroup values before conversion, if available
+  original_subgroup_values <- NULL
+  if (!is.null(subgroups)) {
+    original_subgroup_values <- data[[subgroups]]
+  }
+  
+  # Create a mapping between original values and labels if both exist
+  subgroup_mapping <- NULL
+  if (!is.null(subgroups) && !is.null(subgroup_labels)) {
+    # Identify unique values in original data
+    unique_values <- sort(unique(data[[subgroups]]))
+    
+    # Create mapping
+    if (length(unique_values) == length(subgroup_labels)) {
+      subgroup_mapping <- setNames(subgroup_labels, unique_values)
+    }
+  }
+  
   # Function to create prediction data frame
   create_pred_data <- function(x_values, subgroups_data = NULL) {
     if (is.null(subgroups)) {
@@ -123,10 +145,10 @@ MI_spline_deriv <- function(data,
       return(pred_data)
     } else {
       # With subgroups
-      subgroup_levels <- if (is.factor(subgroups_data)) {
-        levels(subgroups_data)
+      if (is.factor(subgroups_data)) {
+        subgroup_levels <- levels(subgroups_data)
       } else {
-        sort(unique(subgroups_data))
+        subgroup_levels <- sort(unique(subgroups_data))
       }
       
       pred_data <- expand.grid(
@@ -138,6 +160,11 @@ MI_spline_deriv <- function(data,
       # Ensure subgroups column is the right type
       if (is.factor(subgroups_data)) {
         pred_data[[subgroups]] <- factor(pred_data[[subgroups]], levels = levels(subgroups_data))
+      } else if (subgroup_as_factor) {
+        pred_data[[subgroups]] <- factor(pred_data[[subgroups]])
+        if (!is.null(subgroup_labels)) {
+          levels(pred_data[[subgroups]]) <- subgroup_labels
+        }
       }
       return(pred_data)
     }
@@ -474,6 +501,17 @@ MI_spline_deriv <- function(data,
     # Subset data for this imputation
     imp_data <- subset(data, data[[imp_col]] == imp)
     
+    # Convert subgroups to factor if requested and needed
+    if (!is.null(subgroups) && subgroup_as_factor && !is.factor(imp_data[[subgroups]])) {
+      # Convert subgroups column to factor
+      imp_data[[subgroups]] <- as.factor(imp_data[[subgroups]])
+      
+      # Apply custom labels if provided
+      if (!is.null(subgroup_labels)) {
+        levels(imp_data[[subgroups]]) <- subgroup_labels
+      }
+    }
+    
     # Create prediction data for this imputation
     pred_data <- create_pred_data(x_points, imp_data[[subgroups]])
     pred_data <- add_covariates(pred_data, imp_data)
@@ -641,7 +679,6 @@ MI_spline_deriv <- function(data,
           sg_data[[subgroups]] <- factor(sg_data[[subgroups]], 
                                          levels = levels(result_data[[subgroups]]))
         }
-        
         plot <- plot + ggplot2::geom_vline(
           data = sg_data,
           ggplot2::aes(xintercept = x, color = .data[[subgroups]]),
