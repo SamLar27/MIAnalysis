@@ -493,7 +493,8 @@ MI_estimates <- function(data,
       }
     }
 
-    # Extract fixed effects coefficients and standard errors
+    # Replace the problematic coefficient extraction section with this:
+
     coefs <- lapply(models_list, function(m) {
       if (model_type == "cox") {
         # coxme coefficients
@@ -501,13 +502,29 @@ MI_estimates <- function(data,
         c_se <- sqrt(diag(vcov(m)))
       } else if (inherits(m, "glmmTMB")) {
         # glmmTMB coefficients
-        c_est <- fixef(m)$cond  # Extract conditional effects
-        v <- vcov(m)$cond       # Extract conditional variance-covariance matrix
+        c_est <- fixef(m)$cond
+        v <- vcov(m)$cond
         c_se <- sqrt(diag(v))
       } else {
-        # lme4 coefficients
+        # lme4 coefficients - improved handling
         c_est <- fixef(m)
-        c_se <- sqrt(diag(vcov(m)))
+
+        # More robust standard error extraction for lmer/glmer objects
+        if (inherits(m, "lmerMod")) {
+          # For linear mixed models, use summary to get standard errors
+          model_summary <- summary(m)
+          c_se <- model_summary$coefficients[, "Std. Error"]
+        } else {
+          # For other lme4 models (glmer), try vcov approach with error handling
+          tryCatch({
+            vcov_matrix <- vcov(m)
+            c_se <- sqrt(diag(vcov_matrix))
+          }, error = function(e) {
+            # Fallback to summary method
+            model_summary <- summary(m)
+            c_se <- model_summary$coefficients[, "Std. Error"]
+          })
+        }
       }
 
       data.frame(
@@ -565,7 +582,8 @@ MI_estimates <- function(data,
       mutate(
         `2.5 %` = estimate - 1.96 * std.error,
         `97.5 %` = estimate + 1.96 * std.error,
-        p.value = 2 * (1 - pnorm(abs(estimate / std.error)))
+        # More numerically stable p-value calculation
+        p.value = 2 * pnorm(-abs(estimate / std.error))
       )
 
     # Set as the final results
