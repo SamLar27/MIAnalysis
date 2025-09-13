@@ -191,21 +191,55 @@ MI_estimates <- function(data,
 
   # Validate predictor_vars and covariables
   if (is.null(formula_string)) {
-    # Check that predictor_vars exist in data
-    if (!all(predictor_vars %in% names(data))) {
-      missing_vars <- predictor_vars[!predictor_vars %in% names(data)]
+    # Helper function to extract individual variables from interaction terms
+    extract_vars_from_terms <- function(terms) {
+      all_vars <- character(0)
+      for (term in terms) {
+        if (grepl("\\*", term)) {
+          # Split interaction terms
+          vars_in_interaction <- unlist(strsplit(term, "\\*"))
+          vars_in_interaction <- trimws(vars_in_interaction)
+          all_vars <- c(all_vars, vars_in_interaction)
+        } else {
+          all_vars <- c(all_vars, term)
+        }
+      }
+      return(unique(all_vars))
+    }
+
+    # Extract individual variables from predictor_vars (handling interactions)
+    # Filter out empty strings before validation
+    non_empty_predictors <- predictor_vars[predictor_vars != "" & !is.na(predictor_vars) & !is.null(predictor_vars)]
+    individual_predictor_vars <- extract_vars_from_terms(non_empty_predictors)
+
+    # Check that individual predictor variables exist in data (only non-empty ones)
+    if (length(individual_predictor_vars) > 0 && !all(individual_predictor_vars %in% names(data))) {
+      missing_vars <- individual_predictor_vars[!individual_predictor_vars %in% names(data)]
       stop(paste("Predictor variables not found in data:", paste(missing_vars, collapse = ", ")))
     }
 
     # Check that covariables exist in data (if provided)
     if (!is.null(covariables)) {
-      if (!all(covariables %in% names(data))) {
-        missing_vars <- covariables[!covariables %in% names(data)]
+      # Also handle interactions in covariables
+      individual_covariable_vars <- extract_vars_from_terms(covariables)
+
+      if (!all(individual_covariable_vars %in% names(data))) {
+        missing_vars <- individual_covariable_vars[!individual_covariable_vars %in% names(data)]
+        stop(paste("Covariables not found in data:", paste(missing_vars, collapse = ", ")))
+      }
+    }
+
+    # Check that covariables exist in data (if provided)
+    if (!is.null(covariables)) {
+      # Also handle interactions in covariables
+      individual_covariable_vars <- extract_vars_from_terms(covariables)
+
+      if (!all(individual_covariable_vars %in% names(data))) {
+        missing_vars <- individual_covariable_vars[!individual_covariable_vars %in% names(data)]
         stop(paste("Covariables not found in data:", paste(missing_vars, collapse = ", ")))
       }
     }
   }
-
   if (!is.null(followup_col) && !followup_col %in% names(data)) stop("followup_col not found in data.")
   if (!is.null(trial_col) && !trial_col %in% names(data)) stop("trial_col not found in data.")
   if (!is.null(time_col) && !time_col %in% names(data)) stop("time_col not found in data.")
@@ -340,51 +374,65 @@ MI_estimates <- function(data,
       paste("+ (1 | ", random_intercept_var, ")") else ""
 
     if (is.null(formula_string)) {
-      # Remove current predictor from spline_terms and poly_terms if present
-      current_spline_parts <- spline_formula_parts
-      current_poly_parts <- poly_formula_parts
-
-      # Remove spline/poly versions of current predictor
-      if (!is.null(spline_terms)) {
-        for (i in seq_along(spline_terms)) {
-          if (spline_terms[[i]]$var == current_predictor) {
-            # Remove this spline term
-            pattern <- if (use_rms) {
-              paste0("rcs\\(", current_predictor, ",")
-            } else {
-              paste0("bs\\(", current_predictor, ",")
-            }
-            current_spline_parts <- current_spline_parts[!grepl(pattern, current_spline_parts)]
-          }
+      # Handle empty predictor (null model)
+      if (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor)) {
+        # For null model, only use covariables
+        if (!is.null(covariables)) {
+          expanded_covariables <- unlist(lapply(covariables, expand_terms))
+          expanded_covariables <- unique(expanded_covariables)
+        } else {
+          expanded_covariables <- character(0)
         }
-      }
-
-      if (!is.null(poly_terms)) {
-        for (i in seq_along(poly_terms)) {
-          if (poly_terms[[i]]$var == current_predictor) {
-            # Remove this polynomial term
-            pattern <- paste0("poly\\(", current_predictor, ",")
-            current_poly_parts <- current_poly_parts[!grepl(pattern, current_poly_parts)]
-          }
-        }
-      }
-
-      # Prepare covariables (exclude current predictor to avoid duplication)
-      if (!is.null(covariables)) {
-        current_covariables <- covariables[covariables != current_predictor]
-        # Expand covariables for interactions
-        expanded_covariables <- unlist(lapply(current_covariables, expand_terms))
-        expanded_covariables <- unique(expanded_covariables)
+        all_terms <- c(expanded_covariables, spline_formula_parts, poly_formula_parts)
       } else {
-        expanded_covariables <- character(0)
+        # Regular predictor case
+        # Remove current predictor from spline_terms and poly_terms if present
+        current_spline_parts <- spline_formula_parts
+        current_poly_parts <- poly_formula_parts
+
+        # Remove spline/poly versions of current predictor
+        if (!is.null(spline_terms)) {
+          for (i in seq_along(spline_terms)) {
+            if (spline_terms[[i]]$var == current_predictor) {
+              # Remove this spline term
+              pattern <- if (use_rms) {
+                paste0("rcs\\(", current_predictor, ",")
+              } else {
+                paste0("bs\\(", current_predictor, ",")
+              }
+              current_spline_parts <- current_spline_parts[!grepl(pattern, current_spline_parts)]
+            }
+          }
+        }
+
+        if (!is.null(poly_terms)) {
+          for (i in seq_along(poly_terms)) {
+            if (poly_terms[[i]]$var == current_predictor) {
+              # Remove this polynomial term
+              pattern <- paste0("poly\\(", current_predictor, ",")
+              current_poly_parts <- current_poly_parts[!grepl(pattern, current_poly_parts)]
+            }
+          }
+        }
+
+        # Prepare covariables (exclude current predictor to avoid duplication)
+        if (!is.null(covariables)) {
+          current_covariables <- covariables[covariables != current_predictor]
+          # Expand covariables for interactions
+          expanded_covariables <- unlist(lapply(current_covariables, expand_terms))
+          expanded_covariables <- unique(expanded_covariables)
+        } else {
+          expanded_covariables <- character(0)
+        }
+
+        # Expand current predictor for interactions
+        expanded_predictor <- expand_terms(current_predictor)
+
+        # Combine all terms: predictor + covariables + special terms
+        all_terms <- c(expanded_predictor, expanded_covariables, current_spline_parts, current_poly_parts)
       }
 
-      # Expand current predictor for interactions
-      expanded_predictor <- expand_terms(current_predictor)
-
-      # Combine all terms: predictor + covariables + special terms
-      all_terms <- c(expanded_predictor, expanded_covariables, current_spline_parts, current_poly_parts)
-
+      # Build formula based on model type
       if (model_type == "cox") {
         if (is.null(time_col) || is.null(event_col)) {
           stop("For Cox regression, time_col and event_col must be provided.")
@@ -447,7 +495,6 @@ MI_estimates <- function(data,
 
     return(formula_str)
   }
-
   # Function to fit model for a single predictor (existing model fitting logic)
   fit_model_for_predictor <- function(current_predictor) {
     formula_string_current <- build_formula_for_predictor(current_predictor)
@@ -491,7 +538,12 @@ MI_estimates <- function(data,
       # Find terms containing "poly("
       poly_terms_detected <- terms[grepl("poly\\(", terms)]
     }
-
+    # Handle null model case
+    if (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor)) {
+      is_null_model <- TRUE
+    } else {
+      is_null_model <- FALSE
+    }
     # Fit models to each imputed dataset (using existing logic)
     if (random_intercept == "Yes") {
       # Approach models with random effects
@@ -741,6 +793,26 @@ MI_estimates <- function(data,
           filter(!grepl(pattern, term))
       }
     }
+    # For null model, create a dummy result with No_predictor term
+    if (is_null_model) {
+      # Create a row for No_predictor with NAs for estimates but keep other coefficients
+      null_row <- data.frame(
+        term = "No_predictor",
+        estimate = NA,
+        std.error = NA,
+        `2.5 %` = NA,
+        `97.5 %` = NA,
+        exp_estimate = NA,
+        exp_CI95_lower = NA,
+        exp_CI95_upper = NA,
+        p.value = NA,
+        stringsAsFactors = FALSE,
+        check.names = FALSE
+      )
+
+      # Add to the results
+      Results_multivariate_analysis <- rbind(null_row, Results_multivariate_analysis)
+    }
 
     # Add indicator for interaction terms if requested
     if (highlight_interactions && length(interaction_terms) > 0) {
@@ -869,11 +941,16 @@ MI_estimates <- function(data,
 
   for (i in seq_along(predictor_vars)) {
     current_predictor <- predictor_vars[i]
-    message(paste("Fitting model for predictor:", current_predictor))
 
-    results_list[[i]] <- fit_model_for_predictor(current_predictor)
+    # Handle empty predictor
+    if (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor)) {
+      message("Fitting null model (no predictor)")
+      results_list[["No_predictor"]] <- fit_model_for_predictor(current_predictor)
+    } else {
+      message(paste("Fitting model for predictor:", current_predictor))
+      results_list[[i]] <- fit_model_for_predictor(current_predictor)
+    }
   }
-
   # Create combined results dataframe for multiple predictors
   if (length(predictor_vars) > 1) {
     create_combined_results <- function() {
@@ -882,20 +959,29 @@ MI_estimates <- function(data,
       for (pred_name in names(results_list)) {
         result <- results_list[[pred_name]]
 
-        # Find rows that correspond to the predictor variable (not covariables, intercept, or other terms)
-        predictor_rows <- result[grepl(paste0("^", pred_name), result$term) &
-                                   !grepl("Intercept", result$term), ]
+        # Skip if result is NULL or empty
+        if (is.null(result) || nrow(result) == 0) next
 
-        # If no exact match found, try partial matching (for categorical variables)
-        if (nrow(predictor_rows) == 0) {
-          # For categorical variables, the term might be like "GenderMale", "Treatment_stepStep 4", etc.
-          predictor_rows <- result[grepl(pred_name, result$term) &
+        # Special handling for No_predictor
+        if (pred_name == "No_predictor") {
+          # For null model, just take the No_predictor row
+          predictor_rows <- result[result$term == "No_predictor", ]
+        } else {
+          # Find rows that correspond to the predictor variable (not covariables, intercept, or other terms)
+          predictor_rows <- result[grepl(paste0("^", pred_name), result$term) &
                                      !grepl("Intercept", result$term), ]
 
-          # Further filter out covariables if any are found
-          if (!is.null(covariables) && length(covariables) > 0) {
-            covariable_pattern <- paste(covariables, collapse = "|")
-            predictor_rows <- predictor_rows[!grepl(covariable_pattern, predictor_rows$term), ]
+          # If no exact match found, try partial matching (for categorical variables)
+          if (nrow(predictor_rows) == 0) {
+            # For categorical variables, the term might be like "GenderMale", "Treatment_stepStep 4", etc.
+            predictor_rows <- result[grepl(pred_name, result$term) &
+                                       !grepl("Intercept", result$term), ]
+
+            # Further filter out covariables if any are found
+            if (!is.null(covariables) && length(covariables) > 0) {
+              covariable_pattern <- paste(covariables, collapse = "|")
+              predictor_rows <- predictor_rows[!grepl(covariable_pattern, predictor_rows$term), ]
+            }
           }
         }
 
