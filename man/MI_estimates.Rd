@@ -8,6 +8,7 @@ MI_estimates(
   data,
   outcome_var,
   predictor_vars,
+  covariables = NULL,
   imp_col = ".imp",
   imp_n = NULL,
   model_type = "nb",
@@ -22,7 +23,9 @@ MI_estimates(
   spline_terms = NULL,
   poly_terms = NULL,
   include_spline_terms = FALSE,
-  include_poly_terms = TRUE
+  include_poly_terms = TRUE,
+  random_intercept = "No",
+  random_intercept_var = NULL
 )
 }
 \arguments{
@@ -30,37 +33,39 @@ MI_estimates(
 
 \item{outcome_var}{The dependent variable for GLM models.}
 
-\item{predictor_vars}{A vector of predictor variables to include in the model. Can include interaction terms with : notation.}
+\item{predictor_vars}{A vector of predictor variables to be tested in the model. Each predictor will be included individually along with all covariables.}
+
+\item{covariables}{A vector of covariable names to be included as fixed effects in all models. These are always included regardless of which predictor is being tested.}
 
 \item{imp_col}{The column name indicating imputation indices (default is ".imp").}
 
 \item{imp_n}{Number of imputations (if NULL, it is detected automatically).}
 
-\item{model_type}{The model type:
+\item{model_type}{The model type to be used:
 \itemize{
-\item "nb" for Negative Binomial regression
+\item "nb" for Negative Binomial regression (using \code{MASS::glm.nb} or \code{glmmTMB} if random intercepts are used)
 \item "lm" for Linear regression
 \item "bin" for Logistic regression (binomial family)
 \item "poisson" for Poisson regression
 \item "gamma" for Gamma regression
 \item "quasipoisson" for Overdispersed Poisson regression
 \item "quasibinomial" for Overdispersed logistic regression
-\item "cox" for Cox Proportional Hazards regression
+\item "cox" for Cox Proportional Hazards regression (using \code{survival} or \code{coxme})
 }}
 
-\item{followup_offset}{Whether to include offset for follow-up duration ("Yes" or "No").}
+\item{followup_offset}{Whether to include an offset for follow-up duration ("Yes" or "No").}
 
-\item{followup_col}{The column representing follow-up duration (optional, required if followup_offset = "Yes").}
+\item{followup_col}{The column representing follow-up duration (required if \code{followup_offset = "Yes"}).}
 
-\item{trial_factor}{Whether to include trial as a factor ("Yes" or "No").}
+\item{trial_factor}{Whether to include trial as a fixed factor ("Yes" or "No").}
 
-\item{trial_col}{The column for trial factor adjustment (optional).}
+\item{trial_col}{The column used for trial factor (required if \code{trial_factor = "Yes"}).}
 
-\item{time_col}{The time variable for Cox regression (only required if model_type = "cox").}
+\item{time_col}{The time variable for Cox regression (only required if \code{model_type = "cox"}).}
 
-\item{event_col}{The event variable for Cox regression (only required if model_type = "cox").}
+\item{event_col}{The event variable for Cox regression (only required if \code{model_type = "cox"}).}
 
-\item{formula_string}{Optional custom formula string. If provided, overrides the formula created from predictor_vars.}
+\item{formula_string}{Optional custom formula string. If provided, overrides the formula created from predictor_vars and covariables.}
 
 \item{highlight_interactions}{Whether to flag interaction terms in the output (default: TRUE).}
 
@@ -68,16 +73,29 @@ MI_estimates(
 
 \item{poly_terms}{A named list to specify variables to be modeled with polynomial terms. Each element should be a list with 'var' (variable name) and 'degree' (2 for quadratic, 3 for cubic).}
 
-\item{include_spline_terms}{Whether to include the individual spline terms in the output (default: FALSE).}
+\item{include_spline_terms}{Whether to include individual spline components in the output (default: FALSE).}
 
-\item{include_poly_terms}{Whether to include the individual polynomial terms in the output (default: TRUE).}
+\item{include_poly_terms}{Whether to include individual polynomial components in the output (default: TRUE).}
+
+\item{random_intercept}{Whether to include a random intercept in the model ("Yes" or "No").}
+
+\item{random_intercept_var}{The grouping variable for the random intercept (required if \code{random_intercept = "Yes"}).}
 }
 \value{
-A data frame with model estimates, confidence intervals, and p-values.
-If the model type supports exponentiation, exponentiated estimates (e.g., odds ratios, rate ratios, hazard ratios) are provided.
+A list containing model results for each predictor variable. Each element is a data frame with model estimates, standard errors, confidence intervals, p-values, and exponentiated estimates (if applicable).
+Additional attributes for each result include:
+\itemize{
+\item \code{predictor_tested}: the predictor variable that was tested in this model
+\item \code{formula}: the model formula used
+\item \code{has_random_effects}: logical flag indicating if random effects were used
+\item \code{random_intercept_var}: the grouping variable used for the random intercept
+\item \code{variance_components}: the estimated variance of the random intercept (if applicable)
+\item \code{ICC}: intraclass correlation coefficient (for linear mixed models only)
+\item \code{model_type_used}: the model type used internally
+}
 }
 \description{
 This function fits statistical models to multiply imputed datasets and pools the results using Rubin's Rules.
 It supports various regression models, including negative binomial, logistic, Poisson, linear, and Cox regression.
-Enhanced to handle interaction terms, restricted cubic splines (rcs), and polynomial terms.
+The function also supports modeling with random intercepts using \code{glmmTMB}, \code{lme4}, and \code{coxme}, and can handle interaction terms, restricted cubic splines (rcs), and polynomial terms.
 }

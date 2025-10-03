@@ -2,7 +2,7 @@
 % Please edit documentation in R/MI_spline.R
 \name{MI_spline}
 \alias{MI_spline}
-\title{Create Spline Plots from Multiple Imputed Data}
+\title{Create Spline Plots from Multiple Imputed Data (with Random Effects Support)}
 \usage{
 MI_spline(
   data,
@@ -12,6 +12,7 @@ MI_spline(
   covariables = NULL,
   knot_n = 4,
   imp_col = ".imp",
+  MI_method = "first",
   model_type = "nb",
   followup_offset = "No",
   followup_col = NULL,
@@ -19,12 +20,15 @@ MI_spline(
   trial_col = NULL,
   time_col = NULL,
   event_col = NULL,
+  random_intercept = "No",
+  random_intercept_var = NULL,
   plot_options = NULL,
   subgroup_as_factor = TRUE,
   subgroup_labels = NULL,
   prediction_range = c(0.01, 0.99),
   calculate_derivatives = FALSE,
-  derivative_points = NULL
+  derivative_points = NULL,
+  derivative_method = "basis"
 )
 }
 \arguments{
@@ -42,6 +46,8 @@ MI_spline(
 
 \item{imp_col}{The column name indicating imputation indices (default is ".imp").}
 
+\item{MI_method}{Method for using multiply imputed data: "first" (use only first imputation), "average" (average predictions and variances separately), or "Rubin" (pool predictions using Rubin's rules for total variance).}
+
 \item{model_type}{The model type: "nb" for Negative Binomial, "poisson" for Poisson, "cox" for Cox, or "logistic" for Logistic.}
 
 \item{followup_offset}{Whether to include offset for follow-up duration ("Yes" or "No").}
@@ -55,6 +61,10 @@ MI_spline(
 \item{time_col}{The time variable for Cox regression (only required if model_type = "cox").}
 
 \item{event_col}{The event variable for Cox regression (only required if model_type = "cox").}
+
+\item{random_intercept}{Whether to include a random intercept in the model ("Yes" or "No").}
+
+\item{random_intercept_var}{The grouping variable for the random intercept (required if random_intercept = "Yes").}
 
 \item{plot_options}{List of options for plot customization.}
 
@@ -74,5 +84,5 @@ A list containing predictions, model object, plot, and optionally derivatives an
 \description{
 This function fits restricted cubic spline models to multiply imputed datasets and creates
 visualization of the relationships between a continuous predictor and an outcome, with optional
-stratification by subgroups.
+stratification by subgroups. The function now supports random effects models.
 }

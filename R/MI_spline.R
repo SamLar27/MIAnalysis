@@ -246,7 +246,7 @@ MI_spline <- function(data,
 
   # Add offset for count models if requested
   offset_str <- ""
-  if (followup_offset == "Yes") {
+  if (followup_offset == "Yes" && model_type %in% c("nb", "poisson")) {
     offset_str <- paste0(" + offset(log(", followup_col, "))")
   }
 
@@ -1861,7 +1861,11 @@ MI_spline <- function(data,
 
   # Apply custom y-axis breaks if provided
   if (!is.null(plot_options$y_breaks)) {
-    plot <- plot + ggplot2::scale_y_continuous(breaks = plot_options$y_breaks)
+    plot <- plot + scale_y_continuous(
+    limits = plot_options$y_limits,
+    breaks = plot_options$y_breaks,
+    labels = plot_options$y_labels   # ← this is what fixes the formatting
+  )
   }
 
   # Apply axis limits using coord_cartesian

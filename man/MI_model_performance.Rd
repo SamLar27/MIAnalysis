@@ -2,24 +2,30 @@
 % Please edit documentation in R/MI_model_performance.R
 \name{MI_model_performance}
 \alias{MI_model_performance}
-\title{Assess Model Performance for Multiple Imputed Data (Optimized Sequential Version)}
+\title{Assess Model Performance for Multiple Imputed Data (Predictor/Covariable Style)}
 \usage{
 MI_model_performance(
   data,
   outcome_var,
   predictor_vars,
+  covariables = NULL,
   imp_col = ".imp",
+  imp_n = NULL,
+  model_type = "nb",
   followup_offset = "No",
   followup_col = NULL,
   trial_factor = "No",
   trial_col = NULL,
-  imp_n = NULL,
-  model_type = "nb",
+  time_col = NULL,
+  event_col = NULL,
   formula_string = NULL,
   spline_terms = NULL,
-  polynomial_terms = NULL,
-  custom_model_func = NULL,
-  verbose = FALSE
+  poly_terms = NULL,
+  random_intercept = "No",
+  random_intercept_var = NULL,
+  verbose = FALSE,
+  aic_method = "Rubin",
+  r2_method = "pseudo"
 )
 }
 \arguments{
@@ -27,34 +33,50 @@ MI_model_performance(
 
 \item{outcome_var}{The dependent variable in the model.}
 
-\item{predictor_vars}{A vector of predictor variables. Can include interactions using c() and : notation.}
+\item{predictor_vars}{A vector of predictor variables to be tested individually. Each predictor will be tested separately along with all covariables. Can include "" for null model. Can now include RCS terms like "rcs(FEV1_preBD_PCT_0W,4)".}
+
+\item{covariables}{A vector of covariable names to be included as fixed effects in all models.}
 
 \item{imp_col}{The imputation column name (default is ".imp").}
 
+\item{imp_n}{Number of imputations (if NULL, detected automatically).}
+
+\item{model_type}{Model type: "nb", "lm", "bin", "poisson", "gamma", "quasipoisson", "quasibinomial", or "cox".}
+
 \item{followup_offset}{Whether to include an offset for follow-up duration ("Yes" or "No").}
 
-\item{followup_col}{Column for follow-up time (optional, required if followup_offset = "Yes").}
+\item{followup_col}{Column for follow-up time (required if followup_offset = "Yes").}
 
 \item{trial_factor}{Whether to include trial as a factor ("Yes" or "No").}
 
-\item{trial_col}{Column for trial effect (optional).}
+\item{trial_col}{Column for trial effect (required if trial_factor = "Yes").}
 
-\item{imp_n}{Number of imputations (if NULL, detected automatically).}
+\item{time_col}{The time variable for Cox regression (only required if model_type = "cox").}
 
-\item{model_type}{Model type: "nb" (negative binomial), "lm", "bin", "poisson", "gamma", "quasipoisson", "quasibinomial", or "cox".}
+\item{event_col}{The event variable for Cox regression (only required if model_type = "cox").}
 
-\item{formula_string}{Optional custom formula string. If provided, overrides the formula created from predictor_vars.}
+\item{formula_string}{Optional custom formula string. If provided, overrides the formula created from predictor_vars and covariables.}
 
-\item{spline_terms}{A named list to specify variables to be modeled with restricted cubic splines. Each element should be a list with 'var' (variable name) and 'knots' (number of knots or explicit knot positions).}
+\item{spline_terms}{A named list to specify variables to be modeled with restricted cubic splines.}
 
-\item{polynomial_terms}{A named list to specify variables to be modeled with polynomial terms. Each element should be a list with 'var' (variable name) and 'degree' (polynomial degree).}
+\item{poly_terms}{A named list to specify variables to be modeled with polynomial terms.}
+
+\item{random_intercept}{Whether to include a random intercept in the model ("Yes" or "No").}
+
+\item{random_intercept_var}{The grouping variable for the random intercept (required if random_intercept = "Yes").}
 
 \item{verbose}{Show progress information (default: FALSE).}
+
+\item{aic_method}{Method to compute AIC: "Rubin" (default) or "Simple_pooled".}
+
+\item{r2_method}{Method to compute R2: "pseudo" (default, log-likelihood based) or "pooled" (classic pooled predictions).}
 }
 \value{
-A list containing performance metrics, including degrees of freedom (df).
+A list containing performance metrics for each predictor, with combined results if multiple predictors.
 }
 \description{
-This function evaluates model performance across multiple imputations with optimizations
-and supports interaction terms, restricted cubic splines, and polynomial terms in models.
+This function evaluates model performance across multiple imputations with the same
+structure as MI_estimates: testing individual predictors with fixed covariables.
+All R2 calculations are compared against an intercept-only model for meaningful comparison.
+Modified to handle RCS terms directly in predictor_vars and robust null model support.
 }
