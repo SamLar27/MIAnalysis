@@ -4,7 +4,8 @@
 #' It supports various regression models, including negative binomial, logistic, Poisson, linear, and Cox regression.
 #' The function also supports modeling with random intercepts using `glmmTMB`, `lme4`, and `coxme`, and can handle interaction terms,
 #' restricted cubic splines (rcs), and polynomial terms.
-#' New: supports stratified intercepts (per-level intercepts) or stratified baseline hazards (Cox) via `stratified_intercept`.
+#' New: supports stratified intercepts (per-level intercepts) or stratified baseline hazards (Cox) via `stratified_intercept`,
+#' and random slopes for selected variables via `predictor_vars_random_slope` and `covariables_random_slope`.
 #'
 #' @param data A data frame containing the imputed dataset.
 #' @param outcome_var The dependent variable for GLM models.
@@ -35,8 +36,11 @@
 #' @param poly_terms A named list to specify variables to be modeled with polynomial terms. Each element should be a list with 'var' (variable name) and 'degree' (2 for quadratic, 3 for cubic).
 #' @param include_spline_terms Whether to include individual spline components in the output (default: FALSE).
 #' @param include_poly_terms Whether to include individual polynomial components in the output (default: TRUE).
-#' @param random_intercept Whether to include a random intercept in the model ("Yes" or "No").
-#' @param random_intercept_var The grouping variable for the random intercept (required if `random_intercept = "Yes"`).
+#' @param random_intercept Whether to include random effects in the model ("Yes" or "No"). If "Yes", a random intercept is always included, and
+#'   optionally random slopes for selected variables can be added.
+#' @param random_intercept_var The grouping variable for the random effects (required if `random_intercept = "Yes"`).
+#' @param predictor_vars_random_slope Character vector of predictor variable names for which a random slope should be added (in addition to the random intercept).
+#' @param covariables_random_slope Character vector of covariable names for which a random slope should be added (in addition to the random intercept).
 #' @param stratified_intercept Whether to use a stratified intercept ("Yes" or "No"). For Cox, this stratifies the baseline hazard.
 #' @param stratified_intercept_var The variable whose levels define the strata for the intercept (or Cox baseline hazard).
 #'
@@ -46,7 +50,7 @@
 #'     \item \code{predictor_tested}: the predictor variable that was tested in this model
 #'     \item \code{formula}: the model formula used
 #'     \item \code{has_random_effects}: logical flag indicating if random effects were used
-#'     \item \code{random_intercept_var}: the grouping variable used for the random intercept
+#'     \item \code{random_intercept_var}: the grouping variable used for the random effects
 #'     \item \code{variance_components}: the estimated variance of the random intercept (if applicable)
 #'     \item \code{ICC}: intraclass correlation coefficient (for linear mixed models only)
 #'     \item \code{model_type_used}: the model type used internally
@@ -80,6 +84,8 @@ MI_estimates <- function(data,
                          include_poly_terms = TRUE,
                          random_intercept = "No",
                          random_intercept_var = NULL,
+                         predictor_vars_random_slope = NULL,
+                         covariables_random_slope = NULL,
                          stratified_intercept = "No",
                          stratified_intercept_var = NULL) {
 
@@ -140,6 +146,24 @@ MI_estimates <- function(data,
   if (stratified_intercept == "Yes") {
     if (is.null(stratified_intercept_var)) stop("If stratified_intercept = 'Yes', stratified_intercept_var must be provided.")
     if (!stratified_intercept_var %in% names(data)) stop("stratified_intercept_var not found in data.")
+  }
+
+  # Validate random slope vars
+  if (!is.null(predictor_vars_random_slope)) {
+    if (!all(predictor_vars_random_slope %in% names(data))) {
+      missing_rs <- predictor_vars_random_slope[!predictor_vars_random_slope %in% names(data)]
+      stop(paste("predictor_vars_random_slope not found in data:", paste(missing_rs, collapse = ", ")))
+    }
+  }
+  if (!is.null(covariables_random_slope)) {
+    if (!all(covariables_random_slope %in% names(data))) {
+      missing_rs <- covariables_random_slope[!covariables_random_slope %in% names(data)]
+      stop(paste("covariables_random_slope not found in data:", paste(missing_rs, collapse = ", ")))
+    }
+  }
+  if (random_intercept == "No" &&
+      (!is.null(predictor_vars_random_slope) || !is.null(covariables_random_slope))) {
+    warning("Random slopes specified but random_intercept = 'No'. Random slope specifications will be ignored.")
   }
 
   # Determine imputations
@@ -278,15 +302,40 @@ MI_estimates <- function(data,
   spline_formula_parts <- special_terms$spline_parts
   poly_formula_parts <- special_terms$poly_parts
 
-  # Build formula for a given predictor (adds trial, offset, random intercept, and NEW stratified intercept)
+  # Build random-effects term string for this predictor/covariables set
+  build_random_term <- function(current_predictor, covariables_in_model) {
+    if (random_intercept != "Yes") return("")
+    rs_vars <- character(0)
+
+    # Predictor-specific random slopes
+    if (!is.null(predictor_vars_random_slope) &&
+        !is.null(current_predictor) &&
+        nzchar(current_predictor) &&
+        current_predictor %in% predictor_vars_random_slope) {
+      rs_vars <- c(rs_vars, current_predictor)
+    }
+
+    # Covariables random slopes
+    if (!is.null(covariables_random_slope) && !is.null(covariables_in_model)) {
+      rs_vars <- c(rs_vars, intersect(covariables_random_slope, covariables_in_model))
+    }
+
+    rs_vars <- unique(rs_vars)
+
+    if (length(rs_vars) == 0) {
+      paste("+ (1 | ", random_intercept_var, ")", sep = "")
+    } else {
+      rs_str <- paste(rs_vars, collapse = " + ")
+      paste("+ (1 + ", rs_str, " | ", random_intercept_var, ")", sep = "")
+    }
+  }
+
+  # Build formula for a given predictor (adds trial, offset, random effects, and stratified intercept/baseline)
   build_formula_for_predictor <- function(current_predictor) {
     trial_term <- if (trial_factor == "Yes") paste("+ as.factor(", trial_col, ")", sep = "") else ""
     offset_term <- if (followup_offset == "Yes") paste("+ offset(log(", followup_col, "))", sep = "") else ""
-    random_term <- if (random_intercept == "Yes") paste("+ (1 | ", random_intercept_var, ")", sep = "") else ""
 
     # NEW: stratified intercept pieces
-    # For GLM/GLMM: remove global intercept and add 0 + as.factor(strat_var)
-    # For Cox: use strata(strat_var) in RHS (baseline hazard stratification)
     strat_glm_piece <- ""
     strat_cox_piece <- ""
     intercept_prefix <- ""  # will become "0 +" (no intercept) if GLM stratification is used
@@ -308,8 +357,11 @@ MI_estimates <- function(data,
         expanded_covariables <- character(0)
       }
 
+      covariables_in_model <- covariables
+
       # Predictor expansion and special-term handling
       if (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor)) {
+        # Null model
         all_terms <- c(expanded_covariables, spline_formula_parts, poly_formula_parts)
       } else {
         current_spline_parts <- spline_formula_parts
@@ -333,21 +385,20 @@ MI_estimates <- function(data,
         }
 
         current_covariables <- if (is.null(covariables)) character(0) else covariables[covariables != current_predictor]
+        covariables_in_model <- current_covariables
+
         expanded_covariables <- unique(unlist(lapply(current_covariables, expand_terms)))
         expanded_predictor <- expand_terms(current_predictor)
         all_terms <- c(expanded_predictor, expanded_covariables, current_spline_parts, current_poly_parts)
       }
 
+      # Build random term based on current predictor and covariables
+      random_term <- build_random_term(current_predictor, covariables_in_model)
+
       if (model_type == "cox") {
         if (is.null(time_col) || is.null(event_col)) stop("For Cox regression, time_col and event_col must be provided.")
-        if (random_intercept == "Yes") {
-          formula_str <- paste("Surv(", time_col, ",", event_col, ") ~ ",
-                               paste(all_terms, collapse = " + "), trial_term, strat_cox_piece,
-                               "+ (1 | ", random_intercept_var, ")", sep = "")
-        } else {
-          formula_str <- paste("Surv(", time_col, ",", event_col, ") ~ ",
-                               paste(all_terms, collapse = " + "), trial_term, strat_cox_piece, sep = "")
-        }
+        formula_str <- paste("Surv(", time_col, ",", event_col, ") ~ ",
+                             paste(all_terms, collapse = " + "), trial_term, strat_cox_piece, random_term, sep = "")
       } else {
         # GLM / GLMM with optional stratified intercept
         fixed_rhs <- paste(c(if (intercept_prefix != "") intercept_prefix else NULL,
@@ -356,8 +407,14 @@ MI_estimates <- function(data,
       }
 
     } else {
-      # Use provided formula_string; we still add trial/offset/stratification if missing.
+      # Use provided formula_string; we still add trial/offset/stratification/random if missing.
       formula_str <- formula_string
+
+      # Precompute "global" random slope vars when using custom formula
+      all_rs_vars <- unique(c(
+        if (!is.null(predictor_vars_random_slope)) predictor_vars_random_slope else character(0),
+        if (!is.null(covariables_random_slope)) covariables_random_slope else character(0)
+      ))
 
       if (model_type == "cox") {
         if (is.null(time_col) || is.null(event_col)) stop("For Cox regression, time_col and event_col must be provided.")
@@ -370,8 +427,15 @@ MI_estimates <- function(data,
         if (stratified_intercept == "Yes" && !grepl(paste0("strata\\(", stratified_intercept_var, "\\)"), formula_str)) {
           formula_str <- paste(formula_str, paste0("+ strata(", stratified_intercept_var, ")"))
         }
-        if (random_intercept == "Yes" && !grepl("\\(1 \\|", formula_str)) {
-          formula_str <- paste(formula_str, paste0("+ (1 | ", random_intercept_var, ")"))
+        if (random_intercept == "Yes" && !grepl("\\|", formula_str)) {
+          if (!is.null(all_rs_vars) && length(all_rs_vars) > 0) {
+            rs_str <- paste(all_rs_vars, collapse = " + ")
+            formula_str <- paste(formula_str,
+                                 paste0("+ (1 + ", rs_str, " | ", random_intercept_var, ")"))
+          } else {
+            formula_str <- paste(formula_str,
+                                 paste0("+ (1 | ", random_intercept_var, ")"))
+          }
         }
       } else {
         if (!grepl(paste0("^", outcome_var, "\\s*~"), formula_str)) {
@@ -391,15 +455,22 @@ MI_estimates <- function(data,
           }
           formula_str <- paste(formula_str, paste0("+ as.factor(", stratified_intercept_var, ")"))
         }
-        if (random_intercept == "Yes" && !grepl("\\(1 \\|", formula_str)) {
-          formula_str <- paste(formula_str, paste0("+ (1 | ", random_intercept_var, ")"))
+        if (random_intercept == "Yes" && !grepl("\\|", formula_str)) {
+          if (!is.null(all_rs_vars) && length(all_rs_vars) > 0) {
+            rs_str <- paste(all_rs_vars, collapse = " + ")
+            formula_str <- paste(formula_str,
+                                 paste0("+ (1 + ", rs_str, " | ", random_intercept_var, ")"))
+          } else {
+            formula_str <- paste(formula_str,
+                                 paste0("+ (1 | ", random_intercept_var, ")"))
+          }
         }
       }
     }
     formula_str
   }
 
-  # Fit one predictor (unchanged logic except filtering + attributes + detection includes strata)
+  # Fit one predictor (unchanged logic except uses new formula builder)
   fit_model_for_predictor <- function(current_predictor) {
     formula_string_current <- build_formula_for_predictor(current_predictor)
     model_formula <- as.formula(formula_string_current)
@@ -539,7 +610,7 @@ MI_estimates <- function(data,
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         filter(!grepl(trial_col, term))
     }
-    # Filter random-intercept artifacts
+    # Filter random-effect artifacts
     if (random_intercept == "Yes" && !is.null(random_intercept_var)) {
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         filter(!grepl(paste0("\\(Intercept\\)|SD\\(", random_intercept_var, "\\)"), term))
@@ -574,9 +645,8 @@ MI_estimates <- function(data,
           filter(!grepl(pattern, term))
       }
     }
-    # NEW: filter stratified-intercept coefficients from table (they are nuisance intercepts)
+    # Filter stratified-intercept coefficients from table (they are nuisance intercepts)
     if (stratified_intercept == "Yes" && !is.null(stratified_intercept_var) && model_type != "cox") {
-      # they will look like as.factor(var)Level
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         filter(!grepl(paste0("^as\\.factor\\(", stratified_intercept_var, "\\)"), term))
     }
