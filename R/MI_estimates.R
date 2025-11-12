@@ -1,4 +1,4 @@
-#' Compute Estimates for Multiple Imputed Data (with optional stratified intercept)
+#' Compute Estimates for Multiple Imputed Data
 #'
 #' This function fits statistical models to multiply imputed datasets and pools the results using Rubin's Rules.
 #' It supports various regression models, including negative binomial, logistic, Poisson, linear, and Cox regression.
