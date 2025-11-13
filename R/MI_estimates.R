@@ -239,7 +239,6 @@ MI_estimates <- function(data,
 
   ## ---- Helpers ----
 
-  # Expand interactions like a*b -> a + b + a:b (but keep rcs()/bs() intact)
   expand_terms <- function(term) {
     if (grepl("^rcs\\(|^bs\\(", term)) return(term)
     if (grepl("\\*", term)) {
@@ -251,7 +250,6 @@ MI_estimates <- function(data,
     } else term
   }
 
-  # Build spline/poly pieces
   process_special_terms <- function() {
     spline_formula_parts <- character(0)
     if (!is.null(spline_terms)) {
@@ -299,7 +297,6 @@ MI_estimates <- function(data,
 
     if (length(rs_vars) == 0) {
       if (same_group_as_strata) {
-        # pure stratified intercept, no random effects
         return("")
       } else {
         return(paste0("+ (1 | ", random_intercept_var, ")"))
@@ -307,10 +304,8 @@ MI_estimates <- function(data,
     } else {
       rs_str <- paste(rs_vars, collapse = " + ")
       if (same_group_as_strata) {
-        # stratified intercept + random slopes only
         return(paste0("+ (0 + ", rs_str, " | ", random_intercept_var, ")"))
       } else {
-        # random intercept + random slopes
         return(paste0("+ (1 + ", rs_str, " | ", random_intercept_var, ")"))
       }
     }
@@ -341,14 +336,14 @@ MI_estimates <- function(data,
 
     strat_glm_piece <- ""
     strat_cox_piece <- ""
-    intercept_prefix <- ""  # becomes "0 +" for GLM when stratification used
+    intercept_prefix <- ""   ### CHANGED HERE: we keep the standard intercept
 
     if (use_strata) {
       if (model_type == "cox") {
         strat_cox_piece <- paste("+ strata(", stratified_intercept_var, ")", sep = "")
       } else {
-        intercept_prefix <- "0 + "
-        strat_glm_piece  <- paste(" + 0 + as.factor(", stratified_intercept_var, ")", sep = "")
+        # GLM: add as.factor(strata) but DO NOT remove intercept
+        strat_glm_piece <- paste(" + as.factor(", stratified_intercept_var, ")", sep = "")  ### CHANGED HERE
       }
     }
 
@@ -368,7 +363,6 @@ MI_estimates <- function(data,
         current_spline_parts <- spline_formula_parts
         current_poly_parts   <- poly_formula_parts
 
-        # Remove own spline/poly if present
         if (!is.null(spline_terms)) {
           for (i in seq_along(spline_terms)) {
             if (spline_terms[[i]]$var == current_predictor) {
@@ -443,10 +437,8 @@ MI_estimates <- function(data,
           formula_str <- paste(formula_str, offset_term)
         }
         if (use_strata && !grepl(paste0("as\\.factor\\(", stratified_intercept_var, "\\)"), formula_str)) {
-          if (!grepl("~\\s*0\\s*\\+", formula_str)) {
-            formula_str <- sub("~", "~ 0 +", formula_str)
-          }
-          formula_str <- paste(formula_str, paste0("+ as.factor(", stratified_intercept_var, ")"))
+          # CHANGED: do NOT force 0 +, just add as.factor(strata)
+          formula_str <- paste(formula_str, paste0("+ as.factor(", stratified_intercept_var, ")"))   ### CHANGED HERE
         }
         if (use_random_effects && !grepl("\\|", formula_str)) {
           random_term <- build_random_term_core(all_rs_vars)
@@ -719,7 +711,9 @@ MI_estimates <- function(data,
     }
   }
 
-  if (length(predictor_vars) > 1) {
+  if (length(predictor_vars) == 1) {
+    return(results_list[[1]])
+  } else {
     create_combined_results <- function() {
       combined_results <- data.frame()
       for (pred_name in names(results_list)) {
@@ -744,11 +738,7 @@ MI_estimates <- function(data,
       combined_results
     }
     combined_predictors_results <- create_combined_results()
-  }
 
-  if (length(predictor_vars) == 1) {
-    return(results_list[[1]])
-  } else {
     class(results_list) <- c("MI_estimates_multi", "list")
     attr(results_list, "covariables")      <- covariables
     attr(results_list, "predictors")       <- predictor_vars
