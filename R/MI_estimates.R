@@ -5,9 +5,18 @@
 #' The function also supports mixed models (random effects) using `glmmTMB`, `lme4`, and `coxme`, and can handle interaction terms,
 #' restricted cubic splines (rcs), and polynomial terms.
 #'
-#' It allows:
-#' - Intercept: common, stratified (fixed per level), or random
-#' - Slopes: fixed or random (for selected predictors / covariables)
+#' Intercept / slope structure is inferred automatically:
+#'   - If `stratified_intercept_var` is provided:
+#'       * GLM: fixed stratified intercept via `0 + as.factor(stratified_intercept_var)`
+#'       * Cox: stratified baseline hazard via `strata(stratified_intercept_var)`
+#'   - If `random_intercept_var` is provided:
+#'       * Mixed model is used (glmmTMB/lme4/coxme)
+#'       * Random intercept and/or random slopes are defined by `predictor_vars_random_slope`
+#'         and `covariables_random_slope`, with the following special case:
+#'           - If `random_intercept_var == stratified_intercept_var`:
+#'               + and no random slopes -> no random effect at all (pure stratified intercept)
+#'               + and random slopes -> random slopes only (no random intercept):
+#'                     (0 + slopes | random_intercept_var)
 #'
 #' @param data A data frame containing the imputed dataset.
 #' @param outcome_var The dependent variable for GLM models.
@@ -38,24 +47,14 @@
 #' @param poly_terms A named list to specify variables to be modeled with polynomial terms. Each element should be a list with 'var' (variable name) and 'degree' (2 for quadratic, 3 for cubic).
 #' @param include_spline_terms Whether to include individual spline components in the output (default: FALSE).
 #' @param include_poly_terms Whether to include individual polynomial components in the output (default: TRUE).
-#' @param random_intercept Whether to include random effects in the model ("Yes" or "No").
-#'   If "Yes", a random effects term is added that may contain a random intercept and/or random slopes depending on
-#'   `stratified_intercept` and the `*_random_slope` arguments (see details in code comments).
-#' @param random_intercept_var The grouping variable for the random effects (required if `random_intercept = "Yes"`).
+#' @param random_intercept_var Grouping variable for random effects.
+#'        If NULL, no random effects are included.
 #' @param predictor_vars_random_slope Character vector of predictor variable names for which a random slope should be added.
 #' @param covariables_random_slope Character vector of covariable names for which a random slope should be added.
-#' @param stratified_intercept Whether to use a stratified intercept ("Yes" or "No"). For Cox, this stratifies the baseline hazard.
-#' @param stratified_intercept_var The variable whose levels define the strata for the intercept (or Cox baseline hazard).
+#' @param stratified_intercept_var Variable whose levels define a stratified intercept (GLM) or baseline hazard (Cox).
+#'        If NULL, no stratification is applied.
 #'
-#' @return A list (or data frame if a single predictor) containing model results for each predictor variable.
-#'   Each element is a data frame with model estimates, standard errors, confidence intervals, p-values,
-#'   and exponentiated estimates (if applicable).
-#'   Attributes include information about the model, formula, random effects, and imputations.
-#'
-#' @import dplyr MASS mice survival splines
-#' @importFrom lme4 lmer glmer fixef VarCorr
-#' @importFrom glmmTMB glmmTMB fixef VarCorr
-#' @importFrom coxme coxme
+#' @return A list (or data frame if a single predictor) containing model results.
 #' @export
 MI_estimates <- function(data,
                          outcome_var,
@@ -76,14 +75,16 @@ MI_estimates <- function(data,
                          poly_terms = NULL,
                          include_spline_terms = FALSE,
                          include_poly_terms = TRUE,
-                         random_intercept = "No",
                          random_intercept_var = NULL,
                          predictor_vars_random_slope = NULL,
                          covariables_random_slope = NULL,
-                         stratified_intercept = "No",
                          stratified_intercept_var = NULL) {
 
-  ## ---- Package setup ----
+  ## ---- Flags inferred from arguments ----
+  use_random_effects <- !is.null(random_intercept_var)
+  use_strata         <- !is.null(stratified_intercept_var)
+
+  ## ---- Packages ----
   require(dplyr)
   require(MASS)
   require(mice)
@@ -91,7 +92,7 @@ MI_estimates <- function(data,
   require(survival)
   require(splines)
 
-  if (random_intercept == "Yes") {
+  if (use_random_effects) {
     require(lme4)
     require(mitools)
 
@@ -124,7 +125,7 @@ MI_estimates <- function(data,
     use_rms <- FALSE
   }
 
-  ## ---- Core validation ----
+  ## ---- Core checks ----
   if (!imp_col %in% names(data)) stop("imp_col not found in data.")
   if (!outcome_var %in% names(data) && model_type != "cox") stop("outcome_var not found in data.")
   if (!followup_offset %in% c("Yes", "No")) stop("followup_offset must be either 'Yes' or 'No'.")
@@ -132,16 +133,13 @@ MI_estimates <- function(data,
   if (!is.null(followup_col) && any(data[[followup_col]] <= 0, na.rm = TRUE)) stop("followup_col must be strictly positive for offset.")
   if (!trial_factor %in% c("Yes", "No")) stop("trial_factor must be either 'Yes' or 'No'.")
   if (trial_factor == "Yes" && is.null(trial_col)) stop("If trial_factor = 'Yes', trial_col must be provided.")
-  if (!random_intercept %in% c("Yes", "No")) stop("random_intercept must be either 'Yes' or 'No'.")
-  if (random_intercept == "Yes" && is.null(random_intercept_var)) stop("If random_intercept = 'Yes', random_intercept_var must be provided.")
-  if (!is.null(random_intercept_var) && !random_intercept_var %in% names(data)) stop("random_intercept_var not found in data.")
-  if (!stratified_intercept %in% c("Yes", "No")) stop("stratified_intercept must be either 'Yes' or 'No'.")
-  if (stratified_intercept == "Yes") {
-    if (is.null(stratified_intercept_var)) stop("If stratified_intercept = 'Yes', stratified_intercept_var must be provided.")
-    if (!stratified_intercept_var %in% names(data)) stop("stratified_intercept_var not found in data.")
-  }
+  if (use_random_effects && !random_intercept_var %in% names(data)) stop("random_intercept_var not found in data.")
+  if (use_strata && !stratified_intercept_var %in% names(data)) stop("stratified_intercept_var not found in data.")
+  if (!is.null(followup_col) && !followup_col %in% names(data)) stop("followup_col not found in data.")
+  if (!is.null(trial_col) && !trial_col %in% names(data)) stop("trial_col not found in data.")
+  if (!is.null(time_col) && !time_col %in% names(data)) stop("time_col not found in data.")
+  if (!is.null(event_col) && !event_col %in% names(data)) stop("event_col not found in data.")
 
-  # Random slope variable checks
   if (!is.null(predictor_vars_random_slope)) {
     if (!all(predictor_vars_random_slope %in% names(data))) {
       missing_rs <- predictor_vars_random_slope[!predictor_vars_random_slope %in% names(data)]
@@ -154,15 +152,10 @@ MI_estimates <- function(data,
       stop(paste("covariables_random_slope not found in data:", paste(missing_rs, collapse = ", ")))
     }
   }
-  if (random_intercept == "No" &&
+  if (!use_random_effects &&
       (!is.null(predictor_vars_random_slope) || !is.null(covariables_random_slope))) {
-    warning("Random slopes specified but random_intercept = 'No'. Random slope specifications will be ignored.")
+    warning("Random slopes specified but random_intercept_var is NULL. Random slopes will be ignored (no mixed model).")
   }
-
-  if (!is.null(followup_col) && !followup_col %in% names(data)) stop("followup_col not found in data.")
-  if (!is.null(trial_col) && !trial_col %in% names(data)) stop("trial_col not found in data.")
-  if (!is.null(time_col) && !time_col %in% names(data)) stop("time_col not found in data.")
-  if (!is.null(event_col) && !event_col %in% names(data)) stop("event_col not found in data.")
 
   ## ---- Imputations ----
   actual_imps <- sort(unique(data[[imp_col]]))
@@ -181,7 +174,7 @@ MI_estimates <- function(data,
     implist[[i]] <- data_i
   }
 
-  ## ---- Validate splines / polynomials ----
+  ## ---- Validate spline/poly ----
   if (!is.null(spline_terms)) {
     if (!is.list(spline_terms)) stop("spline_terms must be a list")
     for (i in seq_along(spline_terms)) {
@@ -212,9 +205,7 @@ MI_estimates <- function(data,
     }
   }
 
-  ## ---- Helpers ----
-
-  # Extract raw variables from terms including interactions
+  ## ---- Variable presence checks (if no custom formula) ----
   if (is.null(formula_string)) {
     extract_vars_from_terms <- function(terms) {
       all_vars <- character(0)
@@ -245,6 +236,8 @@ MI_estimates <- function(data,
       }
     }
   }
+
+  ## ---- Helpers ----
 
   # Expand interactions like a*b -> a + b + a:b (but keep rcs()/bs() intact)
   expand_terms <- function(term) {
@@ -297,53 +290,34 @@ MI_estimates <- function(data,
   spline_formula_parts <- special_terms$spline_parts
   poly_formula_parts <- special_terms$poly_parts
 
-  ## ---- Random effects term builder (core) ----
-  # Given a vector of variables with random slopes (rs_vars),
-  # decide what random term to add based on:
-  # - random_intercept ("Yes"/"No")
-  # - stratified_intercept and whether it uses the same grouping variable
-  #
-  # Cases:
-  # 1) random_intercept = "No"     -> "" (no random effects)
-  # 2) random_intercept = "Yes", rs_vars empty, different grouping from any strata:
-  #      -> "+ (1 | group)"
-  # 3) random_intercept = "Yes", rs_vars not empty, different grouping from strata:
-  #      -> "+ (1 + rs_vars | group)"
-  # 4) stratified_intercept = "Yes", same var as random_intercept_var:
-  #    - rs_vars empty  -> ""  (purely stratified intercept, no random intercept)
-  #    - rs_vars non-empty -> "+ (0 + rs_vars | group)" (random slopes, no random intercept)
+  ## ---- Random-effects core builder ----
   build_random_term_core <- function(rs_vars) {
-    if (random_intercept != "Yes") return("")
-
-    same_group_as_strata <- (stratified_intercept == "Yes" &&
-                               !is.null(stratified_intercept_var) &&
-                               !is.null(random_intercept_var) &&
+    if (!use_random_effects) return("")
+    rs_vars <- unique(rs_vars)
+    same_group_as_strata <- (use_strata &&
                                stratified_intercept_var == random_intercept_var)
 
-    rs_vars <- unique(rs_vars)
     if (length(rs_vars) == 0) {
       if (same_group_as_strata) {
-        # Stratified intercept on same variable -> no random intercept
+        # pure stratified intercept, no random effects
         return("")
       } else {
-        # Random intercept only
         return(paste0("+ (1 | ", random_intercept_var, ")"))
       }
     } else {
       rs_str <- paste(rs_vars, collapse = " + ")
       if (same_group_as_strata) {
-        # Stratified intercept + random slopes only
+        # stratified intercept + random slopes only
         return(paste0("+ (0 + ", rs_str, " | ", random_intercept_var, ")"))
       } else {
-        # Random intercept + random slopes
+        # random intercept + random slopes
         return(paste0("+ (1 + ", rs_str, " | ", random_intercept_var, ")"))
       }
     }
   }
 
-  # Build random-effects term for "automatic" formula construction (non-custom)
   build_random_term <- function(current_predictor, covariables_in_model) {
-    if (random_intercept != "Yes") return("")
+    if (!use_random_effects) return("")
     rs_vars <- character(0)
 
     if (!is.null(predictor_vars_random_slope) &&
@@ -362,14 +336,14 @@ MI_estimates <- function(data,
 
   ## ---- Formula builder ----
   build_formula_for_predictor <- function(current_predictor) {
-    trial_term   <- if (trial_factor == "Yes") paste("+ as.factor(", trial_col, ")", sep = "") else ""
-    offset_term  <- if (followup_offset == "Yes") paste("+ offset(log(", followup_col, "))", sep = "") else ""
+    trial_term  <- if (trial_factor == "Yes") paste("+ as.factor(", trial_col, ")", sep = "") else ""
+    offset_term <- if (followup_offset == "Yes") paste("+ offset(log(", followup_col, "))", sep = "") else ""
 
     strat_glm_piece <- ""
     strat_cox_piece <- ""
-    intercept_prefix <- ""  # becomes "0 +" if GLM stratification is used
+    intercept_prefix <- ""  # becomes "0 +" for GLM when stratification used
 
-    if (stratified_intercept == "Yes") {
+    if (use_strata) {
       if (model_type == "cox") {
         strat_cox_piece <- paste("+ strata(", stratified_intercept_var, ")", sep = "")
       } else {
@@ -379,7 +353,7 @@ MI_estimates <- function(data,
     }
 
     if (is.null(formula_string)) {
-      ## --- Automatic formula construction ---
+      # Automatic formula construction
       if (!is.null(covariables)) {
         expanded_covariables <- unique(unlist(lapply(covariables, expand_terms)))
       } else {
@@ -389,13 +363,12 @@ MI_estimates <- function(data,
       covariables_in_model <- covariables
 
       if (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor)) {
-        # Null model
         all_terms <- c(expanded_covariables, spline_formula_parts, poly_formula_parts)
       } else {
         current_spline_parts <- spline_formula_parts
         current_poly_parts   <- poly_formula_parts
 
-        # Remove own spline/poly terms if present
+        # Remove own spline/poly if present
         if (!is.null(spline_terms)) {
           for (i in seq_along(spline_terms)) {
             if (spline_terms[[i]]$var == current_predictor) {
@@ -434,10 +407,9 @@ MI_estimates <- function(data,
       }
 
     } else {
-      ## --- Custom formula: we add trial/offset/strata/random if missing ---
+      # Custom formula: add trial/offset/strata/random if missing
       formula_str <- formula_string
 
-      # Global random-slope vars (for custom formula)
       all_rs_vars <- unique(c(
         if (!is.null(predictor_vars_random_slope)) predictor_vars_random_slope else character(0),
         if (!is.null(covariables_random_slope))   covariables_random_slope   else character(0)
@@ -451,17 +423,15 @@ MI_estimates <- function(data,
         if (trial_factor == "Yes" && !grepl(paste0("as\\.factor\\(", trial_col, "\\)"), formula_str)) {
           formula_str <- paste(formula_str, trial_term)
         }
-        if (stratified_intercept == "Yes" && !grepl(paste0("strata\\(", stratified_intercept_var, "\\)"), formula_str)) {
+        if (use_strata && !grepl(paste0("strata\\(", stratified_intercept_var, "\\)"), formula_str)) {
           formula_str <- paste(formula_str, paste0("+ strata(", stratified_intercept_var, ")"))
         }
-
-        if (random_intercept == "Yes" && !grepl("\\|", formula_str)) {
+        if (use_random_effects && !grepl("\\|", formula_str)) {
           random_term <- build_random_term_core(all_rs_vars)
           if (nzchar(random_term)) {
             formula_str <- paste(formula_str, random_term)
           }
         }
-
       } else {
         if (!grepl(paste0("^", outcome_var, "\\s*~"), formula_str)) {
           formula_str <- paste(outcome_var, "~", formula_str)
@@ -472,14 +442,13 @@ MI_estimates <- function(data,
         if (followup_offset == "Yes" && !grepl("offset\\(log\\(.*\\)\\)", formula_str)) {
           formula_str <- paste(formula_str, offset_term)
         }
-        if (stratified_intercept == "Yes" && !grepl(paste0("as\\.factor\\(", stratified_intercept_var, "\\)"), formula_str)) {
+        if (use_strata && !grepl(paste0("as\\.factor\\(", stratified_intercept_var, "\\)"), formula_str)) {
           if (!grepl("~\\s*0\\s*\\+", formula_str)) {
             formula_str <- sub("~", "~ 0 +", formula_str)
           }
           formula_str <- paste(formula_str, paste0("+ as.factor(", stratified_intercept_var, ")"))
         }
-
-        if (random_intercept == "Yes" && !grepl("\\|", formula_str)) {
+        if (use_random_effects && !grepl("\\|", formula_str)) {
           random_term <- build_random_term_core(all_rs_vars)
           if (nzchar(random_term)) {
             formula_str <- paste(formula_str, random_term)
@@ -495,7 +464,6 @@ MI_estimates <- function(data,
     formula_string_current <- build_formula_for_predictor(current_predictor)
     model_formula <- as.formula(formula_string_current)
 
-    # Detect interaction / spline / poly terms for flags and filtering
     interaction_terms <- character(0)
     if (grepl(":", formula_string_current)) {
       terms_part <- strsplit(formula_string_current, "~")[[1]][2]
@@ -517,7 +485,7 @@ MI_estimates <- function(data,
 
     is_null_model <- (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor))
 
-    if (random_intercept == "Yes") {
+    if (use_random_effects) {
       models_list <- vector("list", imp_n)
       for (i in seq_along(actual_imps)) {
         data_i <- implist[[i]]
@@ -618,27 +586,31 @@ MI_estimates <- function(data,
 
     # exponentiation
     Results_multivariate_analysis <- Results_multivariate_analysis %>%
-      mutate(exp_estimate     = exp(estimate),
-             exp_CI95_lower   = exp(`2.5 %`),
-             exp_CI95_upper   = exp(`97.5 %`)) %>%
+      mutate(exp_estimate   = exp(estimate),
+             exp_CI95_lower = exp(`2.5 %`),
+             exp_CI95_upper = exp(`97.5 %`)) %>%
       dplyr::select(term, estimate, std.error, `2.5 %`, `97.5 %`,
                     exp_estimate, exp_CI95_lower, exp_CI95_upper, p.value)
 
     Results_multivariate_analysis$term <- gsub("poly\\(([^,]+), degree = ([0-9]+), raw = TRUE\\)",
                                                "poly(\\1, \\2, raw = TRUE)", Results_multivariate_analysis$term)
 
-    # Filter trial terms from output
+    # Filter trial and nuisance terms
     if (!is.null(trial_col)) {
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         filter(!grepl(trial_col, term))
     }
-    # Filter random-effect artifacts
-    if (random_intercept == "Yes" && !is.null(random_intercept_var)) {
+    if (use_random_effects) {
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         filter(!grepl(paste0("\\(Intercept\\)|SD\\(", random_intercept_var, "\\)"), term))
     }
-    # Filter spline components
-    if (!include_spline_terms && length(spline_terms_detected) > 0) {
+    if (use_strata && model_type != "cox") {
+      Results_multivariate_analysis <- Results_multivariate_analysis %>%
+        filter(!grepl(paste0("^as\\.factor\\(", stratified_intercept_var, "\\)"), term))
+    }
+
+    # filter spline / poly components if required
+    if (length(spline_terms_detected) > 0 && !include_spline_terms) {
       spline_patterns <- sapply(spline_terms_detected, function(x) {
         if (grepl("rcs\\(", x)) {
           var_name <- gsub("rcs\\(([^,]+),.*", "\\1", x)
@@ -653,8 +625,7 @@ MI_estimates <- function(data,
           filter(!grepl(pattern, term))
       }
     }
-    # Filter polynomial components
-    if (!include_poly_terms && length(poly_terms_detected) > 0) {
+    if (length(poly_terms_detected) > 0 && !include_poly_terms) {
       poly_patterns <- sapply(poly_terms_detected, function(x) {
         if (grepl("poly\\(", x)) {
           var_name <- trimws(gsub("poly\\(([^,]+),.*", "\\1", x))
@@ -667,13 +638,8 @@ MI_estimates <- function(data,
           filter(!grepl(pattern, term))
       }
     }
-    # Filter stratified-intercept coefficients from table (nuisance)
-    if (stratified_intercept == "Yes" && !is.null(stratified_intercept_var) && model_type != "cox") {
-      Results_multivariate_analysis <- Results_multivariate_analysis %>%
-        filter(!grepl(paste0("^as\\.factor\\(", stratified_intercept_var, "\\)"), term))
-    }
 
-    # Null model row
+    # null model row
     if (is_null_model) {
       null_row <- data.frame(
         term = "No_predictor",
@@ -684,75 +650,57 @@ MI_estimates <- function(data,
       Results_multivariate_analysis <- rbind(null_row, Results_multivariate_analysis)
     }
 
-    # Flags
+    # flags
     if (highlight_interactions && length(interaction_terms) > 0) {
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         mutate(is_interaction = sapply(term, function(t) any(sapply(interaction_terms, function(i) grepl(i, t, fixed = TRUE)))))
     }
     if (highlight_interactions && length(spline_terms_detected) > 0) {
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
-        mutate(is_spline = sapply(term, function(t) {
-          if (grepl("rcs\\(|bs\\(", t)) return(TRUE)
-          for (spline_term in spline_terms_detected) {
-            var_name <- if (grepl("rcs\\(", spline_term))
-              gsub("rcs\\(([^,]+),.*", "\\1", spline_term) else
-                gsub("bs\\(([^,]+),.*", "\\1", spline_term)
-            if (grepl(paste0("^", trimws(var_name), "'"), t)) return(TRUE)
-          }
-          FALSE
-        }))
+        mutate(is_spline = grepl("rcs\\(|bs\\(", term))
     }
     if (highlight_interactions && length(poly_terms_detected) > 0) {
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         mutate(is_polynomial = grepl("poly\\(", term))
     }
 
-    # Attributes
-    if (random_intercept == "Yes") {
-      attr(Results_multivariate_analysis, "has_random_effects") <- TRUE
-      attr(Results_multivariate_analysis, "random_intercept_var") <- random_intercept_var
-      if (exists("current_models_list") && length(current_models_list) > 0) {
-        model1 <- current_models_list[[1]]
-        if (inherits(model1, "glmmTMB")) {
-          re_var <- tryCatch({ as.data.frame(glmmTMB::VarCorr(model1)$cond)[1, "vcov"] }, error = function(e) NA)
-          attr(Results_multivariate_analysis, "variance_components") <- re_var
-        }
-        if (model_type == "cox") {
-          if (!is.null(model1$vcoef)) {
-            var_comp <- as.numeric(model1$vcoef)
-            names(var_comp) <- "Var(Random Intercept)"
-            attr(Results_multivariate_analysis, "variance_components") <- var_comp
-          }
-        } else if (inherits(model1, "merMod")) {
-          var_comp <- as.data.frame(lme4::VarCorr(model1))
-          var_comp <- setNames(var_comp$vcov, paste0("Var(", var_comp$grp, ")"))
-          attr(Results_multivariate_analysis, "variance_components") <- var_comp
-          if (model_type == "lm") {
-            tau2   <- var_comp[1]
-            sigma2 <- attr(lme4::VarCorr(model1), "sc")^2
-            ICC    <- tau2 / (tau2 + sigma2)
-            attr(Results_multivariate_analysis, "ICC") <- ICC
-          }
-        }
-      }
-    } else {
-      attr(Results_multivariate_analysis, "has_random_effects") <- FALSE
-    }
-
-    attr(Results_multivariate_analysis, "predictor_tested")         <- current_predictor
+    # attributes
+    attr(Results_multivariate_analysis, "has_random_effects")      <- use_random_effects
+    attr(Results_multivariate_analysis, "random_intercept_var")    <- random_intercept_var
+    attr(Results_multivariate_analysis, "predictor_tested")        <- current_predictor
     attr(Results_multivariate_analysis, "model_type_used")         <- model_type
     attr(Results_multivariate_analysis, "formula")                 <- formula_string_current
     attr(Results_multivariate_analysis, "has_interactions")        <- length(interaction_terms) > 0
     attr(Results_multivariate_analysis, "interaction_terms")       <- if (length(interaction_terms) > 0) interaction_terms else NULL
     attr(Results_multivariate_analysis, "has_splines")             <- length(spline_terms_detected) > 0
     attr(Results_multivariate_analysis, "spline_terms")            <- if (length(spline_terms_detected) > 0) spline_terms_detected else NULL
-    attr(Results_multivariate_analysis, "spline_method")           <- if (exists("use_rms") && isTRUE(use_rms)) "rcs" else "bs"
     attr(Results_multivariate_analysis, "has_polynomials")         <- length(poly_terms_detected) > 0
     attr(Results_multivariate_analysis, "polynomial_terms")        <- if (length(poly_terms_detected) > 0) poly_terms_detected else NULL
     attr(Results_multivariate_analysis, "imputations")             <- actual_imps
     attr(Results_multivariate_analysis, "n_imp")                   <- length(actual_imps)
-    attr(Results_multivariate_analysis, "stratified_intercept")    <- stratified_intercept
     attr(Results_multivariate_analysis, "stratified_intercept_var")<- stratified_intercept_var
+
+    if (use_random_effects && exists("current_models_list") && length(current_models_list) > 0) {
+      model1 <- current_models_list[[1]]
+      if (inherits(model1, "glmmTMB")) {
+        re_var <- tryCatch({ as.data.frame(glmmTMB::VarCorr(model1)$cond)[1, "vcov"] }, error = function(e) NA)
+        attr(Results_multivariate_analysis, "variance_components") <- re_var
+      } else if (model_type == "cox" && !is.null(model1$vcoef)) {
+        var_comp <- as.numeric(model1$vcoef)
+        names(var_comp) <- "Var(Random Intercept)"
+        attr(Results_multivariate_analysis, "variance_components") <- var_comp
+      } else if (inherits(model1, "merMod")) {
+        var_comp <- as.data.frame(lme4::VarCorr(model1))
+        var_comp <- setNames(var_comp$vcov, paste0("Var(", var_comp$grp, ")"))
+        attr(Results_multivariate_analysis, "variance_components") <- var_comp
+        if (model_type == "lm") {
+          tau2   <- var_comp[1]
+          sigma2 <- attr(lme4::VarCorr(model1), "sc")^2
+          ICC    <- tau2 / (tau2 + sigma2)
+          attr(Results_multivariate_analysis, "ICC") <- ICC
+        }
+      }
+    }
 
     Results_multivariate_analysis
   }
@@ -781,14 +729,10 @@ MI_estimates <- function(data,
           predictor_rows <- result[result$term == "No_predictor", ]
         } else {
           predictor_rows <- result[grepl(paste0("^", pred_name), result$term) & !grepl("Intercept", result$term), ]
-          if (nrow(predictor_rows) == 0) {
-            if (!is.null(covariables) && length(covariables) > 0) {
-              covariable_pattern <- paste(covariables, collapse = "|")
-              predictor_rows <- result[grepl(pred_name, result$term) & !grepl("Intercept", result$term), ]
-              predictor_rows <- predictor_rows[!grepl(covariable_pattern, predictor_rows$term), ]
-            } else {
-              predictor_rows <- result[grepl(pred_name, result$term) & !grepl("Intercept", result$term), ]
-            }
+          if (nrow(predictor_rows) == 0 && !is.null(covariables) && length(covariables) > 0) {
+            covariable_pattern <- paste(covariables, collapse = "|")
+            predictor_rows <- result[grepl(pred_name, result$term) & !grepl("Intercept", result$term), ]
+            predictor_rows <- predictor_rows[!grepl(covariable_pattern, predictor_rows$term), ]
           }
         }
         if (nrow(predictor_rows) > 0) {
