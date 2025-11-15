@@ -71,7 +71,16 @@ MI_estimates <- function(data,
                          event_col = NULL,
                          formula_string = NULL,
                          highlight_interactions = TRUE,
+                         # --- NEW INTERFACE FOR SPLINES ---
+                         # You can pass either:
+                         #   - character vector of variable names (e.g. "Tif_preBD_PCT_0W")
+                         #   - or the old list-of-lists structure
                          spline_terms = NULL,
+                         # number of knots (used if spline_knots_percentile is NULL)
+                         spline_knots_n = 4,
+                         # percentiles (0-100) to define knot locations, applied on the whole data
+                         spline_knots_percentile = NULL,
+                         # ---------------------------------
                          poly_terms = NULL,
                          include_spline_terms = FALSE,
                          include_poly_terms = TRUE,
@@ -115,7 +124,7 @@ MI_estimates <- function(data,
   # Spline support
   if (!is.null(spline_terms)) {
     if (!requireNamespace("rms", quietly = TRUE)) {
-      message("Package 'rms' is not available. Using splines package instead.")
+      message("Package 'rms' is not available. Using splines::bs() instead of rcs().")
       use_rms <- FALSE
     } else {
       require(rms)
@@ -174,18 +183,58 @@ MI_estimates <- function(data,
     implist[[i]] <- data_i
   }
 
-  ## ---- Validate spline/poly ----
+  ## ---- NEW: user-friendly rcs specification -> internal structure ----
+  # Old API expected: list(list(var="x", knots=...), list(var="y", knots=...))
+  # New API: spline_terms = "x" or c("x","y"), plus spline_knots_n / spline_knots_percentile.
+  if (!is.null(spline_terms) && is.character(spline_terms)) {
+    spline_vars <- spline_terms
+    spline_list <- vector("list", length(spline_vars))
+
+    # Convert percentiles to probabilities if provided
+    if (!is.null(spline_knots_percentile)) {
+      probs <- spline_knots_percentile / 100
+      if (any(probs <= 0 | probs >= 1)) {
+        stop("spline_knots_percentile must be strictly between 0 and 100 (exclusive).")
+      }
+    } else {
+      probs <- NULL
+    }
+
+    for (i in seq_along(spline_vars)) {
+      v <- spline_vars[i]
+      if (!v %in% names(data)) stop(paste("Spline variable", v, "not found in data."))
+
+      x <- data[[v]]
+
+      if (!is.null(probs)) {
+        # Global percentile-based knots over the *entire* distribution
+        knots <- as.numeric(stats::quantile(x, probs = probs, na.rm = TRUE))
+      } else {
+        # Fall back to "number of knots" logic used previously
+        # We just store "k" and let process_special_terms() translate to df/knots
+        knots <- spline_knots_n
+      }
+
+      spline_list[[i]] <- list(var = v, knots = knots)
+    }
+
+    spline_terms <- spline_list
+  }
+
+  ## ---- Validate spline/poly (internal representation) ----
   if (!is.null(spline_terms)) {
-    if (!is.list(spline_terms)) stop("spline_terms must be a list")
+    if (!is.list(spline_terms)) stop("spline_terms must be a list (or character vector of variable names).")
     for (i in seq_along(spline_terms)) {
       if (!is.list(spline_terms[[i]]) || is.null(spline_terms[[i]]$var))
-        stop("Each element in spline_terms must be a list with at least a 'var' element")
+        stop("Each element in spline_terms must be a list with at least a 'var' element.")
       if (!spline_terms[[i]]$var %in% names(data))
-        stop(paste("Spline variable", spline_terms[[i]]$var, "not found in data"))
+        stop(paste("Spline variable", spline_terms[[i]]$var, "not found in data."))
       if (is.null(spline_terms[[i]]$knots)) {
-        spline_terms[[i]]$knots <- 3
-      } else if (!is.numeric(spline_terms[[i]]$knots)) {
-        stop("Knots must be numeric")
+        spline_terms[[i]]$knots <- spline_knots_n
+      }
+      # knots can be numeric scalar (k) or numeric vector (explicit positions)
+      if (!is.numeric(spline_terms[[i]]$knots)) {
+        stop("Knots must be numeric (either number of knots or vector of knot positions).")
       }
     }
   }
@@ -255,19 +304,33 @@ MI_estimates <- function(data,
     if (!is.null(spline_terms)) {
       for (i in seq_along(spline_terms)) {
         var_name <- spline_terms[[i]]$var
-        knots <- spline_terms[[i]]$knots
-        if (use_rms) {
-          if (length(knots) == 1) {
-            spline_formula_parts <- c(spline_formula_parts, paste0("rcs(", var_name, ", ", knots, ")"))
+        knots    <- spline_terms[[i]]$knots
+
+        # Two modes:
+        #  - scalar "knots" = number of knots (k) -> rcs(x, k) or bs(x, df = k+2)
+        #  - vector "knots" = explicit knot positions -> rcs(x, c(...)) or bs(x, knots = c(...))
+        if (length(knots) == 1) {
+          k <- knots[1]
+          if (use_rms) {
+            spline_formula_parts <- c(spline_formula_parts,
+                                      paste0("rcs(", var_name, ", ", k, ")"))
           } else {
-            spline_formula_parts <- c(spline_formula_parts, paste0("rcs(", var_name, ", c(", paste(knots, collapse = ", "), "))"))
+            df <- k + 2
+            spline_formula_parts <- c(spline_formula_parts,
+                                      paste0("bs(", var_name, ", df = ", df, ", degree = 3)"))
           }
         } else {
-          if (length(knots) == 1) {
-            df <- knots + 2
-            spline_formula_parts <- c(spline_formula_parts, paste0("bs(", var_name, ", df = ", df, ", degree = 3)"))
+          # explicit knot locations (from percentiles or user-provided)
+          if (use_rms) {
+            spline_formula_parts <- c(
+              spline_formula_parts,
+              paste0("rcs(", var_name, ", c(", paste(knots, collapse = ", "), "))")
+            )
           } else {
-            spline_formula_parts <- c(spline_formula_parts, paste0("bs(", var_name, ", knots = c(", paste(knots, collapse = ", "), "), degree = 3)"))
+            spline_formula_parts <- c(
+              spline_formula_parts,
+              paste0("bs(", var_name, ", knots = c(", paste(knots, collapse = ", "), "), degree = 3)")
+            )
           }
         }
       }
@@ -277,8 +340,9 @@ MI_estimates <- function(data,
     if (!is.null(poly_terms)) {
       for (i in seq_along(poly_terms)) {
         var_name <- poly_terms[[i]]$var
-        degree <- poly_terms[[i]]$degree
-        poly_formula_parts <- c(poly_formula_parts, paste0("poly(", var_name, ", degree = ", degree, ", raw = TRUE)"))
+        degree   <- poly_terms[[i]]$degree
+        poly_formula_parts <- c(poly_formula_parts,
+                                paste0("poly(", var_name, ", degree = ", degree, ", raw = TRUE)"))
       }
     }
     list(spline_parts = spline_formula_parts, poly_parts = poly_formula_parts)
@@ -286,7 +350,7 @@ MI_estimates <- function(data,
 
   special_terms <- process_special_terms()
   spline_formula_parts <- special_terms$spline_parts
-  poly_formula_parts <- special_terms$poly_parts
+  poly_formula_parts   <- special_terms$poly_parts
 
   ## ---- Random-effects core builder ----
   build_random_term_core <- function(rs_vars) {
@@ -334,16 +398,16 @@ MI_estimates <- function(data,
     trial_term  <- if (trial_factor == "Yes") paste("+ as.factor(", trial_col, ")", sep = "") else ""
     offset_term <- if (followup_offset == "Yes") paste("+ offset(log(", followup_col, "))", sep = "") else ""
 
-    strat_glm_piece <- ""
-    strat_cox_piece <- ""
-    intercept_prefix <- ""   ### CHANGED HERE: we keep the standard intercept
+    strat_glm_piece  <- ""
+    strat_cox_piece  <- ""
+    intercept_prefix <- ""   # keep standard intercept
 
     if (use_strata) {
       if (model_type == "cox") {
         strat_cox_piece <- paste("+ strata(", stratified_intercept_var, ")", sep = "")
       } else {
-        # GLM: add as.factor(strata) but DO NOT remove intercept
-        strat_glm_piece <- paste(" + as.factor(", stratified_intercept_var, ")", sep = "")  ### CHANGED HERE
+        # GLM: add as.factor(strata) but keep intercept
+        strat_glm_piece <- paste(" + as.factor(", stratified_intercept_var, ")", sep = "")
       }
     }
 
@@ -363,6 +427,7 @@ MI_estimates <- function(data,
         current_spline_parts <- spline_formula_parts
         current_poly_parts   <- poly_formula_parts
 
+        # Remove own spline/poly if present (to avoid double inclusion)
         if (!is.null(spline_terms)) {
           for (i in seq_along(spline_terms)) {
             if (spline_terms[[i]]$var == current_predictor) {
@@ -380,12 +445,12 @@ MI_estimates <- function(data,
           }
         }
 
-        current_covariables <- if (is.null(covariables)) character(0) else covariables[covariables != current_predictor]
-        covariables_in_model <- current_covariables
-
-        expanded_covariables <- unique(unlist(lapply(current_covariables, expand_terms)))
-        expanded_predictor   <- expand_terms(current_predictor)
-        all_terms <- c(expanded_predictor, expanded_covariables, current_spline_parts, current_poly_parts)
+        current_covariables   <- if (is.null(covariables)) character(0) else covariables[covariables != current_predictor]
+        covariables_in_model  <- current_covariables
+        expanded_covariables  <- unique(unlist(lapply(current_covariables, expand_terms)))
+        expanded_predictor    <- expand_terms(current_predictor)
+        all_terms <- c(expanded_predictor, expanded_covariables,
+                       current_spline_parts, current_poly_parts)
       }
 
       random_term <- build_random_term(current_predictor, covariables_in_model)
@@ -437,8 +502,7 @@ MI_estimates <- function(data,
           formula_str <- paste(formula_str, offset_term)
         }
         if (use_strata && !grepl(paste0("as\\.factor\\(", stratified_intercept_var, "\\)"), formula_str)) {
-          # CHANGED: do NOT force 0 +, just add as.factor(strata)
-          formula_str <- paste(formula_str, paste0("+ as.factor(", stratified_intercept_var, ")"))   ### CHANGED HERE
+          formula_str <- paste(formula_str, paste0("+ as.factor(", stratified_intercept_var, ")"))
         }
         if (use_random_effects && !grepl("\\|", formula_str)) {
           random_term <- build_random_term_core(all_rs_vars)
@@ -512,8 +576,8 @@ MI_estimates <- function(data,
           c_se  <- sqrt(diag(vcov(m)))
         } else if (inherits(m, "glmmTMB")) {
           c_est <- fixef(m)$cond
-          v <- vcov(m)$cond
-          c_se <- sqrt(diag(v))
+          v     <- vcov(m)$cond
+          c_se  <- sqrt(diag(v))
         } else {
           c_est <- fixef(m)
           if (inherits(m, "lmerMod")) {
@@ -540,9 +604,9 @@ MI_estimates <- function(data,
         term_ses  <- term_ses[!is.na(term_ses)]
         if (length(term_ests) < 2) next
         pooled_est <- mean(term_ests)
-        w_var <- mean(term_ses^2)
-        b_var <- sum((term_ests - pooled_est)^2) / (length(term_ests) - 1)
-        total_var <- w_var + (1 + 1/length(term_ests)) * b_var
+        w_var      <- mean(term_ses^2)
+        b_var      <- sum((term_ests - pooled_est)^2) / (length(term_ests) - 1)
+        total_var  <- w_var + (1 + 1/length(term_ests)) * b_var
         pooled_results$estimate[pooled_results$term == term] <- pooled_est
         pooled_results$std.error[pooled_results$term == term] <- sqrt(total_var)
       }
@@ -551,7 +615,7 @@ MI_estimates <- function(data,
         mutate(
           `2.5 %` = estimate - 1.96 * std.error,
           `97.5 %` = estimate + 1.96 * std.error,
-          p.value = 2 * pnorm(-abs(estimate / std.error))
+          p.value  = 2 * pnorm(-abs(estimate / std.error))
         )
       current_models_list <- models_list
 
@@ -730,7 +794,8 @@ MI_estimates <- function(data,
           }
         }
         if (nrow(predictor_rows) > 0) {
-          predictor_rows <- predictor_rows[, c("term","estimate","std.error","2.5 %","97.5 %","exp_estimate","exp_CI95_lower","exp_CI95_upper","p.value")]
+          predictor_rows <- predictor_rows[, c("term","estimate","std.error","2.5 %","97.5 %",
+                                               "exp_estimate","exp_CI95_lower","exp_CI95_upper","p.value")]
           combined_results <- rbind(combined_results, predictor_rows)
         }
       }
