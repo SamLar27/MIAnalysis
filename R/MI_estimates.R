@@ -76,7 +76,6 @@ MI_estimates <- function(data,
                          spline_knots_n = 4,              # number of knots if percentiles not given
                          spline_knots_percentile = NULL,  # e.g. c(20, 35, 65, 80)
                          poly_terms = NULL,
-                         include_spline_terms = FALSE,
                          include_poly_terms = TRUE,
                          random_intercept_var = NULL,
                          predictor_vars_random_slope = NULL,
@@ -620,22 +619,7 @@ MI_estimates <- function(data,
         filter(!grepl(paste0("^as\\.factor\\(", stratified_intercept_var, "\\)"), term))
     }
 
-    # filter spline / poly components if required
-    if (length(spline_terms_detected) > 0 && !include_spline_terms) {
-      spline_patterns <- sapply(spline_terms_detected, function(x) {
-        if (grepl("rcs\\(", x)) {
-          var_name <- gsub("rcs\\(([^,]+),.*", "\\1", x)
-        } else if (grepl("bs\\(", x)) {
-          var_name <- gsub("bs\\(([^,]+),.*", "\\1", x)
-        } else return("")
-        paste0("^", trimws(var_name), "'")
-      })
-      pattern <- paste(spline_patterns, collapse = "|")
-      if (nzchar(pattern)) {
-        Results_multivariate_analysis <- Results_multivariate_analysis %>%
-          filter(!grepl(pattern, term))
-      }
-    }
+    # filter poly components if required
     if (length(poly_terms_detected) > 0 && !include_poly_terms) {
       poly_patterns <- sapply(poly_terms_detected, function(x) {
         if (grepl("poly\\(", x)) {
