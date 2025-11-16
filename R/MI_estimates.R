@@ -605,13 +605,6 @@ MI_estimates <- function(data,
       current_models_list <- res_comb
     }
 
-    # save spline flag *before* renaming
-    is_spline_logical <- if (length(spline_terms_detected) > 0) {
-      grepl("rcs\\(|bs\\(", Results_multivariate_analysis$term)
-    } else {
-      rep(FALSE, nrow(Results_multivariate_analysis))
-    }
-
     # exponentiation
     Results_multivariate_analysis <- Results_multivariate_analysis %>%
       mutate(exp_estimate   = exp(estimate),
@@ -649,12 +642,10 @@ MI_estimates <- function(data,
       if (nzchar(pattern)) {
         Results_multivariate_analysis <- Results_multivariate_analysis %>%
           filter(!grepl(pattern, term))
-        is_spline_logical <- is_spline_logical[match(Results_multivariate_analysis$term,
-                                                     Results_multivariate_analysis$term)]
       }
     }
 
-    # ---- NEW: rename rcs() terms to nice names ----
+    # ---- rename rcs() terms to nice names ----
     Results_multivariate_analysis <- rename_rcs_terms(Results_multivariate_analysis)
 
     # null model row
@@ -666,7 +657,6 @@ MI_estimates <- function(data,
         stringsAsFactors = FALSE, check.names = FALSE
       )
       Results_multivariate_analysis <- rbind(null_row, Results_multivariate_analysis)
-      is_spline_logical <- c(FALSE, is_spline_logical)
     }
 
     # flags
@@ -674,9 +664,12 @@ MI_estimates <- function(data,
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         mutate(is_interaction = sapply(term, function(t) any(sapply(interaction_terms, function(i) grepl(i, t, fixed = TRUE)))))
     }
+
+    # NEW & SIMPLE: mark splines using the renamed term
     if (length(spline_terms_detected) > 0) {
-      Results_multivariate_analysis$is_spline <- is_spline_logical
+      Results_multivariate_analysis$is_spline <- grepl("_rcs_", Results_multivariate_analysis$term)
     }
+
     if (highlight_interactions && length(poly_terms_detected) > 0) {
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         mutate(is_polynomial = grepl("^poly\\(", term))
