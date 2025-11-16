@@ -33,7 +33,7 @@
 #' @param derivative_points Optional explicit x-values for derivatives.
 #' @param derivative_method Currently ignored; numeric finite-difference is used.
 #' @param group_fits If TRUE, refit independent models per group (e.g. per trial)
-#'        using the same global knots; returns Spline per group.
+#'        using the same global knots; returns spline per group.
 #'
 #' @return A list with:
 #'   - predictions: prediction data for population curve
@@ -42,16 +42,15 @@
 #'   - plot_data: same as predictions
 #'   - prediction_range_values: numeric range used for x
 #'   - derivatives: derivative data (if requested)
-#'   - derivative_plot: ggplot for derivatives (if requested)
+#'   - derivative_plot: reserved (currently NULL)
 #'   - threshold: approximate threshold where derivative CI>0 (if requested)
 #'   - group_fits: data frame of trial-specific fits (if group_fits = TRUE)
 #'
-#' @importFrom stats as.formula glm binomial poisson gaussian predict quantile median plogis setNames
+#' @importFrom stats as.formula glm binomial poisson gaussian predict quantile median plogis setNames vcov
 #' @importFrom MASS glm.nb
 #' @importFrom survival Surv coxph
 #' @importFrom rms rcs
 #' @importFrom ggplot2 ggplot aes_string geom_line geom_ribbon xlab ylab labs scale_x_log10 scale_x_continuous scale_y_continuous coord_cartesian scale_color_manual scale_fill_manual scale_linetype_manual guides guide_legend facet_wrap theme_minimal element_rect element_text margin element_blank element_line unit annotate
-#' @importFrom dplyr %>%
 #' @importFrom lme4 lmer glmer fixef
 #' @importFrom glmmTMB glmmTMB
 #' @importFrom coxme coxme
@@ -84,6 +83,9 @@ MI_spline <- function(data,
                       derivative_points = NULL,
                       derivative_method = "numeric",
                       group_fits = FALSE) {
+
+  # small helper
+  `%||%` <- function(x, y) if (!is.null(x)) x else y
 
   # ---- Basic checks ----
   if (!model_type %in% c("nb", "poisson", "cox", "logistic", "lm")) {
@@ -128,7 +130,7 @@ MI_spline <- function(data,
     if (!is.null(subgroup_labels)) {
       unique_values <- sort(unique(Data_Subset[[subgroups]]))
       if (length(unique_values) == length(subgroup_labels)) {
-        subgroup_mapping <- setNames(subgroup_labels, unique_values)
+        subgroup_mapping <- stats::setNames(subgroup_labels, unique_values)
       }
     }
 
@@ -202,6 +204,22 @@ MI_spline <- function(data,
     ""
   }
 
+  # global covariate vars for prediction templates
+  global_covariate_vars <- NULL
+  if (!is.null(expanded_covariables)) {
+    extract_variables_cov <- function(term) {
+      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term) || grepl("^poly\\(", term)) {
+        inside <- sub("^[^\\(]+\\(([^,]+),.*$", "\\1", term)
+        return(trimws(inside))
+      } else {
+        return(term)
+      }
+    }
+    global_covariate_vars <- unique(unlist(strsplit(gsub(":", "*", expanded_covariables), "\\*")))
+    global_covariate_vars <- trimws(global_covariate_vars)
+    global_covariate_vars <- sapply(global_covariate_vars, extract_variables_cov)
+  }
+
   # ---- Trial factor & offset ----
   trial_str <- ""
   if (trial_factor == "Yes") {
@@ -228,7 +246,7 @@ MI_spline <- function(data,
 
   if (use_mixed) {
     if (length(slope_terms) == 0 && random_slope == "Yes") {
-      stop("random_slope='Yes' but no predictor_vars_random_slope / covariables_random_slope provided.")
+      stop("random_slope='Yes' but no predictor_vars_random_slope/covariables_random_slope provided.")
     }
 
     if (random_intercept == "Yes" && random_slope == "Yes" && length(slope_terms) > 0) {
@@ -254,9 +272,9 @@ MI_spline <- function(data,
       spline_term, " ", covariates_str, trial_str, offset_str, random_effect_str
     )
   }
-  formula_obj <- as.formula(formula_str)
+  formula_obj <- stats::as.formula(formula_str)
 
-  # ---- Fit main model (MI_method = first) ----
+  # ---- Fit main model ----
   fit_single_model <- function(dat) {
     if (use_mixed) {
       if (model_type == "nb") {
@@ -264,12 +282,12 @@ MI_spline <- function(data,
           glmmTMB::glmmTMB(formula_obj, family = glmmTMB::nbinom2, data = dat)
         } else {
           warning("glmmTMB not available, using Poisson glmer approximation for negative binomial.")
-          lme4::glmer(formula_obj, family = poisson(link = "log"), data = dat)
+          lme4::glmer(formula_obj, family = stats::poisson(link = "log"), data = dat)
         }
       } else if (model_type == "poisson") {
-        lme4::glmer(formula_obj, family = poisson(link = "log"), data = dat)
+        lme4::glmer(formula_obj, family = stats::poisson(link = "log"), data = dat)
       } else if (model_type == "logistic") {
-        lme4::glmer(formula_obj, family = binomial(link = "logit"), data = dat)
+        lme4::glmer(formula_obj, family = stats::binomial(link = "logit"), data = dat)
       } else if (model_type == "lm") {
         lme4::lmer(formula_obj, data = dat)
       } else if (model_type == "cox") {
@@ -279,11 +297,11 @@ MI_spline <- function(data,
       if (model_type == "nb") {
         MASS::glm.nb(formula_obj, data = dat)
       } else if (model_type == "poisson") {
-        glm(formula_obj, family = poisson(link = "log"), data = dat)
+        stats::glm(formula_obj, family = stats::poisson(link = "log"), data = dat)
       } else if (model_type == "logistic") {
-        glm(formula_obj, family = binomial(link = "logit"), data = dat)
+        stats::glm(formula_obj, family = stats::binomial(link = "logit"), data = dat)
       } else if (model_type == "lm") {
-        glm(formula_obj, family = gaussian(), data = dat)
+        stats::glm(formula_obj, family = stats::gaussian(), data = dat)
       } else if (model_type == "cox") {
         survival::coxph(formula_obj, data = dat)
       }
@@ -293,10 +311,10 @@ MI_spline <- function(data,
   if (MI_method == "first") {
     model <- fit_single_model(Data_Subset)
   } else {
-    model <- NULL  # will fit per imputation in prediction loop
+    model <- NULL
   }
 
-  # ---- Prediction data frame (population curve) ----
+  # ---- Prediction data (population curve) ----
   x_pred <- seq(
     from = stats::quantile(Data_Subset[[variable_x]], prediction_range[1], na.rm = TRUE),
     to   = stats::quantile(Data_Subset[[variable_x]], prediction_range[2], na.rm = TRUE),
@@ -324,27 +342,17 @@ MI_spline <- function(data,
     }
   }
 
-  # add covariates at median/mode
-  if (!is.null(expanded_covariables)) {
-    extract_variables_cov <- function(term) {
-      if (grepl("^rcs\\(", term) || grepl("^bs\\(", term) || grepl("^poly\\(", term)) {
-        inside <- sub("^[^\\(]+\\(([^,]+),.*$", "\\1", term)
-        return(trimws(inside))
-      } else {
-        return(term)
-      }
-    }
-    covariate_vars_for_prediction <- unique(unlist(strsplit(gsub(":", "*", expanded_covariables), "\\*")))
-    covariate_vars_for_prediction <- trimws(covariate_vars_for_prediction)
-    covariate_vars_for_prediction <- sapply(covariate_vars_for_prediction, extract_variables_cov)
-
-    for (cov in covariate_vars_for_prediction) {
+  # add covariates at median/mode (using global_covariate_vars)
+  if (!is.null(global_covariate_vars)) {
+    for (cov in global_covariate_vars) {
       if (cov %in% colnames(Data_Subset)) {
         if (is.factor(Data_Subset[[cov]])) {
           pred_data[[cov]] <- as.factor(names(which.max(table(Data_Subset[[cov]]))))
         } else {
           pred_data[[cov]] <- stats::median(Data_Subset[[cov]], na.rm = TRUE)
         }
+      } else {
+        pred_data[[cov]] <- NA_real_
       }
     }
   }
@@ -432,7 +440,6 @@ MI_spline <- function(data,
       pr        <- pred_on_scale(model_imp, pred_data)
 
       all_fit[[as.character(imp)]] <- log(pr$prediction)  # work on link scale
-      # approximate var from CI width
       all_var[[as.character(imp)]] <- ((log(pr$upper_ci) - log(pr$lower_ci)) / (2*1.96))^2
     }
 
@@ -471,8 +478,8 @@ MI_spline <- function(data,
   }
 
   # ---- Derivatives (numeric finite-difference, optional) ----
-  derivative_data <- NULL
-  threshold       <- NA
+  derivative_data  <- NULL
+  threshold        <- NA
   threshold_values <- NULL
 
   if (calculate_derivatives) {
@@ -506,25 +513,17 @@ MI_spline <- function(data,
       }
     }
 
-    # add covariates as before
-    if (!is.null(expanded_covariables)) {
-      extract_variables_cov <- function(term) {
-        if (grepl("^rcs\\(", term) || grepl("^bs\\(", term) || grepl("^poly\\(", term)) {
-          inside <- sub("^[^\\(]+\\(([^,]+),.*$", "\\1", term)
-          return(trimws(inside))
-        } else term
-      }
-      covariate_vars_for_prediction <- unique(unlist(strsplit(gsub(":", "*", expanded_covariables), "\\*")))
-      covariate_vars_for_prediction <- trimws(covariate_vars_for_prediction)
-      covariate_vars_for_prediction <- sapply(covariate_vars_for_prediction, extract_variables_cov)
-
-      for (cov in covariate_vars_for_prediction) {
+    # covariates template
+    if (!is.null(global_covariate_vars)) {
+      for (cov in global_covariate_vars) {
         if (cov %in% colnames(Data_Subset)) {
           if (is.factor(Data_Subset[[cov]])) {
             deriv_data[[cov]] <- as.factor(names(which.max(table(Data_Subset[[cov]]))))
           } else {
             deriv_data[[cov]] <- stats::median(Data_Subset[[cov]], na.rm = TRUE)
           }
+        } else {
+          deriv_data[[cov]] <- NA_real_
         }
       }
     }
@@ -538,21 +537,17 @@ MI_spline <- function(data,
       deriv_data[[random_intercept_var]] <- names(which.max(table(Data_Subset[[random_intercept_var]])))
     }
 
-    # numeric finite difference on response scale using main model (MI_method = first only)
     if (MI_method != "first") {
       warning("Derivatives currently implemented for MI_method='first' only. Returning NULL.")
       derivative_data <- NULL
     } else {
       eps <- 1e-5 * stats::sd(Data_Subset[[variable_x]], na.rm = TRUE)
-
       data_plus  <- deriv_data
       data_minus <- deriv_data
       data_plus[[variable_x]]  <- deriv_data[[variable_x]] + eps
       data_minus[[variable_x]] <- deriv_data[[variable_x]] - eps
 
-      # predictions at x, x+eps, x-eps on link scale
-      pred_center <- pred_on_scale(model, deriv_data)
-      # we need link-scale predictions to apply chain rule
+      # link-scale predictions
       if (use_mixed) {
         lp_center <- get_mixed_model_predictions(model, deriv_data, type = "link")$fit
         lp_plus   <- get_mixed_model_predictions(model, data_plus,  type = "link")$fit
@@ -569,10 +564,8 @@ MI_spline <- function(data,
         }
       }
 
-      # derivative of link
       d_link <- (lp_plus - lp_minus) / (2 * eps)
 
-      # apply link derivative -> response derivative
       if (model_type %in% c("nb", "poisson", "cox")) {
         resp_center <- exp(lp_center)
         d_resp      <- resp_center * d_link
@@ -583,7 +576,7 @@ MI_spline <- function(data,
         d_resp <- d_link
       }
 
-      se_der <- abs(d_resp) * 0.2  # conservative 20% relative error
+      se_der <- abs(d_resp) * 0.2
       lower  <- d_resp - 1.96 * se_der
       upper  <- d_resp + 1.96 * se_der
 
@@ -594,7 +587,6 @@ MI_spline <- function(data,
       derivative_data$upper_ci_derivative <- upper
       derivative_data$x_point             <- deriv_data[[variable_x]]
 
-      # simple threshold: where lower CI becomes > 0 for first time
       if (is.null(subgroups)) {
         derivative_data <- derivative_data[order(derivative_data$x_point), ]
         sig_pos <- which(derivative_data$lower_ci_derivative > 0)
@@ -618,7 +610,7 @@ MI_spline <- function(data,
     }
   }
 
-  # ---- Basic plot (population curve) ----
+  # ---- Basic population plot ----
   if (is.null(plot_options)) plot_options <- list()
 
   x_lab <- if (!is.null(plot_options$x_lab)) plot_options$x_lab else variable_x
@@ -645,8 +637,8 @@ MI_spline <- function(data,
       ggplot2::geom_ribbon(ggplot2::aes(ymin = lower_ci, ymax = upper_ci),
                            alpha = plot_options$ribbon_alpha %||% 0.3)
   } else {
-    line_color  <- plot_options$colors     %||% "black"
-    fill_colors <- plot_options$fill_colors %||% "grey70"
+    line_color  <- (plot_options$colors     %||% "black")
+    fill_colors <- (plot_options$fill_colors %||% "grey70")
     plot <- ggplot2::ggplot(pred_data,
                             ggplot2::aes_string(x = variable_x, y = "prediction")) +
       ggplot2::geom_line(linewidth = plot_options$line_size %||% 1,
@@ -661,7 +653,6 @@ MI_spline <- function(data,
     ggplot2::ylab(y_lab) +
     ggplot2::theme_minimal(base_size = 10)
 
-  # limits
   coord_args <- list()
   if (!is.null(plot_options$y_limits)) coord_args$ylim <- plot_options$y_limits
   if (!is.null(plot_options$x_limits)) coord_args$xlim <- plot_options$x_limits
@@ -685,13 +676,12 @@ MI_spline <- function(data,
         dat_g <- subset(Data_Subset, get(trial_col) == g)
         dat_g <- droplevels(dat_g)
 
-        # if too few observations, skip
         if (nrow(dat_g) < (knot_n + 2)) {
           warning(sprintf("Group '%s': too few observations, skipping in group_fits.", g))
           next
         }
 
-        # factor vars with <2 levels
+        # find 1-level factors (for formula, not for prediction template)
         one_level_factors <- vapply(
           dat_g,
           function(col) is.factor(col) && nlevels(col) < 2,
@@ -707,7 +697,7 @@ MI_spline <- function(data,
           })]
         }
 
-        # group-specific spline (same global knots)
+        # group-specific spline term with SAME global knots
         spline_term_g <- paste0(
           "rcs(", variable_x, ", c(",
           paste(round(global_knots, 4), collapse = ", "),
@@ -729,18 +719,18 @@ MI_spline <- function(data,
         } else {
           paste0(outcome_var, " ~ ", rhs_g)
         }
-        form_g <- as.formula(form_g_str)
+        form_g <- stats::as.formula(form_g_str)
 
-        # fit per-group model (no random effects)
+        # fit per-group model (no random effects here)
         mod_g <- tryCatch({
           if (model_type == "nb") {
             MASS::glm.nb(form_g, data = dat_g)
           } else if (model_type == "poisson") {
-            glm(form_g, family = poisson(link = "log"), data = dat_g)
+            stats::glm(form_g, family = stats::poisson(link = "log"), data = dat_g)
           } else if (model_type == "logistic") {
-            glm(form_g, family = binomial(link = "logit"), data = dat_g)
+            stats::glm(form_g, family = stats::binomial(link = "logit"), data = dat_g)
           } else if (model_type == "lm") {
-            glm(form_g, family = gaussian(), data = dat_g)
+            stats::glm(form_g, family = stats::gaussian(), data = dat_g)
           } else if (model_type == "cox") {
             survival::coxph(form_g, data = dat_g)
           }
@@ -752,34 +742,31 @@ MI_spline <- function(data,
 
         if (is.null(mod_g)) next
 
-        # x-range for this group
+        # group-specific x-range
         x_g <- seq(
           min(dat_g[[variable_x]], na.rm = TRUE),
           max(dat_g[[variable_x]], na.rm = TRUE),
           length.out = 80
         )
+
         new_g <- data.frame(x_g)
         colnames(new_g)[1] <- variable_x
 
-        # covariates: medians/modes within this group
-        if (!is.null(covariates_group) && length(covariates_group) > 0) {
-          extract_variables_cov <- function(term) {
-            if (grepl("^rcs\\(", term) || grepl("^bs\\(", term) || grepl("^poly\\(", term)) {
-              inside <- sub("^[^\\(]+\\(([^,]+),.*$", "\\1", term)
-              return(trimws(inside))
-            } else term
-          }
-          cov_vars <- unique(unlist(strsplit(gsub(":", "*", covariates_group), "\\*")))
-          cov_vars <- trimws(cov_vars)
-          cov_vars <- sapply(cov_vars, extract_variables_cov)
-
-          for (cv in cov_vars) {
+        # add global covariate columns for prediction template (same columns across groups)
+        if (!is.null(global_covariate_vars)) {
+          for (cv in global_covariate_vars) {
             if (cv %in% names(dat_g)) {
               if (is.factor(dat_g[[cv]])) {
-                new_g[[cv]] <- as.factor(names(which.max(table(dat_g[[cv]]))))
+                if (nlevels(dat_g[[cv]]) >= 2) {
+                  new_g[[cv]] <- as.factor(names(which.max(table(dat_g[[cv]]))))
+                } else {
+                  new_g[[cv]] <- dat_g[[cv]][1]
+                }
               } else {
                 new_g[[cv]] <- stats::median(dat_g[[cv]], na.rm = TRUE)
               }
+            } else {
+              new_g[[cv]] <- NA_real_
             }
           }
         }
@@ -788,7 +775,7 @@ MI_spline <- function(data,
           new_g[[followup_col]] <- 365
         }
 
-        # predict with CI
+        # predictions with CI
         if (model_type == "cox") {
           lp <- predict(mod_g, newdata = new_g, type = "lp", se.fit = TRUE)
           fit <- lp$fit
@@ -820,14 +807,18 @@ MI_spline <- function(data,
       }
 
       if (length(all_g) > 0) {
-        group_fits_df <- do.call(rbind, all_g)
+        # Ensure identical column order/names before rbind
+        all_names <- unique(unlist(lapply(all_g, names)))
+        all_g_aligned <- lapply(all_g, function(df) {
+          missing_cols <- setdiff(all_names, names(df))
+          for (mc in missing_cols) df[[mc]] <- NA
+          df[, all_names]
+        })
+        group_fits_df <- do.call(rbind, all_g_aligned)
         rownames(group_fits_df) <- NULL
       }
     }
   }
-
-  # Helper %||%
-  `%||%` <- function(x, y) if (!is.null(x)) x else y
 
   # ---- Return ----
   list(
@@ -839,12 +830,12 @@ MI_spline <- function(data,
       stats::quantile(Data_Subset[[variable_x]], prediction_range[1], na.rm = TRUE),
       stats::quantile(Data_Subset[[variable_x]], prediction_range[2], na.rm = TRUE)
     ),
-    derivatives      = derivative_data,
+    derivatives       = derivative_data,
     derivative_method = derivative_method,
-    threshold        = if (!calculate_derivatives) NULL else {
+    threshold         = if (!calculate_derivatives) NULL else {
       if (!is.null(subgroups)) threshold_values else threshold
     },
-    derivative_plot = NULL,  # can be added later if you want a dedicated derivative plot
+    derivative_plot = NULL,
     group_fits      = group_fits_df
   )
 }
