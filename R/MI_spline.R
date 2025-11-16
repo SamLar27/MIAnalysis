@@ -61,7 +61,7 @@ MI_spline <- function(data,
                       subgroups = NULL,
                       covariables = NULL,
 
-                      ## NEW spline arguments
+                      # --- NEW spline arguments ---
                       spline_knots_n          = 4,
                       spline_knots_percentile = NULL,
 
@@ -276,7 +276,6 @@ MI_spline <- function(data,
     formula_str <- paste0(outcome_var, " ~ ", rhs)
   }
 
-  ## random effects only added for mixed models (nb/poisson/logistic/lm, Cox via coxme)
   mixed_formula_str <- formula_str
   if (random_intercept == "Yes" || random_slope == "Yes") {
     if (model_type != "cox") {
@@ -309,21 +308,19 @@ MI_spline <- function(data,
       }
     } else {
       ## mixed models
-      if (model_type %in% c("nb", "poisson", "logistic", "lm")) {
-        requireNamespace("lme4", quietly = TRUE)
-        if (model_type == "nb") {
-          ## approximate: Poisson glmer if glmmTMB not used here
-          lme4::glmer(mixed_formula_obj, family = poisson(link = "log"),
-                      data = dat)
-        } else if (model_type == "poisson") {
-          lme4::glmer(mixed_formula_obj, family = poisson(link = "log"),
-                      data = dat)
-        } else if (model_type == "logistic") {
-          lme4::glmer(mixed_formula_obj, family = binomial(link = "logit"),
-                      data = dat)
-        } else if (model_type == "lm") {
-          lme4::lmer(mixed_formula_obj, data = dat)
-        }
+      requireNamespace("lme4", quietly = TRUE)
+      if (model_type == "nb") {
+        # approximation: Poisson glmer if no glmmTMB here
+        lme4::glmer(mixed_formula_obj, family = poisson(link = "log"),
+                    data = dat)
+      } else if (model_type == "poisson") {
+        lme4::glmer(mixed_formula_obj, family = poisson(link = "log"),
+                    data = dat)
+      } else if (model_type == "logistic") {
+        lme4::glmer(mixed_formula_obj, family = binomial(link = "logit"),
+                    data = dat)
+      } else if (model_type == "lm") {
+        lme4::lmer(mixed_formula_obj, data = dat)
       } else if (model_type == "cox") {
         requireNamespace("coxme", quietly = TRUE)
         coxme::coxme(mixed_formula_obj, data = dat)
@@ -331,17 +328,14 @@ MI_spline <- function(data,
     }
   }
 
-  ## --- main fit across imputations ---
-  population_model <- NULL
-  pooled_preds     <- NULL
-
-  ## build prediction frame template (used later)
+  ## prediction grid x sequence
   x_seq <- seq(
     from = stats::quantile(x_all, prediction_range[1], na.rm = TRUE),
     to   = stats::quantile(x_all, prediction_range[2], na.rm = TRUE),
     length.out = 100
   )
 
+  ## build prediction frame template (for population model)
   build_pred_frame <- function(base_data, x_vals) {
     if (is.null(subgroups)) {
       pd <- data.frame(x_vals)
@@ -399,7 +393,7 @@ MI_spline <- function(data,
     pd
   }
 
-  ## predict helper on link/responsescale + se
+  ## predict with SE on link scale
   predict_with_se <- function(mod, newdata) {
     if (inherits(mod, c("lmerMod", "glmerMod"))) {
       lp <- predict(mod, newdata = newdata, type = "link", se.fit = TRUE, re.form = NA)
@@ -439,23 +433,22 @@ MI_spline <- function(data,
     list(pred = pred, lower = lower, upper = upper)
   }
 
-  ## --- MI_method implementation ---
+  population_model <- NULL
+  pred_data        <- NULL
+
+  ## --- MI_method implementation for POPULATION model ---
   if (MI_method == "first") {
-    use_mixed <- (random_intercept == "Yes" | random_slope == "Yes")
+    use_mixed <- (random_intercept == "Yes" || random_slope == "Yes")
     population_model <- fit_single_model(Data_Subset, use_mixed = use_mixed)
     pred_data <- build_pred_frame(Data_Subset, x_seq)
 
     if (model_type == "cox") {
-      ## coxph/coxme: predict on lp, then exp
       if (inherits(population_model, "coxph")) {
         pr <- predict(population_model, newdata = pred_data, type = "lp", se.fit = TRUE)
         resp <- link_to_response(pr$fit, pr$se.fit, "cox")
       } else {
-        ## coxme: no se.fit, approximate (no CI)
         lp <- predict(population_model, newdata = pred_data, type = "lp")
-        resp <- list(pred = exp(lp),
-                     lower = NA_real_,
-                     upper = NA_real_)
+        resp <- list(pred = exp(lp), lower = NA_real_, upper = NA_real_)
       }
     } else {
       pr <- predict_with_se(population_model, pred_data)
@@ -471,31 +464,24 @@ MI_spline <- function(data,
     imps <- sort(unique(Data_Subset[[imp_col]]))
     pred_data <- build_pred_frame(Data_Subset, x_seq)
 
-    all_fits <- matrix(NA_real_, nrow = length(x_seq) *
-                         ifelse(is.null(subgroups), 1, length(unique(pred_data[[subgroups]]))),
-                       ncol = length(imps))
-    all_ses  <- all_fits
-
-    row_template <- NULL
+    n_rows <- nrow(pred_data)
+    all_fits <- matrix(NA_real_, nrow = n_rows, ncol = length(imps))
+    all_ses  <- matrix(NA_real_, nrow = n_rows, ncol = length(imps))
 
     for (j in seq_along(imps)) {
       imp <- imps[j]
       dat_imp <- subset(Data_Subset, get(imp_col) == imp)
-      use_mixed <- (random_intercept == "Yes" | random_slope == "Yes")
+      use_mixed <- (random_intercept == "Yes" || random_slope == "Yes")
       mod_imp <- fit_single_model(dat_imp, use_mixed = use_mixed)
       pd_imp  <- build_pred_frame(dat_imp, x_seq)
-      if (is.null(row_template)) {
-        row_template <- nrow(pd_imp)
-      }
-      pr_imp <- predict_with_se(mod_imp, pd_imp)
-      all_fits[1:nrow(pd_imp), j] <- pr_imp$fit
-      all_ses[1:nrow(pd_imp),  j] <- pr_imp$se.fit
+      pr_imp  <- predict_with_se(mod_imp, pd_imp)
+      all_fits[, j] <- pr_imp$fit
+      all_ses[,  j] <- pr_imp$se.fit
     }
 
     mean_fit <- rowMeans(all_fits, na.rm = TRUE)
-    m        <- length(imps)
-
     mean_var <- numeric(length(mean_fit))
+
     if (MI_method == "Rubin") {
       for (i in seq_along(mean_fit)) {
         fits_i <- all_fits[i, ]
@@ -510,7 +496,7 @@ MI_spline <- function(data,
           mean_var[i] <- W + (1 + 1/length(fits_i)) * B
         }
       }
-    } else { ## "average"
+    } else {  # "average"
       for (i in seq_along(mean_fit)) {
         ses_i <- all_ses[i, ]
         ses_i <- ses_i[is.finite(ses_i)]
@@ -547,7 +533,6 @@ MI_spline <- function(data,
     data_plus[[variable_x]]  <- deriv_data[[variable_x]] + eps
     data_minus[[variable_x]] <- deriv_data[[variable_x]] - eps
 
-    ## predictions on response scale
     pred_resp <- function(mod, newdata) {
       if (model_type == "cox") {
         lp <- predict(mod, newdata = newdata, type = "lp")
@@ -567,7 +552,7 @@ MI_spline <- function(data,
     f_minus <- pred_resp(population_model, data_minus)
 
     deriv <- (f_plus - f_minus) / (2 * eps)
-    se_approx <- abs(deriv) * 0.2  # crude approximation
+    se_approx <- abs(deriv) * 0.2
     lower_d <- deriv - 1.96 * se_approx
     upper_d <- deriv + 1.96 * se_approx
 
@@ -623,7 +608,7 @@ MI_spline <- function(data,
       stop("trial_col not found in data")
     }
 
-    ## helper: identify non-constant covariates in this group
+    # helper: identify non-constant covariates in this group
     non_constant_covs <- function(dat, vars) {
       keep <- logical(length(vars))
       for (i in seq_along(vars)) {
@@ -642,7 +627,7 @@ MI_spline <- function(data,
       vars[keep]
     }
 
-    ## base covariates (no interactions) for group fits
+    # base covariates (no interactions) for group fits
     base_cov_vars <- NULL
     if (!is.null(covariables)) {
       base_cov_vars <- unique(trimws(unlist(strsplit(gsub("\\*", ":", covariables), ":"))))
@@ -657,7 +642,6 @@ MI_spline <- function(data,
       dg <- droplevels(subset(Data_Subset, get(trial_col) == g))
       if (nrow(dg) < spline_knots_n) next
 
-      ## x-range for this group
       xg <- dg[[variable_x]]
       if (all(is.na(xg))) next
 
@@ -667,13 +651,12 @@ MI_spline <- function(data,
         length.out = 100
       )
 
-      ## covariates to use (non-constant in this group)
+      # select covariates that vary in this group
       group_covs <- character(0)
       if (!is.null(base_cov_vars)) {
         group_covs <- non_constant_covs(dg, base_cov_vars)
       }
 
-      ## build formula for this group: outcome ~ rcs(x, global_knots) + group_covs + offset
       knots_str_g  <- knots_str  # reuse global knots
       spline_term_g <- paste0("rcs(", variable_x, ", ", knots_str_g, ")")
 
@@ -687,23 +670,21 @@ MI_spline <- function(data,
 
       form_g <- stats::as.formula(paste0(outcome_var, " ~ ", rhs_g))
 
-      ## fit simple GLM/NB in this group
       mod_g <- switch(model_type,
                       "nb" = { requireNamespace("MASS", quietly = TRUE);
                         MASS::glm.nb(form_g, data = dg) },
-                      "poisson" = glm(form_g, family = poisson(link = "log"), data = dg),
+                      "poisson"  = glm(form_g, family = poisson(link = "log"), data = dg),
                       "logistic" = glm(form_g, family = binomial(link = "logit"), data = dg),
-                      "lm" = glm(form_g, family = gaussian(), data = dg),
+                      "lm"       = glm(form_g, family = gaussian(), data = dg),
                       "cox" = {
                         requireNamespace("survival", quietly = TRUE)
                         survival::coxph(form_g, data = dg)
                       })
 
-      ## prediction frame for this group
       pg <- data.frame(xg_seq)
       colnames(pg) <- variable_x
 
-      ## fill covariates with group medians/modes
+      # fill covariates with group medians/modes
       if (length(group_covs) > 0) {
         for (cv in group_covs) {
           if (cv %in% names(dg)) {
@@ -720,7 +701,7 @@ MI_spline <- function(data,
         pg[[followup_col]] <- 365
       }
 
-      ## predict with se
+      # predict with se for this group
       if (model_type == "cox") {
         prg <- predict(mod_g, newdata = pg, type = "lp", se.fit = TRUE)
         resp_g <- link_to_response(prg$fit, prg$se.fit, "cox")
@@ -732,16 +713,32 @@ MI_spline <- function(data,
       pg$prediction <- resp_g$pred
       pg$lower_ci   <- resp_g$lower
       pg$upper_ci   <- resp_g$upper
-      pg[[trial_col]] <- g
+
+      # store group label as *character* to avoid factor level headaches
+      pg[[trial_col]] <- as.character(g)
 
       group_list[[gi]] <- pg
     }
 
+    # remove NULLs
     group_list <- group_list[!vapply(group_list, is.null, logical(1))]
+
     if (length(group_list) > 0) {
+      # --- KEY FIX: align columns before rbind ---
+      all_names <- unique(unlist(lapply(group_list, names)))
+      group_list <- lapply(group_list, function(df) {
+        missing <- setdiff(all_names, names(df))
+        if (length(missing) > 0) {
+          for (m in missing) {
+            df[[m]] <- NA
+          }
+        }
+        df <- df[, all_names, drop = FALSE]
+        df
+      })
+
       group_fits_df <- do.call(rbind, group_list)
       rownames(group_fits_df) <- NULL
-      names(group_fits_df)[names(group_fits_df) == trial_col] <- trial_col
     }
   }
 
