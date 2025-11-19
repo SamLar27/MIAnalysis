@@ -27,14 +27,6 @@
 #'   - The spline coefficients in the output are renamed as:
 #'       `<var>_rcs_linear`, `<var>_rcs_nl1`, `<var>_rcs_nl2`, ...
 #'
-#' Additional fit statistics:
-#'   - For each imputed dataset, the function stores:
-#'       * logLik, df (necessary for D1 test)
-#'       * AIC, AICc, BIC, BICc
-#'       * RMSE, MAE
-#'       * pseudoR2 (where available)
-#'   - Simple pooled summaries (mean across imputations) are also stored.
-#'
 #' @param data Data frame with all imputations stacked.
 #' @param outcome_var Dependent variable (for non-Cox models).
 #' @param predictor_vars Character vector of predictors to be tested one by one.
@@ -51,24 +43,22 @@
 #' @param formula_string Optional custom formula (overrides automatic building).
 #' @param highlight_interactions Logical, add flags for interactions/splines/polynomials.
 #' @param spline_terms Character vector of variable names for rcs() / bs() terms.
-#'                      (Alternatively, a list of specs like list(list(var="x", knots=c(...))).)
 #' @param spline_knots_n Number of knots (if percentiles are not given).
 #' @param spline_knots_percentile Numeric vector of percentiles for knots (0–100).
-#' @param poly_terms Character vector of polynomial variable names.
-#' @param poly_degree Degree(s) for polynomial terms (2 or 3). Scalar or vector.
+#' @param poly_terms Character vector of variables with polynomial terms.
+#' @param poly_degree Scalar or vector (2 or 3) giving polynomial degree(s).
 #' @param include_poly_terms Logical, keep polynomial basis terms (default TRUE).
 #' @param random_intercept_var Grouping variable for random effects (NULL = no random effects).
 #' @param predictor_vars_random_slope Character vector of predictors with random slope.
 #' @param covariables_random_slope Character vector of covariables with random slope.
 #' @param stratified_intercept_var Variable defining stratified intercept (GLM) / baseline hazard (Cox).
 #'
-#' @return If one predictor: data.frame of results.
-#'         If multiple predictors: list of data.frames with class "MI_estimates_multi"
-#'         and an attribute "combined_results" containing the rows for each main predictor.
-#'         Each result has attributes:
-#'           - "fit_stats_per_imp": per-imputation fit statistics
-#'           - "fit_stats_pooled": simple pooled (mean) fit statistics
-#'           - "D1_components": data.frame(imp, logLik, df) for D1 test
+#' @return
+#'  If one predictor: a data.frame of pooled coefficients with attributes:
+#'    - $term, estimate, std.error, 2.5%, 97.5%, exp_estimate, exp_CI95_lower, exp_CI95_upper, p.value
+#'    - attributes: "fit_stats_per_imp", "fit_stats_pooled", "D1_components", etc.
+#'  If multiple predictors: list of such data.frames with class "MI_estimates_multi"
+#'    and attribute "combined_results".
 #' @export
 MI_estimates <- function(data,
                          outcome_var,
@@ -225,7 +215,6 @@ MI_estimates <- function(data,
     }
 
     if (is.null(poly_degree)) {
-      # default degree 2 if not specified
       poly_degree_vec <- rep(2L, length(poly_terms))
     } else {
       if (!is.numeric(poly_degree)) stop("poly_degree must be numeric (2 or 3).")
@@ -310,92 +299,6 @@ MI_estimates <- function(data,
   spline_formula_parts <- special_terms$spline_parts
   poly_formula_parts   <- special_terms$poly_parts
 
-  ## ---- Fit stats helper (for each imputed model) ----
-  compute_fit_stats <- function(model, outcome_var, model_type) {
-    out <- list(
-      logLik   = NA_real_,
-      df       = NA_real_,
-      AIC      = NA_real_,
-      AICc     = NA_real_,
-      BIC      = NA_real_,
-      BICc     = NA_real_,
-      RMSE     = NA_real_,
-      MAE      = NA_real_,
-      pseudoR2 = NA_real_
-    )
-
-    # logLik and df
-    ll <- tryCatch(stats::logLik(model), error = function(e) NULL)
-    if (!is.null(ll)) {
-      out$logLik <- as.numeric(ll)
-      out$df     <- attr(ll, "df")
-    }
-
-    # AIC / BIC
-    out$AIC <- tryCatch(stats::AIC(model), error = function(e) NA_real_)
-    out$BIC <- tryCatch(stats::BIC(model), error = function(e) NA_real_)
-
-    # AICc / BICc (small-sample corrected versions, using same correction form)
-    n <- tryCatch(stats::nobs(model), error = function(e) NA_integer_)
-    k <- out$df
-    if (!is.na(n) && !is.na(k) && n > (k + 1) && !is.na(out$AIC) && !is.na(out$BIC)) {
-      correction <- 2 * k * (k + 1) / (n - k - 1)
-      out$AICc <- out$AIC + correction
-      out$BICc <- out$BIC + correction
-    }
-
-    # RMSE / MAE / pseudoR2 – not meaningful for Cox, so skip
-    if (model_type != "cox") {
-      # predictions
-      y_hat <- tryCatch(stats::predict(model, type = "response"), error = function(e) NULL)
-      # observed
-      y_obs <- tryCatch({
-        mf <- stats::model.frame(model)
-        if (outcome_var %in% names(mf)) {
-          mf[[outcome_var]]
-        } else {
-          stats::model.response(mf)
-        }
-      }, error = function(e) NULL)
-
-      if (!is.null(y_hat) && !is.null(y_obs)) {
-        if (is.factor(y_obs)) {
-          # if binary, recode 0/1
-          if (nlevels(y_obs) == 2) {
-            y_obs <- as.numeric(y_obs) - 1
-          } else {
-            y_obs <- as.numeric(y_obs)
-          }
-        }
-        if (length(y_hat) == length(y_obs)) {
-          resid <- y_obs - y_hat
-          out$RMSE <- sqrt(mean(resid^2, na.rm = TRUE))
-          out$MAE  <- mean(abs(resid), na.rm = TRUE)
-        }
-      }
-
-      # pseudo-R²
-      if (inherits(model, "glm") || inherits(model, "negbin")) {
-        dev      <- tryCatch(model$deviance,       error = function(e) NA_real_)
-        null_dev <- tryCatch(model$null.deviance,  error = function(e) NA_real_)
-        if (!is.na(dev) && !is.na(null_dev) && null_dev != 0) {
-          out$pseudoR2 <- 1 - dev / null_dev
-        }
-      } else if (inherits(model, "lm")) {
-        out$pseudoR2 <- tryCatch(summary(model)$r.squared, error = function(e) NA_real_)
-      } else if (inherits(model, "glmmTMB") || inherits(model, "merMod")) {
-        if (requireNamespace("performance", quietly = TRUE)) {
-          out$pseudoR2 <- tryCatch({
-            r2 <- performance::r2_nakagawa(model)
-            as.numeric(r2$R2m)
-          }, error = function(e) NA_real_)
-        }
-      }
-    }
-
-    as.data.frame(out)
-  }
-
   ## ---- Random-effects core builder ----
   build_random_term_core <- function(rs_vars) {
     if (!use_random_effects) return("")
@@ -440,6 +343,105 @@ MI_estimates <- function(data,
     build_random_term_core(rs_vars)
   }
 
+  ## ---- Fit stats helper (for each imputed model) ----
+  compute_fit_stats <- function(model, outcome_var, model_type) {
+
+    # If model is NULL or not a fitted object, return a 1-row NA table
+    if (is.null(model)) {
+      return(data.frame(
+        logLik   = NA_real_,
+        df       = NA_real_,
+        AIC      = NA_real_,
+        AICc     = NA_real_,
+        BIC      = NA_real_,
+        BICc     = NA_real_,
+        RMSE     = NA_real_,
+        MAE      = NA_real_,
+        pseudoR2 = NA_real_
+      ))
+    }
+
+    out <- list(
+      logLik   = NA_real_,
+      df       = NA_real_,
+      AIC      = NA_real_,
+      AICc     = NA_real_,
+      BIC      = NA_real_,
+      BICc     = NA_real_,
+      RMSE     = NA_real_,
+      MAE      = NA_real_,
+      pseudoR2 = NA_real_
+    )
+
+    # logLik and df
+    ll <- tryCatch(stats::logLik(model), error = function(e) NULL)
+    if (!is.null(ll)) {
+      out$logLik <- as.numeric(ll)
+      out$df     <- attr(ll, "df")
+    }
+
+    # AIC / BIC
+    out$AIC <- tryCatch(stats::AIC(model), error = function(e) NA_real_)
+    out$BIC <- tryCatch(stats::BIC(model), error = function(e) NA_real_)
+
+    # AICc / BICc
+    n <- tryCatch(stats::nobs(model), error = function(e) NA_integer_)
+    k <- out$df
+    if (!is.na(n) && !is.na(k) && n > (k + 1) && !is.na(out$AIC) && !is.na(out$BIC)) {
+      correction <- 2 * k * (k + 1) / (n - k - 1)
+      out$AICc <- out$AIC + correction
+      out$BICc <- out$BIC + correction
+    }
+
+    # RMSE / MAE / pseudoR2 – not meaningful for Cox, so skip
+    if (model_type != "cox") {
+      y_hat <- tryCatch(stats::predict(model, type = "response"), error = function(e) NULL)
+      y_obs <- tryCatch({
+        mf <- stats::model.frame(model)
+        if (outcome_var %in% names(mf)) {
+          mf[[outcome_var]]
+        } else {
+          stats::model.response(mf)
+        }
+      }, error = function(e) NULL)
+
+      if (!is.null(y_hat) && !is.null(y_obs)) {
+        if (is.factor(y_obs)) {
+          if (nlevels(y_obs) == 2) {
+            y_obs <- as.numeric(y_obs) - 1
+          } else {
+            y_obs <- as.numeric(y_obs)
+          }
+        }
+        if (length(y_hat) == length(y_obs)) {
+          resid <- y_obs - y_hat
+          out$RMSE <- sqrt(mean(resid^2, na.rm = TRUE))
+          out$MAE  <- mean(abs(resid), na.rm = TRUE)
+        }
+      }
+
+      # pseudo-R²
+      if (inherits(model, "glm") || inherits(model, "negbin")) {
+        dev      <- tryCatch(model$deviance,      error = function(e) NA_real_)
+        null_dev <- tryCatch(model$null.deviance, error = function(e) NA_real_)
+        if (!is.na(dev) && !is.na(null_dev) && null_dev != 0) {
+          out$pseudoR2 <- 1 - dev / null_dev
+        }
+      } else if (inherits(model, "lm")) {
+        out$pseudoR2 <- tryCatch(summary(model)$r.squared, error = function(e) NA_real_)
+      } else if (inherits(model, "glmmTMB") || inherits(model, "merMod")) {
+        if (requireNamespace("performance", quietly = TRUE)) {
+          out$pseudoR2 <- tryCatch({
+            r2 <- performance::r2_nakagawa(model)
+            as.numeric(r2$R2m)
+          }, error = function(e) NA_real_)
+        }
+      }
+    }
+
+    as.data.frame(out)
+  }
+
   ## ---- Formula builder ----
   build_formula_for_predictor <- function(current_predictor) {
     trial_term  <- if (trial_factor == "Yes") paste("+ as.factor(", trial_col, ")", sep = "") else ""
@@ -475,20 +477,15 @@ MI_estimates <- function(data,
         current_spline_parts <- spline_formula_parts
         current_poly_parts   <- poly_formula_parts
 
-        # remove the current predictor's spline/poly from the "other" parts
-        # and use it as its own main term instead of the raw variable
         if (!is.null(spline_terms) && current_predictor %in% spline_terms) {
-          # use rcs/bs for this predictor
           main_pred_term <- spline_map[[current_predictor]]
           current_spline_parts <- setdiff(current_spline_parts, main_pred_term)
           expanded_predictor <- main_pred_term
         } else if (!is.null(poly_terms) && current_predictor %in% poly_terms) {
-          # use poly() for this predictor
           main_pred_term <- poly_map[[current_predictor]]
           current_poly_parts <- setdiff(current_poly_parts, main_pred_term)
           expanded_predictor <- main_pred_term
         } else {
-          # standard linear predictor
           expanded_predictor <- expand_terms(current_predictor)
         }
 
@@ -562,6 +559,7 @@ MI_estimates <- function(data,
 
   ## ---- Fit one predictor ----
   fit_model_for_predictor <- function(current_predictor) {
+
     formula_string_current <- build_formula_for_predictor(current_predictor)
     model_formula <- as.formula(formula_string_current)
 
@@ -588,47 +586,58 @@ MI_estimates <- function(data,
 
     is_null_model <- (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor))
 
-    current_models_list <- NULL   # will store models per imputation
+    current_models_list <- NULL
+    fit_stats_per_imp   <- NULL
+    fit_stats_pooled    <- NULL
+    D1_components       <- NULL
 
     if (use_random_effects) {
+
       models_list <- vector("list", imp_n)
       for (i in seq_along(actual_imps)) {
         data_i <- implist[[i]]
-        if (model_type == "lm") {
-          models_list[[i]] <- lme4::lmer(model_formula, data = data_i)
-        } else if (model_type %in% c("bin")) {
-          models_list[[i]] <- lme4::glmer(model_formula, family = binomial(), data = data_i)
-        } else if (model_type %in% c("poisson", "quasipoisson")) {
-          models_list[[i]] <- lme4::glmer(model_formula, family = poisson(), data = data_i)
-        } else if (model_type == "nb") {
-          if (requireNamespace("glmmTMB", quietly = TRUE)) {
-            models_list[[i]] <- glmmTMB::glmmTMB(model_formula, family = nbinom2, data = data_i)
-          } else {
-            warning("Using Poisson instead of Negative Binomial. Install glmmTMB for proper NB mixed models.")
-            models_list[[i]] <- lme4::glmer(model_formula, family = poisson(), data = data_i)
-          }
-        } else if (model_type == "cox") {
-          models_list[[i]] <- coxme::coxme(model_formula, data = data_i)
-        } else if (model_type == "gamma") {
-          if (requireNamespace("glmmTMB", quietly = TRUE)) {
-            models_list[[i]] <- glmmTMB::glmmTMB(model_formula, family = Gamma, data = data_i)
-          } else {
-            warning("Gamma family with random effects may not be stable in lme4.")
-            models_list[[i]] <- lme4::glmer(model_formula, family = Gamma, data = data_i)
-          }
-        } else stop("Unsupported model type for random effects.")
+        models_list[[i]] <- tryCatch({
+          if (model_type == "lm") {
+            lme4::lmer(model_formula, data = data_i)
+          } else if (model_type %in% c("bin")) {
+            lme4::glmer(model_formula, family = binomial(), data = data_i)
+          } else if (model_type %in% c("poisson", "quasipoisson")) {
+            lme4::glmer(model_formula, family = poisson(), data = data_i)
+          } else if (model_type == "nb") {
+            if (requireNamespace("glmmTMB", quietly = TRUE)) {
+              glmmTMB::glmmTMB(model_formula, family = nbinom2, data = data_i)
+            } else {
+              warning("Using Poisson instead of Negative Binomial. Install glmmTMB for proper NB mixed models.")
+              lme4::glmer(model_formula, family = poisson(), data = data_i)
+            }
+          } else if (model_type == "cox") {
+            coxme::coxme(model_formula, data = data_i)
+          } else if (model_type == "gamma") {
+            if (requireNamespace("glmmTMB", quietly = TRUE)) {
+              glmmTMB::glmmTMB(model_formula, family = Gamma, data = data_i)
+            } else {
+              warning("Gamma family with random effects may not be stable in lme4.")
+              lme4::glmer(model_formula, family = Gamma, data = data_i)
+            }
+          } else stop("Unsupported model type for random effects.")
+        }, error = function(e) {
+          warning(sprintf("Model failed to fit for imputation %s: %s", actual_imps[i], e$message))
+          NULL
+        })
       }
 
       current_models_list <- models_list
 
+      # --- Pooled coefficients via Rubin ---
       coefs <- lapply(models_list, function(m) {
+        if (is.null(m)) return(NULL)
         if (model_type == "cox") {
           c_est <- fixef(m)
           c_se  <- sqrt(diag(vcov(m)))
         } else if (inherits(m, "glmmTMB")) {
           c_est <- fixef(m)$cond
-          v <- vcov(m)$cond
-          c_se <- sqrt(diag(v))
+          v     <- vcov(m)$cond
+          c_se  <- sqrt(diag(v))
         } else {
           c_est <- fixef(m)
           if (inherits(m, "lmerMod")) {
@@ -645,6 +654,7 @@ MI_estimates <- function(data,
         data.frame(term = names(c_est), estimate = c_est, std.error = c_se, stringsAsFactors = FALSE)
       })
 
+      coefs <- Filter(function(x) !is.null(x), coefs)
       all_terms <- unique(unlist(lapply(coefs, function(df) df$term)))
       pooled_results <- data.frame(term = all_terms, estimate = NA_real_, std.error = NA_real_, stringsAsFactors = FALSE)
 
@@ -670,25 +680,69 @@ MI_estimates <- function(data,
         )
 
     } else {
+      # ---- Non-random effects: classical glm/glm.nb, pooled with mice::pool ----
       res_comb <- vector("list", length(actual_imps))
       for (i in seq_along(actual_imps)) {
         data_subset <- implist[[i]]
-        model <- switch(model_type,
-                        "nb" = MASS::glm.nb(model_formula, data = data_subset),
-                        "lm" = glm(model_formula, family = gaussian(), data = data_subset),
-                        "bin" = glm(model_formula, family = binomial(), data = data_subset),
-                        "poisson" = glm(model_formula, family = poisson(), data = data_subset),
-                        "gamma" = glm(model_formula, family = Gamma(), data = data_subset),
-                        "quasipoisson" = glm(model_formula, family = quasipoisson(), data = data_subset),
-                        "quasibinomial" = glm(model_formula, family = quasibinomial(), data = data_subset),
-                        "cox" = coxph(model_formula, data = data_subset),
-                        stop("Unsupported model type."))
-        res_comb[[i]] <- model
+        res_comb[[i]] <- tryCatch({
+          switch(model_type,
+                 "nb"            = MASS::glm.nb(model_formula, data = data_subset),
+                 "lm"            = glm(model_formula, family = gaussian(), data = data_subset),
+                 "bin"           = glm(model_formula, family = binomial(), data = data_subset),
+                 "poisson"       = glm(model_formula, family = poisson(), data = data_subset),
+                 "gamma"         = glm(model_formula, family = Gamma(), data = data_subset),
+                 "quasipoisson"  = glm(model_formula, family = quasipoisson(), data = data_subset),
+                 "quasibinomial" = glm(model_formula, family = quasibinomial(), data = data_subset),
+                 "cox"           = coxph(model_formula, data = data_subset),
+                 stop("Unsupported model type.")
+          )
+        }, error = function(e) {
+          warning(sprintf("Model failed to fit for imputation %s: %s", actual_imps[i], e$message))
+          NULL
+        })
       }
+
       current_models_list <- res_comb
 
-      pooled <- mice::pool(res_comb)
+      ok_models <- Filter(function(x) !is.null(x), res_comb)
+      if (length(ok_models) == 0) {
+        stop("All models failed to fit in MI_estimates.")
+      }
+
+      pooled <- mice::pool(ok_models)
       Results_multivariate_analysis <- summary(pooled, conf.int = TRUE, exp = FALSE)
+    }
+
+    # --- Fit stats & D1 components from current_models_list ---
+    if (!is.null(current_models_list) && length(current_models_list) > 0) {
+
+      fit_list <- lapply(current_models_list,
+                         compute_fit_stats,
+                         outcome_var = outcome_var,
+                         model_type  = model_type)
+
+      fit_list <- Filter(function(x) {
+        !is.null(x) && is.data.frame(x) && nrow(x) > 0
+      }, fit_list)
+
+      if (length(fit_list) > 0) {
+        fit_stats_per_imp <- dplyr::bind_rows(fit_list, .id = "imp")
+        fit_stats_per_imp$imp <- actual_imps[as.integer(fit_stats_per_imp$imp)]
+
+        pooled_vals <- lapply(
+          fit_stats_per_imp[, setdiff(names(fit_stats_per_imp), "imp"), drop = FALSE],
+          function(x) mean(x, na.rm = TRUE)
+        )
+        fit_stats_pooled <- data.frame(imp = "pooled", pooled_vals, check.names = FALSE)
+
+        if (all(c("logLik", "df") %in% names(fit_stats_per_imp))) {
+          D1_components <- fit_stats_per_imp[, c("imp", "logLik", "df")]
+        }
+      } else {
+        fit_stats_per_imp <- NULL
+        fit_stats_pooled  <- NULL
+        D1_components     <- NULL
+      }
     }
 
     # exponentiation
@@ -767,29 +821,6 @@ MI_estimates <- function(data,
       Results_multivariate_analysis <- rbind(null_row, Results_multivariate_analysis)
     }
 
-    # ---- Fit statistics per imputation & pooled (for D1 etc.) ----
-    fit_stats_per_imp  <- NULL
-    fit_stats_pooled   <- NULL
-    D1_components      <- NULL
-
-    if (!is.null(current_models_list) && length(current_models_list) > 0) {
-      fit_list <- lapply(current_models_list, compute_fit_stats,
-                         outcome_var = outcome_var, model_type = model_type)
-      fit_stats_per_imp <- dplyr::bind_rows(fit_list, .id = "imp")
-      # map .id to actual imputation labels
-      fit_stats_per_imp$imp <- actual_imps[as.integer(fit_stats_per_imp$imp)]
-
-      # simple pooled stats: mean across imputations (per column)
-      pooled_vals <- lapply(fit_stats_per_imp[ , setdiff(names(fit_stats_per_imp), "imp"), drop = FALSE],
-                            function(x) mean(x, na.rm = TRUE))
-      fit_stats_pooled <- data.frame(imp = "pooled", pooled_vals, check.names = FALSE)
-
-      # components for D1 test (logLik + df per imputation)
-      if (all(c("logLik", "df") %in% names(fit_stats_per_imp))) {
-        D1_components <- fit_stats_per_imp[, c("imp", "logLik", "df")]
-      }
-    }
-
     # flags
     if (highlight_interactions && length(interaction_terms) > 0) {
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
@@ -808,27 +839,22 @@ MI_estimates <- function(data,
     Results_multivariate_analysis$is_polynomial <- grepl("poly\\(", Results_multivariate_analysis$term)
 
     # attributes
-    attr(Results_multivariate_analysis, "has_random_effects")       <- use_random_effects
-    attr(Results_multivariate_analysis, "random_intercept_var")     <- random_intercept_var
-    attr(Results_multivariate_analysis, "predictor_tested")         <- current_predictor
-    attr(Results_multivariate_analysis, "model_type_used")          <- model_type
-    attr(Results_multivariate_analysis, "formula")                  <- formula_string_current
-    attr(Results_multivariate_analysis, "has_interactions")         <- length(interaction_terms) > 0
-    attr(Results_multivariate_analysis, "interaction_terms")        <- if (length(interaction_terms) > 0) interaction_terms else NULL
-    attr(Results_multivariate_analysis, "has_splines")              <- length(spline_terms_detected) > 0
-    attr(Results_multivariate_analysis, "spline_terms")             <- if (length(spline_terms_detected) > 0) spline_terms_detected else NULL
-    attr(Results_multivariate_analysis, "has_polynomials")          <- length(poly_terms_detected) > 0
-    attr(Results_multivariate_analysis, "polynomial_terms")         <- if (length(poly_terms_detected) > 0) poly_terms_detected else NULL
-    attr(Results_multivariate_analysis, "imputations")              <- actual_imps
-    attr(Results_multivariate_analysis, "n_imp")                    <- length(actual_imps)
-    attr(Results_multivariate_analysis, "stratified_intercept_var") <- stratified_intercept_var
+    attr(Results_multivariate_analysis, "has_random_effects")      <- use_random_effects
+    attr(Results_multivariate_analysis, "random_intercept_var")    <- random_intercept_var
+    attr(Results_multivariate_analysis, "predictor_tested")        <- current_predictor
+    attr(Results_multivariate_analysis, "model_type_used")         <- model_type
+    attr(Results_multivariate_analysis, "formula")                 <- formula_string_current
+    attr(Results_multivariate_analysis, "has_interactions")        <- length(interaction_terms) > 0
+    attr(Results_multivariate_analysis, "interaction_terms")       <- if (length(interaction_terms) > 0) interaction_terms else NULL
+    attr(Results_multivariate_analysis, "has_splines")             <- length(spline_terms_detected) > 0
+    attr(Results_multivariate_analysis, "spline_terms")            <- if (length(spline_terms_detected) > 0) spline_terms_detected else NULL
+    attr(Results_multivariate_analysis, "has_polynomials")         <- length(poly_terms_detected) > 0
+    attr(Results_multivariate_analysis, "polynomial_terms")        <- if (length(poly_terms_detected) > 0) poly_terms_detected else NULL
+    attr(Results_multivariate_analysis, "imputations")             <- actual_imps
+    attr(Results_multivariate_analysis, "n_imp")                   <- length(actual_imps)
+    attr(Results_multivariate_analysis, "stratified_intercept_var")<- stratified_intercept_var
 
-    # fit statistics attributes (for D1 and global fit)
-    attr(Results_multivariate_analysis, "fit_stats_per_imp") <- fit_stats_per_imp
-    attr(Results_multivariate_analysis, "fit_stats_pooled")  <- fit_stats_pooled
-    attr(Results_multivariate_analysis, "D1_components")     <- D1_components
-
-    # variance components / ICC for mixed models
+    # variance components / ICC
     if (use_random_effects && !is.null(current_models_list) && length(current_models_list) > 0) {
       model1 <- current_models_list[[1]]
       if (inherits(model1, "glmmTMB")) {
@@ -850,6 +876,11 @@ MI_estimates <- function(data,
         }
       }
     }
+
+    # attach fit stats / D1 components
+    attr(Results_multivariate_analysis, "fit_stats_per_imp") <- fit_stats_per_imp
+    attr(Results_multivariate_analysis, "fit_stats_pooled")  <- fit_stats_pooled
+    attr(Results_multivariate_analysis, "D1_components")     <- D1_components
 
     Results_multivariate_analysis
   }
