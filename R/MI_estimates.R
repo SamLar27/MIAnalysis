@@ -280,7 +280,6 @@ MI_estimates <- function(data,
     } else term
   }
 
-  ## Build vectors of special terms (strings used in formulas)
   process_special_terms <- function() {
     spline_formula_parts <- character(0)
     if (length(spline_map) > 0) {
@@ -308,7 +307,6 @@ MI_estimates <- function(data,
 
     if (length(rs_vars) == 0) {
       if (same_group_as_strata) {
-        # pure stratified intercept, no random effects
         return("")
       } else {
         return(paste0("+ (1 | ", random_intercept_var, ")"))
@@ -316,10 +314,8 @@ MI_estimates <- function(data,
     } else {
       rs_str <- paste(rs_vars, collapse = " + ")
       if (same_group_as_strata) {
-        # stratified intercept + random slopes only
         return(paste0("+ (0 + ", rs_str, " | ", random_intercept_var, ")"))
       } else {
-        # random intercept + random slopes
         return(paste0("+ (1 + ", rs_str, " | ", random_intercept_var, ")"))
       }
     }
@@ -346,21 +342,7 @@ MI_estimates <- function(data,
   ## ---- Fit stats helper (for each imputed model) ----
   compute_fit_stats <- function(model, outcome_var, model_type) {
 
-    # If model is NULL or not a fitted object, return a 1-row NA table
-    if (is.null(model)) {
-      return(data.frame(
-        logLik   = NA_real_,
-        df       = NA_real_,
-        AIC      = NA_real_,
-        AICc     = NA_real_,
-        BIC      = NA_real_,
-        BICc     = NA_real_,
-        RMSE     = NA_real_,
-        MAE      = NA_real_,
-        pseudoR2 = NA_real_
-      ))
-    }
-
+    # Always return 1-row data.frame with fixed columns
     out <- list(
       logLik   = NA_real_,
       df       = NA_real_,
@@ -373,11 +355,15 @@ MI_estimates <- function(data,
       pseudoR2 = NA_real_
     )
 
-    # logLik and df
+    if (is.null(model)) {
+      return(as.data.frame(out))
+    }
+
+    # logLik / df
     ll <- tryCatch(stats::logLik(model), error = function(e) NULL)
     if (!is.null(ll)) {
       out$logLik <- as.numeric(ll)
-      out$df     <- attr(ll, "df")
+      out$df     <- as.numeric(attr(ll, "df"))
     }
 
     # AIC / BIC
@@ -385,7 +371,7 @@ MI_estimates <- function(data,
     out$BIC <- tryCatch(stats::BIC(model), error = function(e) NA_real_)
 
     # AICc / BICc
-    n <- tryCatch(stats::nobs(model), error = function(e) NA_integer_)
+    n <- tryCatch(as.numeric(stats::nobs(model)), error = function(e) NA_real_)
     k <- out$df
     if (!is.na(n) && !is.na(k) && n > (k + 1) && !is.na(out$AIC) && !is.na(out$BIC)) {
       correction <- 2 * k * (k + 1) / (n - k - 1)
@@ -393,7 +379,7 @@ MI_estimates <- function(data,
       out$BICc <- out$BIC + correction
     }
 
-    # RMSE / MAE / pseudoR2 – not meaningful for Cox, so skip
+    # RMSE / MAE / pseudoR2 – skip for Cox
     if (model_type != "cox") {
       y_hat <- tryCatch(stats::predict(model, type = "response"), error = function(e) NULL)
       y_obs <- tryCatch({
@@ -413,7 +399,7 @@ MI_estimates <- function(data,
             y_obs <- as.numeric(y_obs)
           }
         }
-        if (length(y_hat) == length(y_obs)) {
+        if (length(y_hat) == length(y_obs) && length(y_hat) > 0) {
           resid <- y_obs - y_hat
           out$RMSE <- sqrt(mean(resid^2, na.rm = TRUE))
           out$MAE  <- mean(abs(resid), na.rm = TRUE)
@@ -434,7 +420,10 @@ MI_estimates <- function(data,
           out$pseudoR2 <- tryCatch({
             r2 <- performance::r2_nakagawa(model)
             as.numeric(r2$R2m)
-          }, error = function(e) NA_real_)
+          }, error = function(e) {
+            warning("Random effect variances not available. Returned R2 does not account for random effects.")
+            NA_real_
+          })
         }
       }
     }
@@ -454,7 +443,6 @@ MI_estimates <- function(data,
       if (model_type == "cox") {
         strat_cox_piece <- paste("+ strata(", stratified_intercept_var, ")", sep = "")
       } else {
-        # GLM: keep intercept + add as.factor(strata)
         strat_glm_piece <- paste(" + as.factor(", stratified_intercept_var, ")", sep = "")
       }
     }
@@ -469,9 +457,8 @@ MI_estimates <- function(data,
 
       covariables_in_model <- covariables
 
-      # Special handling for current predictor if spline/poly is requested
       if (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor)) {
-        # Null model: only covariables and special terms that are NOT tied to a specific predictor
+        # Null model
         all_terms <- c(expanded_covariables, spline_formula_parts, poly_formula_parts)
       } else {
         current_spline_parts <- spline_formula_parts
@@ -508,7 +495,7 @@ MI_estimates <- function(data,
       }
 
     } else {
-      # Custom formula: add trial/offset/strata/random if missing
+      # Custom formula
       formula_str <- formula_string
 
       all_rs_vars <- unique(c(
@@ -628,7 +615,6 @@ MI_estimates <- function(data,
 
       current_models_list <- models_list
 
-      # --- Pooled coefficients via Rubin ---
       coefs <- lapply(models_list, function(m) {
         if (is.null(m)) return(NULL)
         if (model_type == "cox") {
@@ -680,7 +666,7 @@ MI_estimates <- function(data,
         )
 
     } else {
-      # ---- Non-random effects: classical glm/glm.nb, pooled with mice::pool ----
+      # ---- Non-random effects ----
       res_comb <- vector("list", length(actual_imps))
       for (i in seq_along(actual_imps)) {
         data_subset <- implist[[i]]
@@ -713,35 +699,45 @@ MI_estimates <- function(data,
       Results_multivariate_analysis <- summary(pooled, conf.int = TRUE, exp = FALSE)
     }
 
-    # --- Fit stats & D1 components from current_models_list ---
+    ## ---- Fit stats & D1 components ----
     if (!is.null(current_models_list) && length(current_models_list) > 0) {
 
-      fit_list <- lapply(current_models_list,
-                         compute_fit_stats,
-                         outcome_var = outcome_var,
-                         model_type  = model_type)
+      fit_list <- lapply(current_models_list, function(m) {
+        tryCatch(
+          compute_fit_stats(m, outcome_var = outcome_var, model_type = model_type),
+          error = function(e) {
+            warning(sprintf("Fit stats failed for one imputation: %s", e$message))
+            NULL
+          }
+        )
+      })
 
       fit_list <- Filter(function(x) {
-        !is.null(x) && is.data.frame(x) && nrow(x) > 0
+        !is.null(x) && is.data.frame(x) && nrow(x) == 1
       }, fit_list)
 
       if (length(fit_list) > 0) {
-        fit_stats_per_imp <- dplyr::bind_rows(fit_list, .id = "imp")
-        fit_stats_per_imp$imp <- actual_imps[as.integer(fit_stats_per_imp$imp)]
-
-        pooled_vals <- lapply(
-          fit_stats_per_imp[, setdiff(names(fit_stats_per_imp), "imp"), drop = FALSE],
-          function(x) mean(x, na.rm = TRUE)
+        fit_stats_per_imp <- tryCatch(
+          dplyr::bind_rows(fit_list, .id = "imp"),
+          error = function(e) {
+            warning(sprintf("bind_rows for fit_stats_per_imp failed: %s", e$message))
+            NULL
+          }
         )
-        fit_stats_pooled <- data.frame(imp = "pooled", pooled_vals, check.names = FALSE)
 
-        if (all(c("logLik", "df") %in% names(fit_stats_per_imp))) {
-          D1_components <- fit_stats_per_imp[, c("imp", "logLik", "df")]
+        if (!is.null(fit_stats_per_imp)) {
+          fit_stats_per_imp$imp <- actual_imps[as.integer(fit_stats_per_imp$imp)]
+
+          pooled_vals <- lapply(
+            fit_stats_per_imp[, setdiff(names(fit_stats_per_imp), "imp"), drop = FALSE],
+            function(x) mean(x, na.rm = TRUE)
+          )
+          fit_stats_pooled <- data.frame(imp = "pooled", pooled_vals, check.names = FALSE)
+
+          if (all(c("logLik", "df") %in% names(fit_stats_per_imp))) {
+            D1_components <- fit_stats_per_imp[, c("imp", "logLik", "df")]
+          }
         }
-      } else {
-        fit_stats_per_imp <- NULL
-        fit_stats_pooled  <- NULL
-        D1_components     <- NULL
       }
     }
 
@@ -753,14 +749,14 @@ MI_estimates <- function(data,
       dplyr::select(term, estimate, std.error, `2.5 %`, `97.5 %`,
                     exp_estimate, exp_CI95_lower, exp_CI95_upper, p.value)
 
-    # Normalize poly() term name a bit
+    # Normalize poly() name
     Results_multivariate_analysis$term <- gsub(
       "poly\\(([^,]+), degree = ([0-9]+), raw = TRUE\\)",
       "poly(\\1, \\2, raw = TRUE)",
       Results_multivariate_analysis$term
     )
 
-    # Filter trial and nuisance terms
+    # Filter trial / nuisance terms
     if (!is.null(trial_col)) {
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         filter(!grepl(trial_col, term))
@@ -774,7 +770,7 @@ MI_estimates <- function(data,
         filter(!grepl(paste0("^as\\.factor\\(", stratified_intercept_var, "\\)"), term))
     }
 
-    # --- Rename spline terms nicely ( *_rcs_linear / *_rcs_nl1 / *_rcs_nl2 ) ---
+    # Rename spline terms: *_rcs_linear / *_rcs_nl1 / *_rcs_nl2
     if (!is.null(spline_terms) && length(spline_terms) > 0) {
       for (v in spline_terms) {
         pattern_base <- paste0("rcs\\(", v, "[^)]*\\)")
@@ -795,7 +791,7 @@ MI_estimates <- function(data,
       }
     }
 
-    # --- Remove polynomial terms if requested (include_poly_terms = FALSE) ---
+    # Drop polynomial basis terms if requested
     if (length(poly_terms_detected) > 0 && !include_poly_terms) {
       poly_patterns <- sapply(poly_terms_detected, function(x) {
         if (grepl("poly\\(", x)) {
@@ -810,7 +806,7 @@ MI_estimates <- function(data,
       }
     }
 
-    # null model row
+    # Null model row
     if (is_null_model) {
       null_row <- data.frame(
         term = "No_predictor",
@@ -821,7 +817,7 @@ MI_estimates <- function(data,
       Results_multivariate_analysis <- rbind(null_row, Results_multivariate_analysis)
     }
 
-    # flags
+    # Flags
     if (highlight_interactions && length(interaction_terms) > 0) {
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         mutate(is_interaction = sapply(term, function(t) any(sapply(interaction_terms, function(i) grepl(i, t, fixed = TRUE)))))
@@ -829,16 +825,14 @@ MI_estimates <- function(data,
       Results_multivariate_analysis$is_interaction <- FALSE
     }
 
-    # spline flag
     Results_multivariate_analysis$is_spline <- FALSE
     if (!is.null(spline_terms) && length(spline_terms) > 0) {
       Results_multivariate_analysis$is_spline[grepl("_rcs_", Results_multivariate_analysis$term)] <- TRUE
     }
 
-    # polynomial flag
     Results_multivariate_analysis$is_polynomial <- grepl("poly\\(", Results_multivariate_analysis$term)
 
-    # attributes
+    # Attributes
     attr(Results_multivariate_analysis, "has_random_effects")      <- use_random_effects
     attr(Results_multivariate_analysis, "random_intercept_var")    <- random_intercept_var
     attr(Results_multivariate_analysis, "predictor_tested")        <- current_predictor
@@ -854,7 +848,6 @@ MI_estimates <- function(data,
     attr(Results_multivariate_analysis, "n_imp")                   <- length(actual_imps)
     attr(Results_multivariate_analysis, "stratified_intercept_var")<- stratified_intercept_var
 
-    # variance components / ICC
     if (use_random_effects && !is.null(current_models_list) && length(current_models_list) > 0) {
       model1 <- current_models_list[[1]]
       if (inherits(model1, "glmmTMB")) {
@@ -877,7 +870,6 @@ MI_estimates <- function(data,
       }
     }
 
-    # attach fit stats / D1 components
     attr(Results_multivariate_analysis, "fit_stats_per_imp") <- fit_stats_per_imp
     attr(Results_multivariate_analysis, "fit_stats_pooled")  <- fit_stats_pooled
     attr(Results_multivariate_analysis, "D1_components")     <- D1_components
@@ -910,15 +902,18 @@ MI_estimates <- function(data,
         if (pred_name == "No_predictor") {
           predictor_rows <- result[result$term == "No_predictor", ]
         } else {
-          predictor_rows <- result[grepl(paste0("^", pred_name), result$term) & !grepl("Intercept", result$term), ]
+          predictor_rows <- result[grepl(paste0("^", pred_name), result$term) &
+                                     !grepl("Intercept", result$term), ]
           if (nrow(predictor_rows) == 0 && !is.null(covariables) && length(covariables) > 0) {
             covariable_pattern <- paste(covariables, collapse = "|")
-            predictor_rows <- result[grepl(pred_name, result$term) & !grepl("Intercept", result$term), ]
+            predictor_rows <- result[grepl(pred_name, result$term) &
+                                       !grepl("Intercept", result$term), ]
             predictor_rows <- predictor_rows[!grepl(covariable_pattern, predictor_rows$term), ]
           }
         }
         if (nrow(predictor_rows) > 0) {
-          predictor_rows <- predictor_rows[, c("term","estimate","std.error","2.5 %","97.5 %","exp_estimate","exp_CI95_lower","exp_CI95_upper","p.value")]
+          predictor_rows <- predictor_rows[, c("term","estimate","std.error","2.5 %","97.5 %",
+                                               "exp_estimate","exp_CI95_lower","exp_CI95_upper","p.value")]
           combined_results <- rbind(combined_results, predictor_rows)
         }
       }
