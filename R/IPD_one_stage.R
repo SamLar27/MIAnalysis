@@ -186,17 +186,14 @@ IPD_one_stage <- function(data,
   ## ------------------------------------------------------------
   ## Build formula
   ## ------------------------------------------------------------
-  # main fixed-effect terms
   rhs_main_terms <- c(predictor_vars, covariables)
 
-  # trial factor (if requested)
   trial_term <- if (trial_factor == "Yes") {
     paste0("+ as.factor(", trial_col, ")")
   } else {
     ""
   }
 
-  # stratified intercept (GLM)
   strat_glm_term <- ""
   strat_cox_term <- ""
   if (!is.null(stratified_intercept_var)) {
@@ -207,14 +204,12 @@ IPD_one_stage <- function(data,
     }
   }
 
-  # offset
   offset_term <- if (followup_offset == "Yes") {
     paste0("+ offset(log(", followup_col, "))")
   } else {
     ""
   }
 
-  # random effects term builder (glmmTMB / lme4 / coxme syntax)
   build_random_term <- function() {
     if (!use_random_effects) return("")
     rs_vars <- character(0)
@@ -231,9 +226,7 @@ IPD_one_stage <- function(data,
                                stratified_intercept_var == random_intercept_var)
 
     if (length(rs_vars) == 0) {
-      # only random intercept if not same as strata
       if (same_group_as_strata) {
-        # pure stratification at that level -> no random effect
         return("")
       } else {
         return(paste0("+ (1 | ", random_intercept_var, ")"))
@@ -241,10 +234,8 @@ IPD_one_stage <- function(data,
     } else {
       rs_str <- paste(rs_vars, collapse = " + ")
       if (same_group_as_strata) {
-        # random slopes only, no random intercept
         return(paste0("+ (0 + ", rs_str, " | ", random_intercept_var, ")"))
       } else {
-        # random intercept + random slopes
         return(paste0("+ (1 + ", rs_str, " | ", random_intercept_var, ")"))
       }
     }
@@ -252,12 +243,11 @@ IPD_one_stage <- function(data,
 
   random_term <- build_random_term()
 
-  # Full formula string
   if (is.null(formula_string)) {
-    # automatic construction
     rhs_core <- paste(rhs_main_terms, collapse = " + ")
+    if (rhs_core == "") rhs_core <- "1"
+
     if (model_type == "cox") {
-      if (rhs_core == "") rhs_core <- "1"
       formula_str <- paste0(
         "survival::Surv(", time_col, ",", event_col, ") ~ ",
         rhs_core, " ",
@@ -266,7 +256,6 @@ IPD_one_stage <- function(data,
         random_term
       )
     } else {
-      if (rhs_core == "") rhs_core <- "1"
       formula_str <- paste0(
         outcome_var, " ~ ",
         rhs_core, " ",
@@ -277,7 +266,6 @@ IPD_one_stage <- function(data,
       )
     }
   } else {
-    # user-specified formula_string (RHS or full)
     formula_str <- formula_string
     if (model_type == "cox") {
       if (!grepl("^Surv\\(", formula_str)) {
@@ -335,12 +323,11 @@ IPD_one_stage <- function(data,
   )
 
   for (i in seq_along(actual_imps)) {
-    dat_i <- implist[[i]]
+    dat_i   <- implist[[i]]
     imp_val <- actual_imps[i]
 
     fit <- tryCatch({
       if (use_random_effects) {
-        # mixed models
         if (model_type == "lm") {
           if (!requireNamespace("lme4", quietly = TRUE)) {
             stop("Package 'lme4' is required for lm with random effects.")
@@ -377,7 +364,6 @@ IPD_one_stage <- function(data,
           stop("Unsupported model_type with random effects.")
         }
       } else {
-        # standard GLM / Cox
         switch(model_type,
                "nb"            = MASS::glm.nb(model_formula, data = dat_i),
                "lm"            = stats::glm(model_formula, family = stats::gaussian(), data = dat_i),
@@ -414,25 +400,24 @@ IPD_one_stage <- function(data,
   ## Pool coefficients across imputations
   ## ------------------------------------------------------------
   if (use_random_effects) {
-    # manual Rubin pooling of fixed effects
+
     coefs_list <- lapply(ok_models, function(m) {
       if (is.null(m)) return(NULL)
 
       if (model_type == "cox") {
-        c_est <- coxme::fixef(m)
-        c_vcov <- as.matrix(vcov(m))
-        c_se <- sqrt(diag(c_vcov))
+        c_est  <- coxme::fixef(m)
+        c_vcov <- stats::vcov(m)
+        c_se   <- sqrt(diag(c_vcov))
       } else if (inherits(m, "glmmTMB")) {
         c_est <- glmmTMB::fixef(m)$cond
-        v <- glmmTMB::vcov(m)$cond
-        c_se <- sqrt(diag(v))
+        v     <- stats::vcov(m)$cond   # <- FIX HERE
+        c_se  <- sqrt(diag(v))
       } else if (inherits(m, "lmerMod") || inherits(m, "glmerMod")) {
         c_est <- lme4::fixef(m)
-        c_se  <- sqrt(diag(as.matrix(vcov(m))))
+        c_se  <- sqrt(diag(as.matrix(stats::vcov(m))))
       } else {
-        # fallback (should not happen here)
         c_est <- stats::coef(m)
-        c_se  <- sqrt(diag(as.matrix(vcov(m))))
+        c_se  <- sqrt(diag(as.matrix(stats::vcov(m))))
       }
 
       data.frame(
@@ -447,7 +432,6 @@ IPD_one_stage <- function(data,
     if (length(coefs_list) == 0) stop("No valid coefficients for pooling.")
 
     all_terms <- unique(unlist(lapply(coefs_list, function(df) df$term)))
-    m         <- length(coefs_list)
 
     pooled_results <- data.frame(
       term      = all_terms,
@@ -482,19 +466,17 @@ IPD_one_stage <- function(data,
     }
 
     Results <- pooled_results
-    Results$`2.5 %` <- Results$estimate - 1.96 * Results$std.error
+    Results$`2.5 %`  <- Results$estimate - 1.96 * Results$std.error
     Results$`97.5 %` <- Results$estimate + 1.96 * Results$std.error
-    Results$p.value <- 2 * stats::pnorm(-abs(Results$estimate / Results$std.error))
+    Results$p.value  <- 2 * stats::pnorm(-abs(Results$estimate / Results$std.error))
 
   } else {
-    # Use mice::pool for standard GLM / Cox
     if (!requireNamespace("mice", quietly = TRUE)) {
       stop("Package 'mice' is required to pool non-mixed models.")
     }
     ok_models_clean <- Filter(Negate(is.null), models_list)
     pooled <- mice::pool(ok_models_clean)
     Results <- summary(pooled, conf.int = TRUE, exponentiate = FALSE)
-    # ensure cols names
     if (!"term" %in% names(Results)) {
       Results$term <- rownames(Results)
     }
@@ -502,22 +484,22 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## Exponentiate (for interpretability)
+  ## Exponentiate
   ## ------------------------------------------------------------
   Results$exp_estimate   <- exp(Results$estimate)
   Results$exp_CI95_lower <- exp(Results$`2.5 %`)
   Results$exp_CI95_upper <- exp(Results$`97.5 %`)
 
   ## ------------------------------------------------------------
-  ## Flags for interaction / spline / polynomial (simple)
+  ## Flags
   ## ------------------------------------------------------------
   if (highlight_interactions) {
     Results$is_interaction <- grepl(":", Results$term)
   } else {
     Results$is_interaction <- FALSE
   }
-  Results$is_spline      <- FALSE
-  Results$is_polynomial  <- grepl("poly\\(", Results$term)
+  Results$is_spline     <- FALSE
+  Results$is_polynomial <- grepl("poly\\(", Results$term)
 
   ## ------------------------------------------------------------
   ## Split intercept vs other terms (including stratified intercepts)
@@ -539,13 +521,12 @@ IPD_one_stage <- function(data,
   Table_no_int    <- Results[!(is_intercept_row | is_strata_row), , drop = FALSE]
 
   ## ------------------------------------------------------------
-  ## Optional: weighted intercept across strata
+  ## Weighted intercept (optional)
   ## ------------------------------------------------------------
   Weighted_intercept <- NULL
 
   if (isTRUE(weighted_intercept) && !is.null(stratified_intercept_var)) {
     if (nrow(Intercept_table) > 0 && nrow(data) > 0) {
-      # 1) weights by number of subjects per stratum
       strat_fac <- as.factor(data[[stratified_intercept_var]])
       strat_fac <- droplevels(strat_fac)
 
@@ -553,11 +534,9 @@ IPD_one_stage <- function(data,
       colnames(N_by_stratum) <- c("level", "N")
       N_by_stratum$w <- N_by_stratum$N / sum(N_by_stratum$N)
 
-      # 2) base intercept
       beta0 <- Intercept_table$estimate[Intercept_table$term == "(Intercept)"]
       if (length(beta0) == 0L) beta0 <- 0
 
-      # 3) strata dummy coefficients
       if (!is.null(pattern_strata)) {
         strata_coefs <- Results[grepl(pattern_strata, Results$term),
                                 c("term", "estimate"), drop = FALSE]
@@ -572,15 +551,11 @@ IPD_one_stage <- function(data,
                                    estimate = numeric(0))
       }
 
-      # 4) merge and fill missing with 0 (baseline level)
       merged <- merge(N_by_stratum, strata_coefs,
                       by = "level", all.x = TRUE)
       merged$estimate[is.na(merged$estimate)] <- 0
-
-      # 5) level-specific intercepts
       merged$beta_level <- beta0 + merged$estimate
 
-      # 6) weighted intercept
       beta_w <- sum(merged$w * merged$beta_level)
 
       Weighted_intercept <- data.frame(
@@ -603,7 +578,7 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## Optional: performance metrics per imputation
+  ## Performance metrics per imputation (optional)
   ## ------------------------------------------------------------
   performance_per_imp <- NULL
   if (isTRUE(model_performance)) {
@@ -623,28 +598,27 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## Build return object
+  ## Return object
   ## ------------------------------------------------------------
   out <- list(
-    table             = Table_no_int,
-    term              = Table_no_int$term,
-    Intercept         = Intercept_table,
+    table              = Table_no_int,
+    term               = Table_no_int$term,
+    Intercept          = Intercept_table,
     Weighted_intercept = Weighted_intercept
   )
 
   class(out) <- c("IPD_one_stage", "list")
 
-  # Attach attributes (to keep your old usage working)
-  attr(out, "fit_log")            <- fit_log
-  attr(out, "models")             <- models_list
-  attr(out, "performance_per_imp")<- performance_per_imp
-  attr(out, "model_type")         <- model_type
-  attr(out, "formula")            <- formula_str
-  attr(out, "imputations")        <- actual_imps
-  attr(out, "n_imp")              <- length(actual_imps)
-  attr(out, "has_random_effects") <- use_random_effects
-  attr(out, "random_intercept_var")   <- random_intercept_var
-  attr(out, "stratified_intercept_var") <- stratified_intercept_var
+  attr(out, "fit_log")             <- fit_log
+  attr(out, "models")              <- models_list
+  attr(out, "performance_per_imp") <- performance_per_imp
+  attr(out, "model_type")          <- model_type
+  attr(out, "formula")             <- formula_str
+  attr(out, "imputations")         <- actual_imps
+  attr(out, "n_imp")               <- length(actual_imps)
+  attr(out, "has_random_effects")  <- use_random_effects
+  attr(out, "random_intercept_var")    <- random_intercept_var
+  attr(out, "stratified_intercept_var")<- stratified_intercept_var
 
   out
 }
