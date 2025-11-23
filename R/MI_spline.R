@@ -60,37 +60,29 @@ MI_spline <- function(data,
                       variable_x,
                       subgroups = NULL,
                       covariables = NULL,
-
                       # --- NEW spline arguments ---
                       spline_knots_n          = 4,
                       spline_knots_percentile = NULL,
-
                       imp_col     = ".imp",
                       MI_method   = "first",   # "first", "average", "Rubin"
                       model_type  = "nb",      # "nb", "poisson", "logistic", "lm", "cox"
-
                       followup_offset = "No",
                       followup_col    = NULL,
-
                       trial_factor    = "No",
                       trial_col       = NULL,
-
                       time_col  = NULL,        # for Cox
                       event_col = NULL,        # for Cox
-
                       random_intercept     = "No",
                       random_intercept_var = NULL,
-
                       random_slope  = "No",
                       predictor_vars_random_slope = NULL,
                       covariables_random_slope    = NULL,
-
                       prediction_range = c(0.01, 0.99),
                       calculate_derivatives = FALSE,
                       derivative_points     = NULL,
-
                       plot_options = NULL,
                       group_fits   = FALSE) {
+
   ## ------------------------------------------------------------------
   ## 0. BASIC CHECKS & SETUP
   ## ------------------------------------------------------------------
@@ -101,44 +93,36 @@ MI_spline <- function(data,
   if (!model_type %in% c("nb", "poisson", "logistic", "lm", "cox")) {
     stop("model_type must be one of 'nb', 'poisson', 'logistic', 'lm', 'cox'")
   }
-
   if (followup_offset == "Yes" && is.null(followup_col)) {
     stop("followup_col must be provided when followup_offset = 'Yes'")
   }
-
   if (trial_factor == "Yes" && is.null(trial_col)) {
     stop("trial_col must be provided when trial_factor = 'Yes'")
   }
-
   if (model_type == "cox" && (is.null(time_col) || is.null(event_col))) {
     stop("time_col and event_col must be provided for Cox models")
   }
-
   if (!random_intercept %in% c("Yes", "No")) {
     stop("random_intercept must be 'Yes' or 'No'")
   }
   if (random_intercept == "Yes" && is.null(random_intercept_var)) {
     stop("If random_intercept = 'Yes', random_intercept_var must be provided")
   }
-
   if (!random_slope %in% c("Yes", "No")) {
     stop("random_slope must be 'Yes' or 'No'")
   }
   if (random_slope == "Yes" && is.null(predictor_vars_random_slope)) {
     stop("If random_slope = 'Yes', predictor_vars_random_slope must be provided")
   }
-
   if (length(prediction_range) != 2 ||
       any(prediction_range < 0) ||
       any(prediction_range > 1) ||
       prediction_range[1] >= prediction_range[2]) {
     stop("prediction_range must be c(p1, p2) with 0 <= p1 < p2 <= 1")
   }
-
   if (calculate_derivatives && MI_method != "first") {
     stop("Derivatives currently implemented only for MI_method = 'first'")
   }
-
   if (is.null(plot_options)) plot_options <- list()
 
   ## ------------------------------------------------------------------
@@ -147,7 +131,6 @@ MI_spline <- function(data,
   if (!imp_col %in% names(data)) {
     stop("imp_col not found in data")
   }
-
   if (MI_method == "first") {
     Data_Subset <- subset(data, get(imp_col) == 1)
   } else if (MI_method %in% c("average", "Rubin")) {
@@ -394,9 +377,11 @@ MI_spline <- function(data,
   }
 
   ## predict with SE on link scale
+  ## IMPORTANT: for lmer/glmer we use re.form = NA => population-level prediction
   predict_with_se <- function(mod, newdata) {
     if (inherits(mod, c("lmerMod", "glmerMod"))) {
-      lp <- predict(mod, newdata = newdata, type = "link", se.fit = TRUE, re.form = NA)
+      lp <- predict(mod, newdata = newdata, type = "link",
+                    se.fit = TRUE, re.form = NA)
       fit <- lp$fit
       se  <- lp$se.fit
     } else if (inherits(mod, "coxph")) {
@@ -414,19 +399,19 @@ MI_spline <- function(data,
   ## link -> response transform
   link_to_response <- function(fit, se, type) {
     if (type %in% c("nb", "poisson", "cox")) {
-      pred <- exp(fit)
+      pred  <- exp(fit)
       lower <- exp(fit - 1.96 * se)
       upper <- exp(fit + 1.96 * se)
     } else if (type == "logistic") {
-      pred <- stats::plogis(fit)
+      pred  <- stats::plogis(fit)
       lower <- stats::plogis(fit - 1.96 * se)
       upper <- stats::plogis(fit + 1.96 * se)
     } else if (type == "lm") {
-      pred <- fit
+      pred  <- fit
       lower <- fit - 1.96 * se
       upper <- fit + 1.96 * se
     } else {
-      pred <- exp(fit)
+      pred  <- exp(fit)
       lower <- exp(fit - 1.96 * se)
       upper <- exp(fit + 1.96 * se)
     }
@@ -464,17 +449,17 @@ MI_spline <- function(data,
     imps <- sort(unique(Data_Subset[[imp_col]]))
     pred_data <- build_pred_frame(Data_Subset, x_seq)
 
-    n_rows <- nrow(pred_data)
+    n_rows   <- nrow(pred_data)
     all_fits <- matrix(NA_real_, nrow = n_rows, ncol = length(imps))
     all_ses  <- matrix(NA_real_, nrow = n_rows, ncol = length(imps))
 
     for (j in seq_along(imps)) {
-      imp <- imps[j]
+      imp    <- imps[j]
       dat_imp <- subset(Data_Subset, get(imp_col) == imp)
       use_mixed <- (random_intercept == "Yes" || random_slope == "Yes")
-      mod_imp <- fit_single_model(dat_imp, use_mixed = use_mixed)
-      pd_imp  <- build_pred_frame(dat_imp, x_seq)
-      pr_imp  <- predict_with_se(mod_imp, pd_imp)
+      mod_imp   <- fit_single_model(dat_imp, use_mixed = use_mixed)
+      pd_imp    <- build_pred_frame(dat_imp, x_seq)
+      pr_imp    <- predict_with_se(mod_imp, pd_imp)
       all_fits[, j] <- pr_imp$fit
       all_ses[,  j] <- pr_imp$se.fit
     }
@@ -509,7 +494,7 @@ MI_spline <- function(data,
     }
 
     se_pool <- sqrt(mean_var)
-    resp <- link_to_response(mean_fit, se_pool, model_type)
+    resp    <- link_to_response(mean_fit, se_pool, model_type)
 
     pred_data$prediction <- resp$pred
     pred_data$lower_ci   <- resp$lower
@@ -551,10 +536,10 @@ MI_spline <- function(data,
     f_plus  <- pred_resp(population_model, data_plus)
     f_minus <- pred_resp(population_model, data_minus)
 
-    deriv <- (f_plus - f_minus) / (2 * eps)
+    deriv     <- (f_plus - f_minus) / (2 * eps)
     se_approx <- abs(deriv) * 0.2
-    lower_d <- deriv - 1.96 * se_approx
-    upper_d <- deriv + 1.96 * se_approx
+    lower_d   <- deriv - 1.96 * se_approx
+    upper_d   <- deriv + 1.96 * se_approx
 
     deriv_data$derivative          <- deriv
     deriv_data$se_derivative       <- se_approx
@@ -566,7 +551,7 @@ MI_spline <- function(data,
   }
 
   ## ------------------------------------------------------------------
-  ## 7. PLOT (population curve)
+  ## 7. PLOT (population curve) – with plot_options
   ## ------------------------------------------------------------------
   x_lab <- if (!is.null(plot_options$x_lab)) plot_options$x_lab else variable_x
   if (model_type %in% c("nb", "poisson")) {
@@ -580,20 +565,141 @@ MI_spline <- function(data,
   }
   y_lab <- if (!is.null(plot_options$y_lab)) plot_options$y_lab else y_lab_default
 
-  plt <- ggplot2::ggplot(pred_data,
-                         ggplot2::aes_string(x = variable_x, y = "prediction")) +
-    ggplot2::geom_ribbon(ggplot2::aes(ymin = lower_ci, ymax = upper_ci),
-                         alpha = ifelse(is.null(plot_options$ribbon_alpha),
-                                        0.3, plot_options$ribbon_alpha),
-                         fill = ifelse(is.null(plot_options$fill_colors),
-                                       "grey80", plot_options$fill_colors[1])) +
-    ggplot2::geom_line(linewidth = ifelse(is.null(plot_options$line_size),
-                                          1, plot_options$line_size),
-                       color = ifelse(is.null(plot_options$colors),
-                                      "black", plot_options$colors[1])) +
+  # Base plot: ribbon + line
+  plt <- ggplot2::ggplot(
+    pred_data,
+    ggplot2::aes_string(x = variable_x, y = "prediction")
+  ) +
+    ggplot2::geom_ribbon(
+      ggplot2::aes(ymin = lower_ci, ymax = upper_ci),
+      alpha = ifelse(is.null(plot_options$ribbon_alpha),
+                     0.3, plot_options$ribbon_alpha),
+      fill  = ifelse(is.null(plot_options$fill_colors),
+                     "grey80", plot_options$fill_colors[1])
+    ) +
+    ggplot2::geom_line(
+      linewidth = ifelse(is.null(plot_options$line_size),
+                         1, plot_options$line_size),
+      color = ifelse(is.null(plot_options$colors),
+                     "black", plot_options$colors[1]),
+      linetype = ifelse(is.null(plot_options$line_types),
+                        "solid", plot_options$line_types[1])
+    ) +
     ggplot2::xlab(x_lab) +
     ggplot2::ylab(y_lab) +
     ggplot2::theme_minimal()
+
+  ## ---- X scale (log or linear, breaks/limits) ----
+  use_log_x <- isTRUE(plot_options$use_log_x)
+  x_breaks  <- plot_options$x_breaks
+  x_limits  <- plot_options$x_limits
+
+  if (use_log_x) {
+    plt <- plt +
+      ggplot2::scale_x_log10(
+        breaks = x_breaks,
+        limits = x_limits
+      )
+  } else {
+    plt <- plt +
+      ggplot2::scale_x_continuous(
+        breaks = x_breaks,
+        limits = x_limits
+      )
+  }
+
+  ## ---- Y scale (limits/breaks) ----
+  y_breaks <- plot_options$y_breaks
+  y_limits <- plot_options$y_limits
+
+  plt <- plt +
+    ggplot2::scale_y_continuous(
+      breaks = y_breaks,
+      limits = y_limits
+    )
+
+  ## ---- Optional vertical & horizontal lines ----
+  if (!is.null(plot_options$vline)) {
+    plt <- plt +
+      ggplot2::geom_vline(
+        xintercept = plot_options$vline,
+        color      = ifelse(is.null(plot_options$vline_color),
+                            "red", plot_options$vline_color),
+        linetype   = ifelse(is.null(plot_options$vline_type),
+                            "dashed", plot_options$vline_type),
+        linewidth  = ifelse(is.null(plot_options$vline_size),
+                            0.7, plot_options$vline_size)
+      )
+  }
+
+  if (!is.null(plot_options$hline)) {
+    plt <- plt +
+      ggplot2::geom_hline(
+        yintercept = plot_options$hline,
+        color      = ifelse(is.null(plot_options$hline_color),
+                            "red", plot_options$hline_color),
+        linetype   = ifelse(is.null(plot_options$hline_type),
+                            "dotted", plot_options$hline_type),
+        linewidth  = ifelse(is.null(plot_options$hline_size),
+                            0.7, plot_options$hline_size)
+      )
+  }
+
+  ## ---- Optional title / subtitle / caption ----
+  if (!is.null(plot_options$title)) {
+    plt <- plt + ggplot2::ggtitle(plot_options$title)
+  }
+  if (!is.null(plot_options$subtitle)) {
+    plt <- plt + ggplot2::labs(subtitle = plot_options$subtitle)
+  }
+  if (!is.null(plot_options$caption)) {
+    plt <- plt + ggplot2::labs(caption = plot_options$caption)
+  }
+
+  ## ---- Theme customisation from plot_options ----
+  theme_args <- list()
+
+  if (!is.null(plot_options$theme_plot_title)) {
+    theme_args$plot.title <- plot_options$theme_plot_title
+  }
+  if (!is.null(plot_options$theme_plot_subtitle)) {
+    theme_args$plot.subtitle <- plot_options$theme_plot_subtitle
+  }
+  if (!is.null(plot_options$theme_plot_caption)) {
+    theme_args$plot.caption <- plot_options$theme_plot_caption
+  }
+  if (!is.null(plot_options$theme_axis_title_x)) {
+    theme_args$axis.title.x <- plot_options$theme_axis_title_x
+  }
+  if (!is.null(plot_options$theme_axis_title_y)) {
+    theme_args$axis.title.y <- plot_options$theme_axis_title_y
+  }
+  if (!is.null(plot_options$theme_axis_text_x)) {
+    theme_args$axis.text.x <- plot_options$theme_axis_text_x
+  }
+  if (!is.null(plot_options$theme_axis_text_y)) {
+    theme_args$axis.text.y <- plot_options$theme_axis_text_y
+  }
+  if (!is.null(plot_options$theme_axis_line)) {
+    theme_args$axis.line.x <- plot_options$theme_axis_line
+    theme_args$axis.line.y <- plot_options$theme_axis_line
+  }
+  if (!is.null(plot_options$theme_panel_background)) {
+    theme_args$panel.background <- plot_options$theme_panel_background
+  }
+  if (!is.null(plot_options$theme_panel_grid_major)) {
+    theme_args$panel.grid.major <- plot_options$theme_panel_grid_major
+  }
+  if (!is.null(plot_options$theme_panel_grid_minor)) {
+    theme_args$panel.grid.minor <- plot_options$theme_panel_grid_minor
+  }
+  if (!is.null(plot_options$theme_plot_margin)) {
+    theme_args$plot.margin <- plot_options$theme_plot_margin
+  }
+
+  if (length(theme_args) > 0) {
+    plt <- plt + do.call(ggplot2::theme, theme_args)
+  }
 
   ## ------------------------------------------------------------------
   ## 8. group_fits: independent per-trial spline fits (no random effects)
@@ -657,7 +763,7 @@ MI_spline <- function(data,
         group_covs <- non_constant_covs(dg, base_cov_vars)
       }
 
-      knots_str_g  <- knots_str  # reuse global knots
+      knots_str_g   <- knots_str  # reuse global knots
       spline_term_g <- paste0("rcs(", variable_x, ", ", knots_str_g, ")")
 
       rhs_g <- spline_term_g
@@ -703,10 +809,10 @@ MI_spline <- function(data,
 
       # predict with se for this group
       if (model_type == "cox") {
-        prg <- predict(mod_g, newdata = pg, type = "lp", se.fit = TRUE)
+        prg    <- predict(mod_g, newdata = pg, type = "lp", se.fit = TRUE)
         resp_g <- link_to_response(prg$fit, prg$se.fit, "cox")
       } else {
-        prg <- predict_with_se(mod_g, pg)
+        prg    <- predict_with_se(mod_g, pg)
         resp_g <- link_to_response(prg$fit, prg$se.fit, model_type)
       }
 
@@ -724,19 +830,16 @@ MI_spline <- function(data,
     group_list <- group_list[!vapply(group_list, is.null, logical(1))]
 
     if (length(group_list) > 0) {
-      # --- KEY FIX: align columns before rbind ---
+      # align columns before rbind
       all_names <- unique(unlist(lapply(group_list, names)))
       group_list <- lapply(group_list, function(df) {
         missing <- setdiff(all_names, names(df))
         if (length(missing) > 0) {
-          for (m in missing) {
-            df[[m]] <- NA
-          }
+          for (m in missing) df[[m]] <- NA
         }
         df <- df[, all_names, drop = FALSE]
         df
       })
-
       group_fits_df <- do.call(rbind, group_list)
       rownames(group_fits_df) <- NULL
     }
