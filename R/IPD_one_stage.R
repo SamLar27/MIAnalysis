@@ -102,237 +102,138 @@ IPD_one_stage <- function(data,
                           event_col = NULL,
                           formula_string = NULL,
                           highlight_interactions = TRUE,
-                          spline_terms = NULL,
-                          spline_knots_n = NULL,
-                          spline_knots_percentile = NULL,
-                          poly_terms = NULL,
-                          poly_degree = NULL,
-                          include_poly_terms = TRUE,
                           random_intercept_var = NULL,
                           predictor_vars_random_slope = NULL,
                           covariables_random_slope = NULL,
                           stratified_intercept_var = NULL,
-                          model_performance = FALSE) {
+                          model_performance = FALSE,
+                          weighted_intercept = FALSE) {
 
-  ## ---- Flags inferred from arguments ----
-  use_random_effects <- !is.null(random_intercept_var)
-  use_strata         <- !is.null(stratified_intercept_var)
-
-  ## ---- Packages ----
-  require(dplyr)
-  require(MASS)
-  require(mice)
-  require(rlang)
-  require(survival)
-  require(splines)
-
-  if (use_random_effects) {
-    require(lme4)
-
-    if (model_type == "cox") {
-      if (!requireNamespace("coxme", quietly = TRUE)) {
-        stop("Package 'coxme' is required for Cox models with random effects.")
-      }
-      require(coxme)
-    }
-
-    if (model_type == "nb") {
-      if (!requireNamespace("glmmTMB", quietly = TRUE)) {
-        warning("Package 'glmmTMB' not available. Using 'lme4' with Poisson family as approximation.")
-      } else {
-        require(glmmTMB)
-      }
-    }
-  }
-
-  # Spline support (rcs via rms if available)
-  use_rms <- FALSE
-  if (!is.null(spline_terms)) {
-    if (!requireNamespace("rms", quietly = TRUE)) {
-      message("Package 'rms' is not available. Using bs() from splines instead of rcs().")
-      use_rms <- FALSE
-    } else {
-      require(rms)
-      use_rms <- TRUE
-    }
-  }
-
-  ## ---- Core checks ----
+  ## ------------------------------------------------------------
+  ## Basic checks
+  ## ------------------------------------------------------------
+  if (!is.data.frame(data)) stop("data must be a data.frame.")
   if (!imp_col %in% names(data)) stop("imp_col not found in data.")
-  if (!outcome_var %in% names(data) && model_type != "cox") stop("outcome_var not found in data.")
-  if (!followup_offset %in% c("Yes", "No")) stop("followup_offset must be either 'Yes' or 'No'.")
-  if (followup_offset == "Yes" && is.null(followup_col)) stop("If followup_offset = 'Yes', followup_col must be provided.")
-  if (!is.null(followup_col) && any(data[[followup_col]] <= 0, na.rm = TRUE)) stop("followup_col must be strictly positive for offset.")
-  if (!trial_factor %in% c("Yes", "No")) stop("trial_factor must be either 'Yes' or 'No'.")
-  if (trial_factor == "Yes" && is.null(trial_col)) stop("If trial_factor = 'Yes', trial_col must be provided.")
-  if (use_random_effects && !random_intercept_var %in% names(data)) stop("random_intercept_var not found in data.")
-  if (use_strata && !stratified_intercept_var %in% names(data)) stop("stratified_intercept_var not found in data.")
-  if (!is.null(followup_col) && !followup_col %in% names(data)) stop("followup_col not found in data.")
-  if (!is.null(trial_col) && !trial_col %in% names(data)) stop("trial_col not found in data.")
-  if (!is.null(time_col) && !time_col %in% names(data)) stop("time_col not found in data.")
-  if (!is.null(event_col) && !event_col %in% names(data)) stop("event_col not found in data.")
+  if (model_type != "cox" && !outcome_var %in% names(data)) {
+    stop("outcome_var not found in data.")
+  }
+  if (!followup_offset %in% c("Yes", "No")) {
+    stop("followup_offset must be 'Yes' or 'No'.")
+  }
+  if (followup_offset == "Yes") {
+    if (is.null(followup_col) || !followup_col %in% names(data)) {
+      stop("followup_offset = 'Yes' but followup_col is missing or not in data.")
+    }
+    if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
+      stop("followup_col must be strictly positive for offset(log(followup_col)).")
+    }
+  }
+  if (!trial_factor %in% c("Yes", "No")) {
+    stop("trial_factor must be 'Yes' or 'No'.")
+  }
+  if (trial_factor == "Yes" && (is.null(trial_col) || !trial_col %in% names(data))) {
+    stop("trial_factor = 'Yes' but trial_col is missing or not in data.")
+  }
+  if (!is.null(random_intercept_var) && !random_intercept_var %in% names(data)) {
+    stop("random_intercept_var not found in data.")
+  }
+  if (!is.null(stratified_intercept_var) && !stratified_intercept_var %in% names(data)) {
+    stop("stratified_intercept_var not found in data.")
+  }
+  if (model_type == "cox") {
+    if (is.null(time_col) || is.null(event_col)) {
+      stop("For Cox models, time_col and event_col must be provided.")
+    }
+    if (!time_col %in% names(data))  stop("time_col not found in data.")
+    if (!event_col %in% names(data)) stop("event_col not found in data.")
+  }
 
   if (!is.null(predictor_vars_random_slope)) {
-    if (!all(predictor_vars_random_slope %in% names(data))) {
-      missing_rs <- predictor_vars_random_slope[!predictor_vars_random_slope %in% names(data)]
-      stop(paste("predictor_vars_random_slope not found in data:", paste(missing_rs, collapse = ", ")))
+    miss <- setdiff(predictor_vars_random_slope, names(data))
+    if (length(miss) > 0) {
+      stop("predictor_vars_random_slope not found in data: ",
+           paste(miss, collapse = ", "))
     }
   }
   if (!is.null(covariables_random_slope)) {
-    if (!all(covariables_random_slope %in% names(data))) {
-      missing_rs <- covariables_random_slope[!covariables_random_slope %in% names(data)]
-      stop(paste("covariables_random_slope not found in data:", paste(missing_rs, collapse = ", ")))
+    miss <- setdiff(covariables_random_slope, names(data))
+    if (length(miss) > 0) {
+      stop("covariables_random_slope not found in data: ",
+           paste(miss, collapse = ", "))
     }
   }
-  if (!use_random_effects &&
-      (!is.null(predictor_vars_random_slope) || !is.null(covariables_random_slope))) {
-    warning("Random slopes specified but random_intercept_var is NULL. Random slopes will be ignored (no mixed model).")
-  }
+  use_random_effects <- !is.null(random_intercept_var)
 
-  ## ---- Imputations ----
+  ## ------------------------------------------------------------
+  ## Imputation list
+  ## ------------------------------------------------------------
   actual_imps <- sort(unique(data[[imp_col]]))
   if (is.null(imp_n)) {
     imp_n <- length(actual_imps)
   } else if (imp_n != length(actual_imps)) {
-    warning("imp_n does not match the number of unique imputations found in the data. Using only present imputations.")
+    warning("imp_n does not match number of unique imputations in data; using present imputations only.")
     imp_n <- length(actual_imps)
   }
 
   implist <- vector("list", length(actual_imps))
   for (i in seq_along(actual_imps)) {
     imp_val <- actual_imps[i]
-    data_i <- dplyr::filter(data, !!rlang::sym(imp_col) == imp_val)
-    if (nrow(data_i) == 0) stop(paste("No data for imputation", imp_val))
-    implist[[i]] <- data_i
+    dat_i   <- data[data[[imp_col]] == imp_val, , drop = FALSE]
+    if (nrow(dat_i) == 0) stop("No data for imputation ", imp_val)
+    implist[[i]] <- dat_i
   }
 
-  ## ---- Spline validation and knot computation ----
-  spline_map <- list()  # var -> formula piece (rcs(...) or bs(...))
-  if (!is.null(spline_terms)) {
-    if (!is.character(spline_terms)) stop("spline_terms must be a character vector of variable names.")
-    for (v in spline_terms) {
-      if (!v %in% names(data)) stop(paste("Spline variable", v, "not found in data"))
-    }
-    if (is.null(spline_knots_n)) stop("spline_knots_n must be provided when using spline_terms.")
-    if (is.null(spline_knots_percentile)) stop("spline_knots_percentile must be provided when using spline_terms.")
-    if (length(spline_knots_percentile) != spline_knots_n)
-      stop("Length of spline_knots_percentile must match spline_knots_n.")
+  ## ------------------------------------------------------------
+  ## Build formula
+  ## ------------------------------------------------------------
+  # main fixed-effect terms
+  rhs_main_terms <- c(predictor_vars, covariables)
 
-    for (v in spline_terms) {
-      knots <- as.numeric(stats::quantile(data[[v]],
-                                          probs = spline_knots_percentile / 100,
-                                          na.rm = TRUE))
-      if (use_rms) {
-        spline_map[[v]] <- paste0("rcs(", v, ", c(", paste(knots, collapse = ", "), "))")
-      } else {
-        df <- spline_knots_n + 1  # approx df
-        spline_map[[v]] <- paste0("bs(", v, ", df = ", df, ", degree = 3)")
-      }
-    }
+  # trial factor (if requested)
+  trial_term <- if (trial_factor == "Yes") {
+    paste0("+ as.factor(", trial_col, ")")
+  } else {
+    ""
   }
 
-  ## ---- Polynomial validation and degree handling ----
-  poly_map <- list()      # var -> formula piece poly(var, degree, raw=TRUE)
-  poly_degree_vec <- NULL # vector of degrees aligned with poly_terms
-
-  if (!is.null(poly_terms)) {
-    if (!is.character(poly_terms)) stop("poly_terms must be a character vector of variable names.")
-    for (v in poly_terms) {
-      if (!v %in% names(data)) stop(paste("Polynomial variable", v, "not found in data"))
-    }
-
-    if (is.null(poly_degree)) {
-      poly_degree_vec <- rep(2L, length(poly_terms))
+  # stratified intercept (GLM)
+  strat_glm_term <- ""
+  strat_cox_term <- ""
+  if (!is.null(stratified_intercept_var)) {
+    if (model_type == "cox") {
+      strat_cox_term <- paste0("+ strata(", stratified_intercept_var, ")")
     } else {
-      if (!is.numeric(poly_degree)) stop("poly_degree must be numeric (2 or 3).")
-      if (length(poly_degree) == 1) {
-        poly_degree_vec <- rep(as.integer(poly_degree), length(poly_terms))
-      } else if (length(poly_degree) == length(poly_terms)) {
-        poly_degree_vec <- as.integer(poly_degree)
-      } else {
-        stop("poly_degree must be length 1 or the same length as poly_terms.")
-      }
-      if (!all(poly_degree_vec %in% c(2L, 3L))) stop("poly_degree must be 2 or 3.")
-    }
-
-    for (i in seq_along(poly_terms)) {
-      v   <- poly_terms[i]
-      deg <- poly_degree_vec[i]
-      poly_map[[v]] <- paste0("poly(", v, ", degree = ", deg, ", raw = TRUE)")
+      strat_glm_term <- paste0("+ as.factor(", stratified_intercept_var, ")")
     }
   }
 
-  ## ---- Variable presence checks (if no custom formula) ----
-  if (is.null(formula_string)) {
-    extract_vars_from_terms <- function(terms) {
-      all_vars <- character(0)
-      for (term in terms) {
-        if (grepl("\\*", term)) {
-          vars_in_interaction <- unlist(strsplit(term, "\\*"))
-          vars_in_interaction <- trimws(vars_in_interaction)
-          all_vars <- c(all_vars, vars_in_interaction)
-        } else {
-          all_vars <- c(all_vars, term)
-        }
-      }
-      unique(all_vars)
-    }
-
-    non_empty_predictors <- predictor_vars[predictor_vars != "" & !is.na(predictor_vars) & !is.null(predictor_vars)]
-    individual_predictor_vars <- extract_vars_from_terms(non_empty_predictors)
-    if (length(individual_predictor_vars) > 0 && !all(individual_predictor_vars %in% names(data))) {
-      missing_vars <- individual_predictor_vars[!individual_predictor_vars %in% names(data)]
-      stop(paste("Predictor variables not found in data:", paste(missing_vars, collapse = ", ")))
-    }
-
-    if (!is.null(covariables)) {
-      individual_covariable_vars <- extract_vars_from_terms(covariables)
-      if (!all(individual_covariable_vars %in% names(data))) {
-        missing_vars <- individual_covariable_vars[!individual_covariable_vars %in% names(data)]
-        stop(paste("Covariables not found in data:", paste(missing_vars, collapse = ", ")))
-      }
-    }
+  # offset
+  offset_term <- if (followup_offset == "Yes") {
+    paste0("+ offset(log(", followup_col, "))")
+  } else {
+    ""
   }
 
-  ## ---- Helpers ----
-  expand_terms <- function(term) {
-    if (grepl("^rcs\\(|^bs\\(|^poly\\(", term)) return(term)
-    if (grepl("\\*", term)) {
-      vars_split <- trimws(unlist(strsplit(term, "\\*")))
-      all_combinations <- lapply(seq_along(vars_split), function(k) {
-        combn(vars_split, k, FUN = function(x) paste(x, collapse = ":"))
-      })
-      unlist(all_combinations)
-    } else term
-  }
-
-  process_special_terms <- function() {
-    spline_formula_parts <- character(0)
-    if (length(spline_map) > 0) {
-      spline_formula_parts <- unlist(unname(spline_map))
-    }
-
-    poly_formula_parts <- character(0)
-    if (length(poly_map) > 0) {
-      poly_formula_parts <- unlist(unname(poly_map))
-    }
-
-    list(spline_parts = spline_formula_parts, poly_parts = poly_formula_parts)
-  }
-
-  special_terms <- process_special_terms()
-  spline_formula_parts <- special_terms$spline_parts
-  poly_formula_parts   <- special_terms$poly_parts
-
-  ## ---- Random-effects core builder ----
-  build_random_term_core <- function(rs_vars) {
+  # random effects term builder (glmmTMB / lme4 / coxme syntax)
+  build_random_term <- function() {
     if (!use_random_effects) return("")
+    rs_vars <- character(0)
+
+    if (!is.null(predictor_vars_random_slope)) {
+      rs_vars <- c(rs_vars, predictor_vars_random_slope)
+    }
+    if (!is.null(covariables_random_slope)) {
+      rs_vars <- c(rs_vars, covariables_random_slope)
+    }
     rs_vars <- unique(rs_vars)
-    same_group_as_strata <- (use_strata &&
+
+    same_group_as_strata <- (!is.null(stratified_intercept_var) &&
                                stratified_intercept_var == random_intercept_var)
 
     if (length(rs_vars) == 0) {
+      # only random intercept if not same as strata
       if (same_group_as_strata) {
+        # pure stratification at that level -> no random effect
         return("")
       } else {
         return(paste0("+ (1 | ", random_intercept_var, ")"))
@@ -340,504 +241,410 @@ IPD_one_stage <- function(data,
     } else {
       rs_str <- paste(rs_vars, collapse = " + ")
       if (same_group_as_strata) {
+        # random slopes only, no random intercept
         return(paste0("+ (0 + ", rs_str, " | ", random_intercept_var, ")"))
       } else {
+        # random intercept + random slopes
         return(paste0("+ (1 + ", rs_str, " | ", random_intercept_var, ")"))
       }
     }
   }
 
-  build_random_term <- function(current_predictor, covariables_in_model) {
-    if (!use_random_effects) return("")
-    rs_vars <- character(0)
+  random_term <- build_random_term()
 
-    if (!is.null(predictor_vars_random_slope) &&
-        !is.null(current_predictor) &&
-        nzchar(current_predictor) &&
-        current_predictor %in% predictor_vars_random_slope) {
-      rs_vars <- c(rs_vars, current_predictor)
-    }
-
-    if (!is.null(covariables_random_slope) && !is.null(covariables_in_model)) {
-      rs_vars <- c(rs_vars, intersect(covariables_random_slope, covariables_in_model))
-    }
-
-    build_random_term_core(rs_vars)
-  }
-
-  ## ---- Formula builder ----
-  build_formula_for_predictor <- function(current_predictor) {
-    trial_term  <- if (trial_factor == "Yes") paste("+ as.factor(", trial_col, ")", sep = "") else ""
-    offset_term <- if (followup_offset == "Yes") paste("+ offset(log(", followup_col, "))", sep = "") else ""
-
-    strat_glm_piece <- ""
-    strat_cox_piece <- ""
-
-    if (use_strata) {
-      if (model_type == "cox") {
-        strat_cox_piece <- paste("+ strata(", stratified_intercept_var, ")", sep = "")
-      } else {
-        strat_glm_piece <- paste(" + as.factor(", stratified_intercept_var, ")", sep = "")
-      }
-    }
-
-    if (is.null(formula_string)) {
-      # Automatic formula construction
-      if (!is.null(covariables)) {
-        expanded_covariables <- unique(unlist(lapply(covariables, expand_terms)))
-      } else {
-        expanded_covariables <- character(0)
-      }
-
-      covariables_in_model <- covariables
-
-      if (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor)) {
-        # Null model
-        all_terms <- c(expanded_covariables, spline_formula_parts, poly_formula_parts)
-      } else {
-        current_spline_parts <- spline_formula_parts
-        current_poly_parts   <- poly_formula_parts
-
-        if (!is.null(spline_terms) && current_predictor %in% spline_terms) {
-          main_pred_term <- spline_map[[current_predictor]]
-          current_spline_parts <- setdiff(current_spline_parts, main_pred_term)
-          expanded_predictor <- main_pred_term
-        } else if (!is.null(poly_terms) && current_predictor %in% poly_terms) {
-          main_pred_term <- poly_map[[current_predictor]]
-          current_poly_parts <- setdiff(current_poly_parts, main_pred_term)
-          expanded_predictor <- main_pred_term
-        } else {
-          expanded_predictor <- expand_terms(current_predictor)
-        }
-
-        current_covariables <- if (is.null(covariables)) character(0) else covariables[covariables != current_predictor]
-        covariables_in_model <- current_covariables
-
-        expanded_covariables <- unique(unlist(lapply(current_covariables, expand_terms)))
-        all_terms <- c(expanded_predictor, expanded_covariables, current_spline_parts, current_poly_parts)
-      }
-
-      random_term <- build_random_term(current_predictor, covariables_in_model)
-
-      if (model_type == "cox") {
-        if (is.null(time_col) || is.null(event_col)) stop("For Cox regression, time_col and event_col must be provided.")
-        formula_str <- paste("Surv(", time_col, ",", event_col, ") ~ ",
-                             paste(all_terms, collapse = " + "), trial_term, strat_cox_piece, random_term, sep = "")
-      } else {
-        fixed_rhs <- paste(all_terms, collapse = " + ")
-        formula_str <- paste(outcome_var, "~", fixed_rhs, offset_term, trial_term, strat_glm_piece, random_term)
-      }
-
+  # Full formula string
+  if (is.null(formula_string)) {
+    # automatic construction
+    rhs_core <- paste(rhs_main_terms, collapse = " + ")
+    if (model_type == "cox") {
+      if (rhs_core == "") rhs_core <- "1"
+      formula_str <- paste0(
+        "survival::Surv(", time_col, ",", event_col, ") ~ ",
+        rhs_core, " ",
+        strat_cox_term, " ",
+        trial_term, " ",
+        random_term
+      )
     } else {
-      # Custom formula
-      formula_str <- formula_string
-
-      all_rs_vars <- unique(c(
-        if (!is.null(predictor_vars_random_slope)) predictor_vars_random_slope else character(0),
-        if (!is.null(covariables_random_slope))   covariables_random_slope   else character(0)
-      ))
-
-      if (model_type == "cox") {
-        if (is.null(time_col) || is.null(event_col)) stop("For Cox regression, time_col and event_col must be provided.")
-        if (!grepl("^Surv\\(", formula_str)) {
-          formula_str <- paste("Surv(", time_col, ",", event_col, ") ~", formula_str)
-        }
-        if (trial_factor == "Yes" && !grepl(paste0("as\\.factor\\(", trial_col, "\\)"), formula_str)) {
-          formula_str <- paste(formula_str, trial_term)
-        }
-        if (use_strata && !grepl(paste0("strata\\(", stratified_intercept_var, "\\)"), formula_str)) {
-          formula_str <- paste(formula_str, paste0("+ strata(", stratified_intercept_var, ")"))
-        }
-        if (use_random_effects && !grepl("\\|", formula_str)) {
-          random_term <- build_random_term_core(all_rs_vars)
-          if (nzchar(random_term)) {
-            formula_str <- paste(formula_str, random_term)
-          }
-        }
-      } else {
-        if (!grepl(paste0("^", outcome_var, "\\s*~"), formula_str)) {
-          formula_str <- paste(outcome_var, "~", formula_str)
-        }
-        if (trial_factor == "Yes" && !grepl(paste0("as\\.factor\\(", trial_col, "\\)"), formula_str)) {
-          formula_str <- paste(formula_str, trial_term)
-        }
-        if (followup_offset == "Yes" && !grepl("offset\\(log\\(.*\\)\\)", formula_str)) {
-          formula_str <- paste(formula_str, offset_term)
-        }
-        if (use_strata && !grepl(paste0("as\\.factor\\(", stratified_intercept_var, "\\)"), formula_str)) {
-          formula_str <- paste(formula_str, paste0("+ as.factor(", stratified_intercept_var, ")"))
-        }
-        if (use_random_effects && !grepl("\\|", formula_str)) {
-          random_term <- build_random_term_core(all_rs_vars)
-          if (nzchar(random_term)) {
-            formula_str <- paste(formula_str, random_term)
-          }
-        }
+      if (rhs_core == "") rhs_core <- "1"
+      formula_str <- paste0(
+        outcome_var, " ~ ",
+        rhs_core, " ",
+        offset_term, " ",
+        strat_glm_term, " ",
+        trial_term, " ",
+        random_term
+      )
+    }
+  } else {
+    # user-specified formula_string (RHS or full)
+    formula_str <- formula_string
+    if (model_type == "cox") {
+      if (!grepl("^Surv\\(", formula_str)) {
+        formula_str <- paste0(
+          "survival::Surv(", time_col, ",", event_col, ") ~ ",
+          formula_str
+        )
+      }
+      if (!identical(trial_term, "") &&
+          !grepl(paste0("as\\.factor\\(", trial_col, "\\)"), formula_str)) {
+        formula_str <- paste(formula_str, trial_term)
+      }
+      if (!identical(strat_cox_term, "") &&
+          !grepl(paste0("strata\\(", stratified_intercept_var, "\\)"), formula_str)) {
+        formula_str <- paste(formula_str, strat_cox_term)
+      }
+      if (use_random_effects && !grepl("\\|", formula_str)) {
+        formula_str <- paste(formula_str, random_term)
+      }
+    } else {
+      if (!grepl(paste0("^", outcome_var, "\\s*~"), formula_str)) {
+        formula_str <- paste(outcome_var, "~", formula_str)
+      }
+      if (followup_offset == "Yes" &&
+          !grepl("offset\\(log\\(", formula_str)) {
+        formula_str <- paste(formula_str, offset_term)
+      }
+      if (!identical(strat_glm_term, "") &&
+          !grepl(paste0("as\\.factor\\(", stratified_intercept_var, "\\)"), formula_str)) {
+        formula_str <- paste(formula_str, strat_glm_term)
+      }
+      if (!identical(trial_term, "") &&
+          !grepl(paste0("as\\.factor\\(", trial_col, "\\)"), formula_str)) {
+        formula_str <- paste(formula_str, trial_term)
+      }
+      if (use_random_effects && !grepl("\\|", formula_str)) {
+        formula_str <- paste(formula_str, random_term)
       }
     }
-    formula_str
   }
 
-  ## ---- Fit one predictor ----
-  fit_model_for_predictor <- function(current_predictor) {
+  model_formula <- stats::as.formula(formula_str)
 
-    formula_string_current <- build_formula_for_predictor(current_predictor)
-    model_formula <- as.formula(formula_string_current)
+  ## ------------------------------------------------------------
+  ## Fit per imputation
+  ## ------------------------------------------------------------
+  models_list <- vector("list", length(actual_imps))
+  names(models_list) <- paste0("imp_", actual_imps)
 
-    interaction_terms <- character(0)
-    if (grepl(":", formula_string_current)) {
-      terms_part <- strsplit(formula_string_current, "~")[[1]][2]
-      terms <- trimws(strsplit(terms_part, "\\+")[[1]])
-      interaction_terms <- terms[grepl(":", terms)]
+  fit_log <- data.frame(
+    imp   = actual_imps,
+    ok    = FALSE,
+    error = NA_character_,
+    stringsAsFactors = FALSE
+  )
+
+  for (i in seq_along(actual_imps)) {
+    dat_i <- implist[[i]]
+    imp_val <- actual_imps[i]
+
+    fit <- tryCatch({
+      if (use_random_effects) {
+        # mixed models
+        if (model_type == "lm") {
+          if (!requireNamespace("lme4", quietly = TRUE)) {
+            stop("Package 'lme4' is required for lm with random effects.")
+          }
+          lme4::lmer(model_formula, data = dat_i)
+        } else if (model_type %in% c("bin")) {
+          if (!requireNamespace("lme4", quietly = TRUE)) {
+            stop("Package 'lme4' is required for binomial mixed models.")
+          }
+          lme4::glmer(model_formula, family = stats::binomial(), data = dat_i)
+        } else if (model_type %in% c("poisson", "quasipoisson")) {
+          if (!requireNamespace("lme4", quietly = TRUE)) {
+            stop("Package 'lme4' is required for Poisson mixed models.")
+          }
+          lme4::glmer(model_formula, family = stats::poisson(), data = dat_i)
+        } else if (model_type == "nb") {
+          if (requireNamespace("glmmTMB", quietly = TRUE)) {
+            glmmTMB::glmmTMB(model_formula,
+                             family = glmmTMB::nbinom2,
+                             data   = dat_i)
+          } else {
+            warning("glmmTMB not installed; using Poisson GLMM (approximation to NB).")
+            if (!requireNamespace("lme4", quietly = TRUE)) {
+              stop("Package 'lme4' is required for Poisson mixed models.")
+            }
+            lme4::glmer(model_formula, family = stats::poisson(), data = dat_i)
+          }
+        } else if (model_type == "cox") {
+          if (!requireNamespace("coxme", quietly = TRUE)) {
+            stop("Package 'coxme' is required for Cox models with random effects.")
+          }
+          coxme::coxme(model_formula, data = dat_i)
+        } else {
+          stop("Unsupported model_type with random effects.")
+        }
+      } else {
+        # standard GLM / Cox
+        switch(model_type,
+               "nb"            = MASS::glm.nb(model_formula, data = dat_i),
+               "lm"            = stats::glm(model_formula, family = stats::gaussian(), data = dat_i),
+               "bin"           = stats::glm(model_formula, family = stats::binomial(), data = dat_i),
+               "poisson"       = stats::glm(model_formula, family = stats::poisson(), data = dat_i),
+               "gamma"         = stats::glm(model_formula, family = stats::Gamma(), data = dat_i),
+               "quasipoisson"  = stats::glm(model_formula, family = stats::quasipoisson(), data = dat_i),
+               "quasibinomial" = stats::glm(model_formula, family = stats::quasibinomial(), data = dat_i),
+               "cox"           = survival::coxph(model_formula, data = dat_i),
+               stop("Unsupported model_type.")
+        )
+      }
+    },
+    error = function(e) {
+      fit_log$error[fit_log$imp == imp_val] <<- e$message
+      NULL
+    })
+
+    if (!is.null(fit)) {
+      fit_log$ok[fit_log$imp == imp_val] <- TRUE
     }
 
-    spline_terms_detected <- character(0)
-    if (grepl("rcs\\(|bs\\(", formula_string_current)) {
-      terms_part <- strsplit(formula_string_current, "~")[[1]][2]
-      terms <- trimws(strsplit(terms_part, "\\+")[[1]])
-      spline_terms_detected <- terms[grepl("rcs\\(|bs\\(", terms)]
-    }
+    models_list[[i]] <- fit
+  }
 
-    poly_terms_detected <- character(0)
-    if (grepl("poly\\(", formula_string_current)) {
-      terms_part <- strsplit(formula_string_current, "~")[[1]][2]
-      terms <- trimws(strsplit(terms_part, "\\+")[[1]])
-      poly_terms_detected <- terms[grepl("poly\\(", terms)]
-    }
+  ok_idx    <- which(fit_log$ok)
+  ok_models <- models_list[ok_idx]
 
-    is_null_model <- (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor))
+  if (length(ok_models) == 0) {
+    stop("All models failed to fit in IPD_one_stage (random-effects block).")
+  }
 
-    current_models_list <- NULL
-    fit_log_df <- data.frame(
-      imp   = actual_imps,
-      ok    = FALSE,
-      error = NA_character_,
+  ## ------------------------------------------------------------
+  ## Pool coefficients across imputations
+  ## ------------------------------------------------------------
+  if (use_random_effects) {
+    # manual Rubin pooling of fixed effects
+    coefs_list <- lapply(ok_models, function(m) {
+      if (is.null(m)) return(NULL)
+
+      if (model_type == "cox") {
+        c_est <- coxme::fixef(m)
+        c_vcov <- as.matrix(vcov(m))
+        c_se <- sqrt(diag(c_vcov))
+      } else if (inherits(m, "glmmTMB")) {
+        c_est <- glmmTMB::fixef(m)$cond
+        v <- glmmTMB::vcov(m)$cond
+        c_se <- sqrt(diag(v))
+      } else if (inherits(m, "lmerMod") || inherits(m, "glmerMod")) {
+        c_est <- lme4::fixef(m)
+        c_se  <- sqrt(diag(as.matrix(vcov(m))))
+      } else {
+        # fallback (should not happen here)
+        c_est <- stats::coef(m)
+        c_se  <- sqrt(diag(as.matrix(vcov(m))))
+      }
+
+      data.frame(
+        term      = names(c_est),
+        estimate  = as.numeric(c_est),
+        std.error = as.numeric(c_se),
+        stringsAsFactors = FALSE
+      )
+    })
+
+    coefs_list <- Filter(Negate(is.null), coefs_list)
+    if (length(coefs_list) == 0) stop("No valid coefficients for pooling.")
+
+    all_terms <- unique(unlist(lapply(coefs_list, function(df) df$term)))
+    m         <- length(coefs_list)
+
+    pooled_results <- data.frame(
+      term      = all_terms,
+      estimate  = NA_real_,
+      std.error = NA_real_,
       stringsAsFactors = FALSE
     )
 
-    if (use_random_effects) {
-
-      models_list <- vector("list", imp_n)
-      for (i in seq_along(actual_imps)) {
-        data_i <- implist[[i]]
-        models_list[[i]] <- tryCatch({
-          fit_log_df$ok[i] <- TRUE
-          if (model_type == "lm") {
-            lme4::lmer(model_formula, data = data_i)
-          } else if (model_type %in% c("bin")) {
-            lme4::glmer(model_formula, family = binomial(), data = data_i)
-          } else if (model_type %in% c("poisson", "quasipoisson")) {
-            lme4::glmer(model_formula, family = poisson(), data = data_i)
-          } else if (model_type == "nb") {
-            if (requireNamespace("glmmTMB", quietly = TRUE)) {
-              glmmTMB::glmmTMB(model_formula, family = nbinom2, data = data_i)
-            } else {
-              warning("Using Poisson instead of Negative Binomial. Install glmmTMB for proper NB mixed models.")
-              lme4::glmer(model_formula, family = poisson(), data = data_i)
-            }
-          } else if (model_type == "cox") {
-            coxme::coxme(model_formula, data = data_i)
-          } else if (model_type == "gamma") {
-            if (requireNamespace("glmmTMB", quietly = TRUE)) {
-              glmmTMB::glmmTMB(model_formula, family = Gamma, data = data_i)
-            } else {
-              warning("Gamma family with random effects may not be stable in lme4.")
-              lme4::glmer(model_formula, family = Gamma, data = data_i)
-            }
-          } else stop("Unsupported model type for random effects.")
-        }, error = function(e) {
-          fit_log_df$ok[i]    <- FALSE
-          fit_log_df$error[i] <- e$message
-          warning(sprintf("Model failed to fit for imputation %s: %s", actual_imps[i], e$message))
-          NULL
-        })
-      }
-
-      current_models_list <- models_list
-
-      coefs <- lapply(models_list, function(m) {
-        if (is.null(m)) return(NULL)
-        if (model_type == "cox") {
-          c_est <- fixef(m)
-          c_se  <- sqrt(diag(vcov(m)))
-        } else if (inherits(m, "glmmTMB")) {
-          c_est <- fixef(m)$cond
-          v     <- vcov(m)$cond
-          c_se  <- sqrt(diag(v))
-        } else {
-          c_est <- fixef(m)
-          if (inherits(m, "lmerMod")) {
-            model_summary <- summary(m)
-            c_se <- model_summary$coefficients[, "Std. Error"]
-          } else {
-            c_se <- tryCatch({
-              sqrt(diag(vcov(m)))
-            }, error = function(e) {
-              summary(m)$coefficients[, "Std. Error"]
-            })
-          }
-        }
-        data.frame(term = names(c_est), estimate = c_est, std.error = c_se, stringsAsFactors = FALSE)
+    for (tt in all_terms) {
+      est_vec <- sapply(coefs_list, function(df) {
+        if (tt %in% df$term) df$estimate[df$term == tt] else NA_real_
+      })
+      se_vec <- sapply(coefs_list, function(df) {
+        if (tt %in% df$term) df$std.error[df$term == tt] else NA_real_
       })
 
-      coefs <- Filter(function(x) !is.null(x), coefs)
-      if (length(coefs) == 0) stop("All models failed to fit in IPD_one_stage (random-effects block).")
+      est_vec <- est_vec[!is.na(est_vec)]
+      se_vec  <- se_vec[!is.na(se_vec)]
 
-      all_terms <- unique(unlist(lapply(coefs, function(df) df$term)))
-      pooled_results <- data.frame(term = all_terms, estimate = NA_real_, std.error = NA_real_,
-                                   stringsAsFactors = FALSE)
+      if (length(est_vec) < 1 || length(se_vec) < 1) next
 
-      for (term in all_terms) {
-        term_ests <- sapply(coefs, function(df) if (term %in% df$term) df$estimate[df$term == term] else NA_real_)
-        term_ests <- term_ests[!is.na(term_ests)]
-        term_ses  <- sapply(coefs, function(df) if (term %in% df$term) df$std.error[df$term == term] else NA_real_)
-        term_ses  <- term_ses[!is.na(term_ses)]
-        if (length(term_ests) < 2) next
-        pooled_est <- mean(term_ests)
-        w_var <- mean(term_ses^2)
-        b_var <- sum((term_ests - pooled_est)^2) / (length(term_ests) - 1)
-        total_var <- w_var + (1 + 1/length(term_ests)) * b_var
-        pooled_results$estimate[pooled_results$term == term] <- pooled_est
-        pooled_results$std.error[pooled_results$term == term] <- sqrt(total_var)
-      }
-
-      Results_multivariate_analysis <- pooled_results %>%
-        mutate(
-          `2.5 %` = estimate - 1.96 * std.error,
-          `97.5 %` = estimate + 1.96 * std.error,
-          p.value = 2 * pnorm(-abs(estimate / std.error))
-        )
-
-    } else {
-      # ---- Non-random effects ----
-      res_comb <- vector("list", length(actual_imps))
-      for (i in seq_along(actual_imps)) {
-        data_subset <- implist[[i]]
-        res_comb[[i]] <- tryCatch({
-          fit_log_df$ok[i] <- TRUE
-          switch(model_type,
-                 "nb"            = MASS::glm.nb(model_formula, data = data_subset),
-                 "lm"            = glm(model_formula, family = gaussian(), data = data_subset),
-                 "bin"           = glm(model_formula, family = binomial(), data = data_subset),
-                 "poisson"       = glm(model_formula, family = poisson(), data = data_subset),
-                 "gamma"         = glm(model_formula, family = Gamma(), data = data_subset),
-                 "quasipoisson"  = glm(model_formula, family = quasipoisson(), data = data_subset),
-                 "quasibinomial" = glm(model_formula, family = quasibinomial(), data = data_subset),
-                 "cox"           = coxph(model_formula, data = data_subset),
-                 stop("Unsupported model type.")
-          )
-        }, error = function(e) {
-          fit_log_df$ok[i]    <- FALSE
-          fit_log_df$error[i] <- e$message
-          warning(sprintf("Model failed to fit for imputation %s: %s", actual_imps[i], e$message))
-          NULL
-        })
-      }
-
-      current_models_list <- res_comb
-
-      ok_models <- Filter(function(x) !is.null(x), res_comb)
-      if (length(ok_models) == 0) {
-        stop("All models failed to fit in IPD_one_stage.")
-      }
-
-      pooled <- mice::pool(ok_models)
-      Results_multivariate_analysis <- summary(pooled, conf.int = TRUE, exp = FALSE)
-    }
-
-    ## ---- Optional performance metrics per imputation ----
-    performance_per_imp <- NULL
-    if (model_performance && !is.null(current_models_list)) {
-      if (!requireNamespace("performance", quietly = TRUE)) {
-        warning("model_performance = TRUE, but package 'performance' is not installed. Skipping performance metrics.")
+      Q_bar <- mean(est_vec)
+      U_bar <- mean(se_vec^2)
+      if (length(est_vec) > 1) {
+        B <- stats::var(est_vec)
       } else {
-        performance_per_imp <- lapply(seq_along(current_models_list), function(i) {
-          m <- current_models_list[[i]]
-          if (is.null(m)) return(NULL)
-          tryCatch(
-            performance::model_performance(m),
-            error = function(e) {
-              warning(sprintf("performance::model_performance failed for imputation %s: %s",
-                              actual_imps[i], e$message))
-              NULL
-            }
-          )
-        })
-        names(performance_per_imp) <- paste0("imp_", actual_imps)
+        B <- 0
       }
+      T_var <- U_bar + (1 + 1 / length(est_vec)) * B
+      pooled_results$estimate[pooled_results$term == tt]  <- Q_bar
+      pooled_results$std.error[pooled_results$term == tt] <- sqrt(T_var)
     }
 
-    # exponentiation
-    Results_multivariate_analysis <- Results_multivariate_analysis %>%
-      mutate(exp_estimate   = exp(estimate),
-             exp_CI95_lower = exp(`2.5 %`),
-             exp_CI95_upper = exp(`97.5 %`)) %>%
-      dplyr::select(term, estimate, std.error, `2.5 %`, `97.5 %`,
-                    p.value, exp_estimate, exp_CI95_lower, exp_CI95_upper)
+    Results <- pooled_results
+    Results$`2.5 %` <- Results$estimate - 1.96 * Results$std.error
+    Results$`97.5 %` <- Results$estimate + 1.96 * Results$std.error
+    Results$p.value <- 2 * stats::pnorm(-abs(Results$estimate / Results$std.error))
 
-    # Normalize poly() name
-    Results_multivariate_analysis$term <- gsub(
-      "poly\\(([^,]+), degree = ([0-9]+), raw = TRUE\\)",
-      "poly(\\1, \\2, raw = TRUE)",
-      Results_multivariate_analysis$term
-    )
-
-    # Rename spline terms nicely ( *_rcs_linear / *_rcs_nl1 / *_rcs_nl2 )
-    if (!is.null(spline_terms) && length(spline_terms) > 0) {
-      for (v in spline_terms) {
-        pattern_base <- paste0("rcs\\(", v, "[^)]*\\)")
-        idx <- grepl(pattern_base, Results_multivariate_analysis$term)
-        if (any(idx)) {
-          old_names <- Results_multivariate_analysis$term[idx]
-          new_names <- old_names
-
-          two_p <- grepl("''$", old_names)
-          one_p <- grepl("'$", old_names) & !two_p
-
-          new_names[two_p] <- paste0(v, "_rcs_nl2")
-          new_names[one_p] <- paste0(v, "_rcs_nl1")
-          new_names[!one_p & !two_p] <- paste0(v, "_rcs_linear")
-
-          Results_multivariate_analysis$term[idx] <- new_names
-        }
-      }
-    }
-
-    # Drop polynomial basis terms if requested
-    if (length(poly_terms_detected) > 0 && !include_poly_terms) {
-      poly_patterns <- sapply(poly_terms_detected, function(x) {
-        if (grepl("poly\\(", x)) {
-          var_name <- trimws(gsub("poly\\(([^,]+),.*", "\\1", x))
-          return(paste0("^poly\\(", var_name, ".*\\)"))
-        } else ""
-      })
-      pattern <- paste(poly_patterns, collapse = "|")
-      if (nzchar(pattern)) {
-        Results_multivariate_analysis <- Results_multivariate_analysis %>%
-          filter(!grepl(pattern, term))
-      }
-    }
-
-    # Null model row
-    if (is_null_model) {
-      null_row <- data.frame(
-        term = "No_predictor",
-        estimate = NA, std.error = NA, `2.5 %` = NA, `97.5 %` = NA,
-        p.value = NA,
-        exp_estimate = NA, exp_CI95_lower = NA, exp_CI95_upper = NA,
-        stringsAsFactors = FALSE, check.names = FALSE
-      )
-      Results_multivariate_analysis <- rbind(null_row, Results_multivariate_analysis)
-    }
-
-    ## ------------------------ Post-processing & splitting intercept ------------------------
-    # Identify intercept and stratified-intercept dummies
-    intercept_pattern <- NULL
-    if (use_strata && !is.null(stratified_intercept_var)) {
-      # e.g. as.factor(Enrolled_Trial_name)BENRAP2B
-      intercept_pattern <- paste0("^as\\.factor\\(", stratified_intercept_var, "\\)")
-    }
-
-    intercept_idx <- grepl("\\(Intercept\\)", Results_multivariate_analysis$term)
-
-    if (!is.null(intercept_pattern)) {
-      intercept_idx <- intercept_idx |
-        grepl(intercept_pattern, Results_multivariate_analysis$term)
-    }
-
-    intercept_df  <- Results_multivariate_analysis[intercept_idx, , drop = FALSE]
-    coef_df       <- Results_multivariate_analysis[!intercept_idx, , drop = FALSE]
-
-    # Flags
-    if (highlight_interactions && length(interaction_terms) > 0) {
-      coef_df <- coef_df %>%
-        mutate(is_interaction = sapply(term, function(t) any(sapply(interaction_terms, function(i) grepl(i, t, fixed = TRUE)))))
-      intercept_df$is_interaction <- FALSE
-    } else {
-      coef_df$is_interaction  <- FALSE
-      intercept_df$is_interaction <- FALSE
-    }
-
-    coef_df$is_spline      <- FALSE
-    intercept_df$is_spline <- FALSE
-    if (!is.null(spline_terms) && length(spline_terms) > 0) {
-      coef_df$is_spline[grepl("_rcs_", coef_df$term)] <- TRUE
-    }
-
-    coef_df$is_polynomial      <- grepl("poly\\(", coef_df$term)
-    intercept_df$is_polynomial <- grepl("poly\\(", intercept_df$term)
-
-    # Build result object
-    result_obj <- list(
-      table     = coef_df,
-      term      = coef_df$term,
-      Intercept = intercept_df
-    )
-
-    # Attributes
-    attr(result_obj, "has_random_effects")       <- use_random_effects
-    attr(result_obj, "random_intercept_var")     <- random_intercept_var
-    attr(result_obj, "predictor_tested")         <- current_predictor
-    attr(result_obj, "model_type_used")          <- model_type
-    attr(result_obj, "formula")                  <- formula_string_current
-    attr(result_obj, "has_interactions")         <- length(interaction_terms) > 0
-    attr(result_obj, "interaction_terms")        <- if (length(interaction_terms) > 0) interaction_terms else NULL
-    attr(result_obj, "has_splines")              <- length(spline_terms_detected) > 0
-    attr(result_obj, "spline_terms")             <- if (length(spline_terms_detected) > 0) spline_terms_detected else NULL
-    attr(result_obj, "has_polynomials")          <- length(poly_terms_detected) > 0
-    attr(result_obj, "polynomial_terms")         <- if (length(poly_terms_detected) > 0) poly_terms_detected else NULL
-    attr(result_obj, "imputations")              <- actual_imps
-    attr(result_obj, "n_imp")                    <- length(actual_imps)
-    attr(result_obj, "stratified_intercept_var") <- stratified_intercept_var
-
-    # Store models + performance + fit_log
-    attr(result_obj, "models")              <- current_models_list
-    attr(result_obj, "performance_per_imp") <- performance_per_imp
-    attr(result_obj, "fit_log")             <- fit_log_df
-
-    # Variance components (for info)
-    if (use_random_effects && !is.null(current_models_list) && length(current_models_list) > 0) {
-      model1 <- current_models_list[[1]]
-      if (inherits(model1, "glmmTMB")) {
-        re_var <- tryCatch({ as.data.frame(glmmTMB::VarCorr(model1)$cond)[1, "vcov"] }, error = function(e) NA)
-        attr(result_obj, "variance_components") <- re_var
-      } else if (model_type == "cox" && !is.null(model1$vcoef)) {
-        var_comp <- as.numeric(model1$vcoef)
-        names(var_comp) <- "Var(Random Intercept)"
-        attr(result_obj, "variance_components") <- var_comp
-      } else if (inherits(model1, "merMod")) {
-        var_comp <- as.data.frame(lme4::VarCorr(model1))
-        var_comp <- setNames(var_comp$vcov, paste0("Var(", var_comp$grp, ")"))
-        attr(result_obj, "variance_components") <- var_comp
-        if (model_type == "lm") {
-          tau2   <- var_comp[1]
-          sigma2 <- attr(lme4::VarCorr(model1), "sc")^2
-          ICC    <- tau2 / (tau2 + sigma2)
-          attr(result_obj, "ICC") <- ICC
-        }
-      }
-    }
-
-    result_obj
-  }
-
-  ## ---- Main loop ----
-  if (length(predictor_vars) == 1) {
-    message("Fitting model for predictor: ", predictor_vars[1])
-    return(fit_model_for_predictor(predictor_vars[1]))
   } else {
-    results_list <- vector("list", length(predictor_vars))
-    names(results_list) <- predictor_vars
-    for (i in seq_along(predictor_vars)) {
-      current_predictor <- predictor_vars[i]
-      message("Fitting model for predictor: ", current_predictor)
-      results_list[[i]] <- fit_model_for_predictor(current_predictor)
+    # Use mice::pool for standard GLM / Cox
+    if (!requireNamespace("mice", quietly = TRUE)) {
+      stop("Package 'mice' is required to pool non-mixed models.")
     }
-    class(results_list) <- c("IPD_one_stage_multi", "list")
-    attr(results_list, "covariables")  <- covariables
-    attr(results_list, "predictors")   <- predictor_vars
-    attr(results_list, "model_type")   <- model_type
-    attr(results_list, "n_predictors") <- length(predictor_vars)
-    return(results_list)
+    ok_models_clean <- Filter(Negate(is.null), models_list)
+    pooled <- mice::pool(ok_models_clean)
+    Results <- summary(pooled, conf.int = TRUE, exponentiate = FALSE)
+    # ensure cols names
+    if (!"term" %in% names(Results)) {
+      Results$term <- rownames(Results)
+    }
+    Results <- Results[, c("term", "estimate", "std.error", "2.5 %", "97.5 %", "p.value")]
   }
+
+  ## ------------------------------------------------------------
+  ## Exponentiate (for interpretability)
+  ## ------------------------------------------------------------
+  Results$exp_estimate   <- exp(Results$estimate)
+  Results$exp_CI95_lower <- exp(Results$`2.5 %`)
+  Results$exp_CI95_upper <- exp(Results$`97.5 %`)
+
+  ## ------------------------------------------------------------
+  ## Flags for interaction / spline / polynomial (simple)
+  ## ------------------------------------------------------------
+  if (highlight_interactions) {
+    Results$is_interaction <- grepl(":", Results$term)
+  } else {
+    Results$is_interaction <- FALSE
+  }
+  Results$is_spline      <- FALSE
+  Results$is_polynomial  <- grepl("poly\\(", Results$term)
+
+  ## ------------------------------------------------------------
+  ## Split intercept vs other terms (including stratified intercepts)
+  ## ------------------------------------------------------------
+  pattern_strata <- if (!is.null(stratified_intercept_var)) {
+    paste0("^as\\.factor\\(", stratified_intercept_var, "\\)")
+  } else {
+    NULL
+  }
+
+  is_intercept_row <- Results$term == "(Intercept)"
+  is_strata_row <- if (!is.null(pattern_strata)) {
+    grepl(pattern_strata, Results$term)
+  } else {
+    rep(FALSE, nrow(Results))
+  }
+
+  Intercept_table <- Results[is_intercept_row | is_strata_row, , drop = FALSE]
+  Table_no_int    <- Results[!(is_intercept_row | is_strata_row), , drop = FALSE]
+
+  ## ------------------------------------------------------------
+  ## Optional: weighted intercept across strata
+  ## ------------------------------------------------------------
+  Weighted_intercept <- NULL
+
+  if (isTRUE(weighted_intercept) && !is.null(stratified_intercept_var)) {
+    if (nrow(Intercept_table) > 0 && nrow(data) > 0) {
+      # 1) weights by number of subjects per stratum
+      strat_fac <- as.factor(data[[stratified_intercept_var]])
+      strat_fac <- droplevels(strat_fac)
+
+      N_by_stratum <- as.data.frame(table(strat_fac), stringsAsFactors = FALSE)
+      colnames(N_by_stratum) <- c("level", "N")
+      N_by_stratum$w <- N_by_stratum$N / sum(N_by_stratum$N)
+
+      # 2) base intercept
+      beta0 <- Intercept_table$estimate[Intercept_table$term == "(Intercept)"]
+      if (length(beta0) == 0L) beta0 <- 0
+
+      # 3) strata dummy coefficients
+      if (!is.null(pattern_strata)) {
+        strata_coefs <- Results[grepl(pattern_strata, Results$term),
+                                c("term", "estimate"), drop = FALSE]
+        if (nrow(strata_coefs) > 0L) {
+          strata_coefs$level <- sub(pattern_strata, "", strata_coefs$term)
+        } else {
+          strata_coefs <- data.frame(level = character(0),
+                                     estimate = numeric(0))
+        }
+      } else {
+        strata_coefs <- data.frame(level = character(0),
+                                   estimate = numeric(0))
+      }
+
+      # 4) merge and fill missing with 0 (baseline level)
+      merged <- merge(N_by_stratum, strata_coefs,
+                      by = "level", all.x = TRUE)
+      merged$estimate[is.na(merged$estimate)] <- 0
+
+      # 5) level-specific intercepts
+      merged$beta_level <- beta0 + merged$estimate
+
+      # 6) weighted intercept
+      beta_w <- sum(merged$w * merged$beta_level)
+
+      Weighted_intercept <- data.frame(
+        term           = paste0("(Intercept)_weighted_", stratified_intercept_var),
+        estimate       = beta_w,
+        std.error      = NA_real_,
+        `2.5 %`        = NA_real_,
+        `97.5 %`       = NA_real_,
+        p.value        = NA_real_,
+        exp_estimate   = exp(beta_w),
+        exp_CI95_lower = NA_real_,
+        exp_CI95_upper = NA_real_,
+        is_interaction = FALSE,
+        is_spline      = FALSE,
+        is_polynomial  = FALSE,
+        stringsAsFactors = FALSE,
+        check.names      = FALSE
+      )
+    }
+  }
+
+  ## ------------------------------------------------------------
+  ## Optional: performance metrics per imputation
+  ## ------------------------------------------------------------
+  performance_per_imp <- NULL
+  if (isTRUE(model_performance)) {
+    if (!requireNamespace("performance", quietly = TRUE)) {
+      warning("model_performance = TRUE, but package 'performance' is not installed. Skipping performance metrics.")
+    } else {
+      performance_per_imp <- lapply(seq_along(models_list), function(i) {
+        m <- models_list[[i]]
+        if (is.null(m)) return(NULL)
+        tryCatch(
+          performance::model_performance(m),
+          error = function(e) NULL
+        )
+      })
+      names(performance_per_imp) <- paste0("imp_", actual_imps)
+    }
+  }
+
+  ## ------------------------------------------------------------
+  ## Build return object
+  ## ------------------------------------------------------------
+  out <- list(
+    table             = Table_no_int,
+    term              = Table_no_int$term,
+    Intercept         = Intercept_table,
+    Weighted_intercept = Weighted_intercept
+  )
+
+  class(out) <- c("IPD_one_stage", "list")
+
+  # Attach attributes (to keep your old usage working)
+  attr(out, "fit_log")            <- fit_log
+  attr(out, "models")             <- models_list
+  attr(out, "performance_per_imp")<- performance_per_imp
+  attr(out, "model_type")         <- model_type
+  attr(out, "formula")            <- formula_str
+  attr(out, "imputations")        <- actual_imps
+  attr(out, "n_imp")              <- length(actual_imps)
+  attr(out, "has_random_effects") <- use_random_effects
+  attr(out, "random_intercept_var")   <- random_intercept_var
+  attr(out, "stratified_intercept_var") <- stratified_intercept_var
+
+  out
 }
