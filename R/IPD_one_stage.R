@@ -105,12 +105,11 @@ IPD_one_stage <- function(data,
                           formula_string = NULL,
                           highlight_interactions = TRUE,
                           performance_index = NULL) {
+
   ## ------------------------------ Flags & packages ------------------------------
   use_random_effects <- !is.null(random_intercept_var)
   use_strata         <- !is.null(stratified_intercept_var)
 
-  # we’ll use the attached packages (typical for analysis scripts);
-  # for a CRAN package you’d replace with Imports + ::
   require(dplyr)
   require(MASS)
   require(mice)
@@ -192,7 +191,6 @@ IPD_one_stage <- function(data,
 
   ## ------------------------------ Helpers ------------------------------
 
-  # Optional: extract variables from interaction terms like "A*B"
   extract_vars_from_terms <- function(terms) {
     all_vars <- character(0)
     for (term in terms) {
@@ -207,7 +205,6 @@ IPD_one_stage <- function(data,
     unique(all_vars)
   }
 
-  # Expand "*" into ":" terms for interactions if needed
   expand_terms <- function(term) {
     if (grepl("\\*", term)) {
       vars_split <- trimws(unlist(strsplit(term, "\\*")))
@@ -218,7 +215,6 @@ IPD_one_stage <- function(data,
     } else term
   }
 
-  # Check predictor / covariable presence (when no custom formula)
   if (is.null(formula_string)) {
     non_empty_predictors <- predictor_vars[predictor_vars != "" &
                                              !is.na(predictor_vars) &
@@ -241,7 +237,6 @@ IPD_one_stage <- function(data,
     }
   }
 
-  # random term builder
   build_random_term_core <- function(rs_vars) {
     if (!use_random_effects) return("")
     rs_vars <- unique(rs_vars)
@@ -250,7 +245,6 @@ IPD_one_stage <- function(data,
 
     if (length(rs_vars) == 0) {
       if (same_group_as_strata) {
-        # same grouping as strata, no random intercept (stratified-only)
         return("")
       } else {
         return(paste0("+ (1 | ", random_intercept_var, ")"))
@@ -283,7 +277,6 @@ IPD_one_stage <- function(data,
     build_random_term_core(rs_vars)
   }
 
-  # Build formula for each predictor
   build_formula_for_predictor <- function(current_predictor) {
     offset_term <- if (followup_offset == "Yes") paste("+ offset(log(", followup_col, "))", sep = "") else ""
     strat_glm_piece <- ""
@@ -298,7 +291,6 @@ IPD_one_stage <- function(data,
     }
 
     if (is.null(formula_string)) {
-      # automatic build
       if (!is.null(covariables)) {
         expanded_covariables <- unique(unlist(lapply(covariables, expand_terms)))
       } else {
@@ -308,7 +300,6 @@ IPD_one_stage <- function(data,
       covariables_in_model <- covariables
 
       if (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor)) {
-        # null model
         all_terms <- expanded_covariables
       } else {
         expanded_predictor <- expand_terms(current_predictor)
@@ -333,7 +324,6 @@ IPD_one_stage <- function(data,
                              offset_term, strat_glm_piece, random_term)
       }
     } else {
-      # user-supplied formula_string; we just wrap and add strata/random bits if needed
       formula_str <- formula_string
 
       all_rs_vars <- unique(c(
@@ -379,8 +369,6 @@ IPD_one_stage <- function(data,
   }
 
   ## -------------------------- Performance helper --------------------------
-  # performance_index can be NULL or subset of:
-  # c("Log_lik","AIC","AICc","BIC","BICc","RMSE","C_index")
   if (!is.null(performance_index)) {
     allowed_perf <- c("Log_lik","AIC","AICc","BIC","BICc","RMSE","C_index")
     if (!all(performance_index %in% allowed_perf)) {
@@ -394,7 +382,6 @@ IPD_one_stage <- function(data,
     res <- setNames(as.list(rep(NA_real_, length(perf_names))), perf_names)
     if (is.null(m)) return(res)
 
-    # sample size & number of parameters for AICc/BICc
     n <- tryCatch(stats::nobs(m), error = function(e) NA_integer_)
     k <- tryCatch(length(stats::coef(m)), error = function(e) NA_integer_)
 
@@ -425,7 +412,6 @@ IPD_one_stage <- function(data,
         tryCatch(stats::BIC(m), error = function(e) NA_real_)
       }
       if (!is.na(bic_val)) {
-        # simple corrected BIC; not universally standard but reasonable
         res[["BICc"]] <- bic_val + (k * (k + 1)) / (n - k - 1)
       }
     }
@@ -465,7 +451,6 @@ IPD_one_stage <- function(data,
     formula_string_current <- build_formula_for_predictor(current_predictor)
     model_formula <- as.formula(formula_string_current)
 
-    # pick up interaction terms just for flags
     interaction_terms <- character(0)
     if (grepl(":", formula_string_current)) {
       terms_part <- strsplit(formula_string_current, "~")[[1]][2]
@@ -533,23 +518,19 @@ IPD_one_stage <- function(data,
         stop("All models failed to fit in IPD_one_stage (random-effects block).")
       }
 
-      # --- relaxed coefficient extraction ---
       coefs <- lapply(current_models_list, function(m) {
         if (is.null(m)) return(NULL)
 
-        # initialize
         c_est <- NULL
         c_se  <- NULL
 
         if (model_type == "cox") {
-          # coxme: fixed effects via fixef; vcov may fail
           c_est <- tryCatch(coef(m), error = function(e) NULL)
           if (is.null(c_est)) return(NULL)
           c_se <- tryCatch({
             v <- as.matrix(vcov(m))
             sqrt(diag(v))
           }, error = function(e) {
-            # last-resort: NA SE
             rep(NA_real_, length(c_est))
           })
 
@@ -561,7 +542,6 @@ IPD_one_stage <- function(data,
             v <- glmmTMB::vcov(m)$cond
             sqrt(diag(v))
           }, error = function(e) {
-            # fallback to summary
             s <- tryCatch(summary(m), error = function(e2) NULL)
             if (!is.null(s) && !is.null(s$coefficients$cond)) {
               se_vec <- s$coefficients$cond[, "Std. Error"]
@@ -577,7 +557,6 @@ IPD_one_stage <- function(data,
             s <- summary(m)
             s$coefficients[, "Std. Error"]
           }, error = function(e) {
-            # fallback to vcov
             tryCatch({
               v <- as.matrix(vcov(m))
               sqrt(diag(v))
@@ -587,7 +566,6 @@ IPD_one_stage <- function(data,
           })
 
         } else {
-          # just in case we get a plain glm here
           c_est <- tryCatch(stats::coef(m), error = function(e) NULL)
           if (is.null(c_est)) return(NULL)
           c_se  <- tryCatch({
@@ -611,7 +589,6 @@ IPD_one_stage <- function(data,
         stop("No usable coefficient table could be extracted for any imputation (random-effects block).")
       }
 
-      # pooled results using relaxed Rubin (allows NA SE, uses subset)
       all_terms <- unique(unlist(lapply(coefs, function(df) df$term)))
       pooled_results <- data.frame(
         term      = all_terms,
@@ -621,7 +598,6 @@ IPD_one_stage <- function(data,
       )
 
       for (term in all_terms) {
-        # gather estimates and SEs (some SE may be NA)
         term_ests <- sapply(coefs, function(df) {
           if (term %in% df$term) df$estimate[df$term == term] else NA_real_
         })
@@ -644,7 +620,6 @@ IPD_one_stage <- function(data,
           T_var <- U_bar + (1 + 1/m) * B
           pooled_se <- sqrt(T_var)
         } else {
-          # not enough SE information; keep estimate, SE unknown
           pooled_se <- NA_real_
         }
 
@@ -718,55 +693,67 @@ IPD_one_stage <- function(data,
       names(performance_per_imp) <- paste0("imp_", actual_imps)
     }
 
-    ## ------------------------ Post-processing results table ------------------------
+    ## ------------------------ Post-processing & splitting intercept ------------------------
     Results_multivariate_analysis <- Results_multivariate_analysis %>%
       mutate(
         exp_estimate   = exp(estimate),
         exp_CI95_lower = exp(`2.5 %`),
         exp_CI95_upper = exp(`97.5 %`)
-      ) %>%
-      dplyr::select(term, estimate, std.error, `2.5 %`, `97.5 %`,
-                    exp_estimate, exp_CI95_lower, exp_CI95_upper, p.value)
-
-    # Null model row
-    if (is_null_model) {
-      null_row <- data.frame(
-        term = "No_predictor",
-        estimate = NA, std.error = NA, `2.5 %` = NA, `97.5 %` = NA,
-        exp_estimate = NA, exp_CI95_lower = NA, exp_CI95_upper = NA, p.value = NA,
-        stringsAsFactors = FALSE, check.names = FALSE
       )
-      Results_multivariate_analysis <- rbind(null_row, Results_multivariate_analysis)
-    }
 
-    # Interaction / spline / polynomial flags (minimal)
+    # interaction / poly flags first (so intercept rows also get correct flags if needed)
     if (highlight_interactions && length(interaction_terms) > 0) {
       Results_multivariate_analysis <- Results_multivariate_analysis %>%
         mutate(is_interaction = grepl(":", term))
     } else {
       Results_multivariate_analysis$is_interaction <- FALSE
     }
-    Results_multivariate_analysis$is_spline      <- FALSE
-    Results_multivariate_analysis$is_polynomial  <- grepl("poly\\(", Results_multivariate_analysis$term)
+    Results_multivariate_analysis$is_spline     <- FALSE
+    Results_multivariate_analysis$is_polynomial <- grepl("poly\\(", Results_multivariate_analysis$term)
 
-    ## ------------------------ Attributes ------------------------
-    attr(Results_multivariate_analysis, "has_random_effects")    <- use_random_effects
-    attr(Results_multivariate_analysis, "random_intercept_var")  <- random_intercept_var
-    attr(Results_multivariate_analysis, "predictor_tested")      <- current_predictor
-    attr(Results_multivariate_analysis, "model_type_used")       <- model_type
-    attr(Results_multivariate_analysis, "formula")               <- formula_string_current
-    attr(Results_multivariate_analysis, "has_interactions")      <- length(interaction_terms) > 0
-    attr(Results_multivariate_analysis, "interaction_terms")     <- if (length(interaction_terms) > 0) interaction_terms else NULL
-    attr(Results_multivariate_analysis, "imputations")           <- actual_imps
-    attr(Results_multivariate_analysis, "n_imp")                 <- length(actual_imps)
-    attr(Results_multivariate_analysis, "stratified_intercept_var") <- stratified_intercept_var
+    # split intercept vs non-intercept
+    intercept_idx <- grepl("\\(Intercept\\)", Results_multivariate_analysis$term, fixed = FALSE)
+    intercept_df  <- Results_multivariate_analysis[intercept_idx, , drop = FALSE]
+    coef_df       <- Results_multivariate_analysis[!intercept_idx, , drop = FALSE]
 
-    # Store models, performance, and fit_log
-    attr(Results_multivariate_analysis, "models")              <- current_models_list
-    attr(Results_multivariate_analysis, "performance_per_imp") <- performance_per_imp
-    attr(Results_multivariate_analysis, "fit_log")             <- fit_log
+    # Null-model row goes into the coefficient table (not in intercepts)
+    if (is_null_model) {
+      null_row <- data.frame(
+        term = "No_predictor",
+        estimate = NA, std.error = NA, `2.5 %` = NA, `97.5 %` = NA,
+        exp_estimate = NA, exp_CI95_lower = NA, exp_CI95_upper = NA, p.value = NA,
+        is_interaction = FALSE,
+        is_spline      = FALSE,
+        is_polynomial  = FALSE,
+        stringsAsFactors = FALSE,
+        check.names = FALSE
+      )
+      coef_df <- rbind(null_row, coef_df)
+    }
 
-    Results_multivariate_analysis
+    ## ------------------------ Build final object ------------------------
+    result_obj <- list(
+      table     = coef_df,               # main coefficient table (no intercepts)
+      term      = coef_df$term,          # convenience: vector of term names (no intercepts)
+      Intercept = intercept_df           # full rows for intercept(s)
+    )
+
+    attr(result_obj, "has_random_effects")       <- use_random_effects
+    attr(result_obj, "random_intercept_var")     <- random_intercept_var
+    attr(result_obj, "predictor_tested")         <- current_predictor
+    attr(result_obj, "model_type_used")          <- model_type
+    attr(result_obj, "formula")                  <- formula_string_current
+    attr(result_obj, "has_interactions")         <- length(interaction_terms) > 0
+    attr(result_obj, "interaction_terms")        <- if (length(interaction_terms) > 0) interaction_terms else NULL
+    attr(result_obj, "imputations")              <- actual_imps
+    attr(result_obj, "n_imp")                    <- length(actual_imps)
+    attr(result_obj, "stratified_intercept_var") <- stratified_intercept_var
+
+    attr(result_obj, "models")              <- current_models_list
+    attr(result_obj, "performance_per_imp") <- performance_per_imp
+    attr(result_obj, "fit_log")             <- fit_log
+
+    result_obj
   }
 
   ## ------------------------ Main loop over predictors ------------------------
@@ -787,16 +774,15 @@ IPD_one_stage <- function(data,
   if (length(predictor_vars) == 1) {
     return(results_list[[1]])
   } else {
-    # combined table with main effect rows for each predictor
     combined_results <- data.frame()
     for (pred_name in names(results_list)) {
       result <- results_list[[pred_name]]
-      if (is.null(result) || nrow(result) == 0) next
+      if (is.null(result$table) || nrow(result$table) == 0) next
       if (pred_name == "No_predictor") {
-        predictor_rows <- result[result$term == "No_predictor", ]
+        predictor_rows <- result$table[result$table$term == "No_predictor", ]
       } else {
-        predictor_rows <- result[grepl(paste0("^", pred_name), result$term) &
-                                   !grepl("Intercept", result$term), ]
+        predictor_rows <- result$table[grepl(paste0("^", pred_name), result$table$term) &
+                                         !grepl("Intercept", result$table$term), ]
       }
       if (nrow(predictor_rows) > 0) {
         predictor_rows <- predictor_rows[, c("term","estimate","std.error","2.5 %","97.5 %",
