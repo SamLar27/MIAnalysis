@@ -346,10 +346,10 @@ IPD_two_stage <- function(data,
     trial_effects <- coefs_term %>%
       dplyr::group_by(.data$trial) %>%
       dplyr::summarise(
-        M_imp = dplyr::n(),
-        Q_bar = mean(.data$estimate, na.rm = TRUE),
-        U_bar = mean(.data$std.error^2, na.rm = TRUE),
-        B_raw = stats::var(.data$estimate, na.rm = TRUE),
+        M_imp   = dplyr::n(),
+        Q_bar   = mean(.data$estimate, na.rm = TRUE),
+        U_bar   = mean(.data$std.error^2, na.rm = TRUE),
+        B_raw   = stats::var(.data$estimate, na.rm = TRUE),
         .groups = "drop"
       ) %>%
       dplyr::mutate(
@@ -940,8 +940,6 @@ IPD_two_stage <- function(data,
     df_term <- df_term[is.finite(df_term$SE_mi) & df_term$SE_mi > 0, , drop = FALSE]
     if (nrow(df_term) < 1L) return(NULL)
 
-    term_name <- df_term$term[1]
-
     meta_fit <- tryCatch(
       metafor::rma(
         yi     = df_term$Q_bar,
@@ -976,7 +974,7 @@ IPD_two_stage <- function(data,
     }
 
     data.frame(
-      term           = term_name,
+      term           = df_term$term[1],
       estimate       = est,
       std.error      = se,
       `2.5 %`        = ci_low,
@@ -985,11 +983,7 @@ IPD_two_stage <- function(data,
       exp_estimate   = exp_est,
       exp_CI95_lower = exp_low,
       exp_CI95_upper = exp_high,
-      is_interaction = grepl(":", term_name, fixed = TRUE),
-      is_spline      = FALSE,
-      is_polynomial  = grepl("^poly\\(", term_name),
-      stringsAsFactors = FALSE,
-      check.names    = FALSE
+      stringsAsFactors = FALSE
     )
   }
 
@@ -1051,9 +1045,6 @@ IPD_two_stage <- function(data,
                                    model_type = model_type,
                                    meta_method = meta_method)
       if (!is.null(global_row)) {
-        # ensure term name is "(Intercept)"
-        global_row$term <- "(Intercept)"
-
         # per-trial intercept rows
         intercept_trials <- intercept_effects
 
@@ -1087,33 +1078,12 @@ IPD_two_stage <- function(data,
             exp_CI95_upper = if (model_type %in% c("nb", "poisson",
                                                    "quasipoisson",
                                                    "binomial"))
-              exp(.data$`97.5 %`) else NA_real_,
-            is_interaction = FALSE,
-            is_spline      = FALSE,
-            is_polynomial  = FALSE
+              exp(.data$`97.5 %`) else NA_real_
           ) %>%
-          dplyr::select(
-            .data$term, .data$estimate, .data$std.error,
-            `2.5 %`, `97.5 %`,
-            .data$p.value, .data$exp_estimate,
-            .data$exp_CI95_lower, .data$exp_CI95_upper,
-            .data$is_interaction, .data$is_spline, .data$is_polynomial
-          )
-
-        # add boolean columns to global_row for consistency
-        global_row$is_interaction <- FALSE
-        global_row$is_spline      <- FALSE
-        global_row$is_polynomial  <- FALSE
-
-        # re-order columns like intercept_trials
-        global_row <- global_row %>%
-          dplyr::select(
-            .data$term, .data$estimate, .data$std.error,
-            `2.5 %`, `97.5 %`,
-            .data$p.value, .data$exp_estimate,
-            .data$exp_CI95_lower, .data$exp_CI95_upper,
-            .data$is_interaction, .data$is_spline, .data$is_polynomial
-          )
+          dplyr::select(.data$term, .data$estimate, .data$std.error,
+                        `2.5 %`, `97.5 %`,
+                        .data$p.value, .data$exp_estimate,
+                        .data$exp_CI95_lower, .data$exp_CI95_upper)
 
         intercept_df <- dplyr::bind_rows(global_row, intercept_trials)
 
@@ -1126,6 +1096,14 @@ IPD_two_stage <- function(data,
   ## ------------------------------------------------------------------
   ## 5) Build final object
   ## ------------------------------------------------------------------
+
+  # pooled performance (if available)
+  pooled_perf <- if (!is.null(performance_per_imp)) {
+    pool_IPD_two_stage_performance_inner(performance_per_imp)
+  } else {
+    NULL
+  }
+
   out <- list(
     call                = match.call(),
     formula             = form_global,
@@ -1144,19 +1122,10 @@ IPD_two_stage <- function(data,
     trial_levels        = trial_levels,
     table               = pooled_table,
     Intercept           = intercept_df,
-    Weighted_intercept  = weighted_intercept_df
+    Weighted_intercept  = weighted_intercept_df,
+    Pooled_performance  = pooled_perf,
+    perf_pool           = pooled_perf  # backward compatibility
   )
-
-  # Pooled performance (always, if available)
-  if (!is.null(performance_per_imp)) {
-    pooled_perf <- pool_IPD_two_stage_performance_inner(performance_per_imp)
-    out$Pooled_performance <- pooled_perf
-    # backward compatibility
-    out$perf_pool <- pooled_perf
-  } else {
-    out$Pooled_performance <- NULL
-    out$perf_pool <- NULL
-  }
 
   ## ------------------------------------------------------------------
   ## 6) Optional: pooled main term + forest plot
