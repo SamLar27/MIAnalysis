@@ -940,6 +940,8 @@ IPD_two_stage <- function(data,
     df_term <- df_term[is.finite(df_term$SE_mi) & df_term$SE_mi > 0, , drop = FALSE]
     if (nrow(df_term) < 1L) return(NULL)
 
+    term_name <- df_term$term[1]
+
     meta_fit <- tryCatch(
       metafor::rma(
         yi     = df_term$Q_bar,
@@ -974,16 +976,20 @@ IPD_two_stage <- function(data,
     }
 
     data.frame(
-      term          = df_term$term[1],
-      estimate      = est,
-      std.error     = se,
-      `2.5 %`       = ci_low,
-      `97.5 %`      = ci_high,
-      p.value       = p,
-      exp_estimate  = exp_est,
+      term           = term_name,
+      estimate       = est,
+      std.error      = se,
+      `2.5 %`        = ci_low,
+      `97.5 %`       = ci_high,
+      p.value        = p,
+      exp_estimate   = exp_est,
       exp_CI95_lower = exp_low,
       exp_CI95_upper = exp_high,
-      stringsAsFactors = FALSE
+      is_interaction = grepl(":", term_name, fixed = TRUE),
+      is_spline      = FALSE,
+      is_polynomial  = grepl("^poly\\(", term_name),
+      stringsAsFactors = FALSE,
+      check.names    = FALSE
     )
   }
 
@@ -1045,6 +1051,9 @@ IPD_two_stage <- function(data,
                                    model_type = model_type,
                                    meta_method = meta_method)
       if (!is.null(global_row)) {
+        # ensure term name is "(Intercept)"
+        global_row$term <- "(Intercept)"
+
         # per-trial intercept rows
         intercept_trials <- intercept_effects
 
@@ -1078,12 +1087,33 @@ IPD_two_stage <- function(data,
             exp_CI95_upper = if (model_type %in% c("nb", "poisson",
                                                    "quasipoisson",
                                                    "binomial"))
-              exp(.data$`97.5 %`) else NA_real_
+              exp(.data$`97.5 %`) else NA_real_,
+            is_interaction = FALSE,
+            is_spline      = FALSE,
+            is_polynomial  = FALSE
           ) %>%
-          dplyr::select(.data$term, .data$estimate, .data$std.error,
-                        `2.5 %`, `97.5 %`,
-                        .data$p.value, .data$exp_estimate,
-                        .data$exp_CI95_lower, .data$exp_CI95_upper)
+          dplyr::select(
+            .data$term, .data$estimate, .data$std.error,
+            `2.5 %`, `97.5 %`,
+            .data$p.value, .data$exp_estimate,
+            .data$exp_CI95_lower, .data$exp_CI95_upper,
+            .data$is_interaction, .data$is_spline, .data$is_polynomial
+          )
+
+        # add boolean columns to global_row for consistency
+        global_row$is_interaction <- FALSE
+        global_row$is_spline      <- FALSE
+        global_row$is_polynomial  <- FALSE
+
+        # re-order columns like intercept_trials
+        global_row <- global_row %>%
+          dplyr::select(
+            .data$term, .data$estimate, .data$std.error,
+            `2.5 %`, `97.5 %`,
+            .data$p.value, .data$exp_estimate,
+            .data$exp_CI95_lower, .data$exp_CI95_upper,
+            .data$is_interaction, .data$is_spline, .data$is_polynomial
+          )
 
         intercept_df <- dplyr::bind_rows(global_row, intercept_trials)
 
