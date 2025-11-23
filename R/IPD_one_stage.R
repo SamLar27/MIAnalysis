@@ -1,10 +1,9 @@
-#' One-stage IPD model fitting on multiply imputed data
+#' IPD One-Stage Modelling on Multiply Imputed Data
 #'
-#' Fits regression models to multiply imputed individual patient data (IPD)
-#' and pools results across imputations using Rubin's rules.
-#'
-#' Supports GLM, mixed models (via \pkg{lme4} / \pkg{glmmTMB} / \pkg{coxme}),
-#' interaction terms, restricted cubic splines (rcs) and polynomial terms.
+#' Fits models to multiply imputed datasets and pools results using Rubin's Rules.
+#' Supports GLM, mixed models (via lme4 / glmmTMB / coxme), interactions,
+#' restricted cubic splines (rcs) and polynomial terms. Designed for IPD
+#' one-stage analyses with optional random effects / stratified intercepts.
 #'
 #' Intercept / slope structure is inferred automatically:
 #'   - If `stratified_intercept_var` is provided:
@@ -25,9 +24,27 @@
 #'       * `spline_knots_percentile`: numeric vector of percentiles (e.g. c(10,35,65,90)),
 #'         applied to the whole distribution of each variable, OR
 #'       * `spline_knots_n`: number of knots; default percentiles are spread between 5 and 95.
-#'   - If \pkg{rms} is installed, uses `rms::rcs()`; otherwise falls back to `splines::bs()`.
+#'   - If `rms` is installed, uses `rms::rcs()`; otherwise falls back to `splines::bs()`.
 #'   - The spline coefficients in the output are renamed as:
 #'       `<var>_rcs_linear`, `<var>_rcs_nl1`, `<var>_rcs_nl2`, ...
+#'
+#' Polynomial terms:
+#'   - Use `poly_terms` and `poly_degree` (2 or 3).
+#'   - Internally uses `poly(var, degree, raw = TRUE)`.
+#'
+#' Performance indices:
+#'   - Controlled by `performance_index`, which can be:
+#'       * NULL (no performance metrics computed)
+#'       * Any subset of:
+#'         `c("Log_lik","AIC","AICc","BIC","BICc","RMSE","C_index")`
+#'   - Metrics are computed per imputation using base R:
+#'       * `Log_lik` : `logLik()`
+#'       * `AIC`     : `AIC()`
+#'       * `AICc`    : small-sample correction from AIC, using `nobs()` and df
+#'       * `BIC`     : `BIC()`
+#'       * `BICc`    : simple corrected BIC (approximate)
+#'       * `RMSE`    : sqrt(mean((y - fitted)^2)), for non-Cox models
+#'       * `C_index` : `survival::concordance()` (C-index) for Cox models (when supported)
 #'
 #' @param data Data frame with all imputations stacked.
 #' @param outcome_var Dependent variable (for non-Cox models).
@@ -35,8 +52,8 @@
 #' @param covariables Character vector of covariables (always included as fixed effects).
 #' @param imp_col Column name indicating imputation index (default ".imp").
 #' @param imp_n Number of imputations (if NULL, detected automatically).
-#' @param model_type One of "nb","lm","bin","poisson","gamma","quasipoisson",
-#'   "quasibinomial","cox".
+#' @param model_type One of: "nb","lm","bin","poisson","gamma",
+#'   "quasipoisson","quasibinomial","cox".
 #' @param followup_offset "Yes"/"No" – whether to include offset(log(followup_col)).
 #' @param followup_col Name of follow-up duration column if offset used.
 #' @param trial_factor "Yes"/"No" – include trial as fixed factor.
@@ -44,35 +61,30 @@
 #' @param time_col Time variable for Cox models.
 #' @param event_col Event variable for Cox models.
 #' @param formula_string Optional custom formula (overrides automatic building).
-#' @param highlight_interactions Logical; add flags for interactions/splines/polynomials.
+#' @param highlight_interactions Logical, add flags for interactions/splines/polynomials.
 #' @param spline_terms Character vector of variable names for rcs() / bs() terms.
 #' @param spline_knots_n Number of knots (if percentiles are not given).
 #' @param spline_knots_percentile Numeric vector of percentiles for knots (0–100).
 #' @param poly_terms Character vector of variables with polynomial terms.
 #' @param poly_degree Scalar or vector (2 or 3) giving polynomial degree(s).
-#' @param include_poly_terms Logical; keep polynomial basis terms (default TRUE).
+#' @param include_poly_terms Logical, keep polynomial basis terms (default TRUE).
 #' @param random_intercept_var Grouping variable for random effects (NULL = no random effects).
 #' @param predictor_vars_random_slope Character vector of predictors with random slope.
 #' @param covariables_random_slope Character vector of covariables with random slope.
-#' @param stratified_intercept_var Variable defining stratified intercept (GLM) /
-#'   baseline hazard (Cox).
-#' @param model_performance Logical; if TRUE and package \pkg{performance} is available,
-#'   computes \code{performance::model_performance()} for each imputed model and stores the
-#'   list in an attribute \code{"performance_per_imp"}.
+#' @param stratified_intercept_var Variable defining stratified intercept (GLM) / baseline hazard (Cox).
+#' @param performance_index Either NULL (no performance metrics) or a character vector
+#'   with any subset of:
+#'   `c("Log_lik","AIC","AICc","BIC","BICc","RMSE","C_index")`.
 #'
 #' @return
 #'  If one predictor: a data.frame of pooled coefficients with attributes:
-#'    * \code{"models"}              : list of fitted models (one per imputation)
-#'    * \code{"performance_per_imp"} : (optional) list of performance objects per imputation
-#'    * plus other metadata flags.
+#'    - "models"              : list of fitted models (one per imputation)
+#'    - "performance_per_imp" : list of lists with requested performance indices
+#'    - "fit_log"             : data.frame with columns `imp`, `ok`, `error` (one row per imputation)
+#'    - plus other metadata flags.
 #'
-#'  If multiple predictors: a list of such data.frames with class
-#'  \code{"IPD_one_stage_multi"} and attribute \code{"combined_results"}.
-#'
-#' @seealso
-#'  \code{\link[mice]{pool}}, \code{\link[lme4]{lmer}}, \code{\link[lme4]{glmer}},
-#'  \code{\link[glmmTMB]{glmmTMB}}, \code{\link[coxme]{coxme}},
-#'  \code{\link[rms]{rcs}}, \code{\link[splines]{bs}}
+#'  If multiple predictors: list of such data.frames with class "IPD_one_stage_multi"
+#'    and attribute "combined_results".
 #'
 #' @export
 IPD_one_stage <- function(data,
@@ -100,7 +112,7 @@ IPD_one_stage <- function(data,
                           predictor_vars_random_slope = NULL,
                           covariables_random_slope = NULL,
                           stratified_intercept_var = NULL,
-                          model_performance = FALSE) {
+                          performance_index = NULL) {
 
   ## ---- Flags inferred from arguments ----
   use_random_effects <- !is.null(random_intercept_var)
@@ -176,6 +188,15 @@ IPD_one_stage <- function(data,
   if (!use_random_effects &&
       (!is.null(predictor_vars_random_slope) || !is.null(covariables_random_slope))) {
     warning("Random slopes specified but random_intercept_var is NULL. Random slopes will be ignored (no mixed model).")
+  }
+
+  ## ---- Performance index validation ----
+  valid_perf <- c("Log_lik","AIC","AICc","BIC","BICc","RMSE","C_index")
+  if (!is.null(performance_index)) {
+    if (!all(performance_index %in% valid_perf)) {
+      stop("performance_index must be NULL or a subset of: ",
+           paste(valid_perf, collapse = ", "))
+    }
   }
 
   ## ---- Imputations ----
@@ -497,20 +518,20 @@ IPD_one_stage <- function(data,
     is_null_model <- (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor))
 
     current_models_list <- NULL
-    fit_log_current <- NULL   # <--- NEW: will store per-imputation fit status
+    fit_log_df <- data.frame(
+      imp   = actual_imps,
+      ok    = NA,
+      error = NA_character_,
+      stringsAsFactors = FALSE
+    )
 
     if (use_random_effects) {
 
       models_list <- vector("list", imp_n)
-      ok_vec  <- rep(FALSE, imp_n)
-      err_vec <- rep(NA_character_, imp_n)
-
       for (i in seq_along(actual_imps)) {
         data_i <- implist[[i]]
-        ok_vec[i]  <- TRUE
-        err_vec[i] <- NA_character_
         models_list[[i]] <- tryCatch({
-          if (model_type == "lm") {
+          m <- if (model_type == "lm") {
             lme4::lmer(model_formula, data = data_i)
           } else if (model_type %in% c("bin")) {
             lme4::glmer(model_formula, family = binomial(), data = data_i)
@@ -533,23 +554,18 @@ IPD_one_stage <- function(data,
               lme4::glmer(model_formula, family = Gamma, data = data_i)
             }
           } else stop("Unsupported model type for random effects.")
+          fit_log_df$ok[i]    <<- TRUE
+          fit_log_df$error[i] <<- NA_character_
+          m
         }, error = function(e) {
-          ok_vec[i]  <<- FALSE
-          err_vec[i] <<- e$message
           warning(sprintf("Model failed to fit for imputation %s: %s", actual_imps[i], e$message))
+          fit_log_df$ok[i]    <<- FALSE
+          fit_log_df$error[i] <<- e$message
           NULL
         })
       }
 
       current_models_list <- models_list
-
-      # Build fit log for this predictor
-      fit_log_current <- data.frame(
-        imp   = actual_imps,
-        ok    = ok_vec,
-        error = ifelse(ok_vec, NA_character_, err_vec),
-        stringsAsFactors = FALSE
-      )
 
       coefs <- lapply(models_list, function(m) {
         if (is.null(m)) return(NULL)
@@ -606,42 +622,32 @@ IPD_one_stage <- function(data,
     } else {
       # ---- Non-random effects ----
       res_comb <- vector("list", length(actual_imps))
-      ok_vec  <- rep(FALSE, length(actual_imps))
-      err_vec <- rep(NA_character_, length(actual_imps))
-
       for (i in seq_along(actual_imps)) {
         data_subset <- implist[[i]]
-        ok_vec[i]  <- TRUE
-        err_vec[i] <- NA_character_
         res_comb[[i]] <- tryCatch({
-          switch(model_type,
-                 "nb"            = MASS::glm.nb(model_formula, data = data_subset),
-                 "lm"            = glm(model_formula, family = gaussian(), data = data_subset),
-                 "bin"           = glm(model_formula, family = binomial(), data = data_subset),
-                 "poisson"       = glm(model_formula, family = poisson(), data = data_subset),
-                 "gamma"         = glm(model_formula, family = Gamma(), data = data_subset),
-                 "quasipoisson"  = glm(model_formula, family = quasipoisson(), data = data_subset),
-                 "quasibinomial" = glm(model_formula, family = quasibinomial(), data = data_subset),
-                 "cox"           = coxph(model_formula, data = data_subset),
-                 stop("Unsupported model type.")
+          m <- switch(model_type,
+                      "nb"            = MASS::glm.nb(model_formula, data = data_subset),
+                      "lm"            = glm(model_formula, family = gaussian(), data = data_subset),
+                      "bin"           = glm(model_formula, family = binomial(), data = data_subset),
+                      "poisson"       = glm(model_formula, family = poisson(), data = data_subset),
+                      "gamma"         = glm(model_formula, family = Gamma(), data = data_subset),
+                      "quasipoisson"  = glm(model_formula, family = quasipoisson(), data = data_subset),
+                      "quasibinomial" = glm(model_formula, family = quasibinomial(), data = data_subset),
+                      "cox"           = coxph(model_formula, data = data_subset),
+                      stop("Unsupported model type.")
           )
+          fit_log_df$ok[i]    <<- TRUE
+          fit_log_df$error[i] <<- NA_character_
+          m
         }, error = function(e) {
-          ok_vec[i]  <<- FALSE
-          err_vec[i] <<- e$message
           warning(sprintf("Model failed to fit for imputation %s: %s", actual_imps[i], e$message))
+          fit_log_df$ok[i]    <<- FALSE
+          fit_log_df$error[i] <<- e$message
           NULL
         })
       }
 
       current_models_list <- res_comb
-
-      # Build fit log for this predictor
-      fit_log_current <- data.frame(
-        imp   = actual_imps,
-        ok    = ok_vec,
-        error = ifelse(ok_vec, NA_character_, err_vec),
-        stringsAsFactors = FALSE
-      )
 
       ok_models <- Filter(function(x) !is.null(x), res_comb)
       if (length(ok_models) == 0) {
@@ -652,26 +658,101 @@ IPD_one_stage <- function(data,
       Results_multivariate_analysis <- summary(pooled, conf.int = TRUE, exp = FALSE)
     }
 
-    ## ---- Optional performance metrics per imputation ----
+    ## ---- Performance metrics per imputation (optional) ----
     performance_per_imp <- NULL
-    if (model_performance && !is.null(current_models_list)) {
-      if (!requireNamespace("performance", quietly = TRUE)) {
-        warning("model_performance = TRUE, but package 'performance' is not installed. Skipping performance metrics.")
-      } else {
-        performance_per_imp <- lapply(seq_along(current_models_list), function(i) {
-          m <- current_models_list[[i]]
-          if (is.null(m)) return(NULL)
-          tryCatch(
-            performance::model_performance(m),
-            error = function(e) {
-              warning(sprintf("performance::model_performance failed for imputation %s: %s",
-                              actual_imps[i], e$message))
-              NULL
-            }
+    if (!is.null(performance_index) && !is.null(current_models_list)) {
+
+      performance_per_imp <- lapply(seq_along(current_models_list), function(i) {
+
+        m <- current_models_list[[i]]
+        if (is.null(m)) return(NULL)
+
+        out <- list()
+
+        ## ---- Log-likelihood ----
+        if ("Log_lik" %in% performance_index) {
+          out$Log_lik <- tryCatch(
+            as.numeric(logLik(m)),
+            error = function(e) NA_real_
           )
-        })
-        names(performance_per_imp) <- paste0("imp_", actual_imps)
-      }
+        }
+
+        ## ---- AIC ----
+        if ("AIC" %in% performance_index) {
+          out$AIC <- tryCatch(
+            AIC(m),
+            error = function(e) NA_real_
+          )
+        }
+
+        ## ---- AICc ----
+        if ("AICc" %in% performance_index) {
+          out$AICc <- tryCatch(
+            {
+              ll <- logLik(m)
+              k  <- attr(ll, "df")
+              n  <- nobs(m)
+              aic <- AIC(m)
+              aic + (2 * k * (k + 1)) / (n - k - 1)
+            },
+            error = function(e) NA_real_
+          )
+        }
+
+        ## ---- BIC ----
+        if ("BIC" %in% performance_index) {
+          out$BIC <- tryCatch(
+            BIC(m),
+            error = function(e) NA_real_
+          )
+        }
+
+        ## ---- BICc (approximate) ----
+        if ("BICc" %in% performance_index) {
+          out$BICc <- tryCatch(
+            {
+              ll <- logLik(m)
+              k  <- attr(ll, "df")
+              n  <- nobs(m)
+              bic <- BIC(m)
+              bic + (log(n) - 1) * k * (k + 1) / (n - k - 1)
+            },
+            error = function(e) NA_real_
+          )
+        }
+
+        ## ---- RMSE (non-Cox) ----
+        if ("RMSE" %in% performance_index && model_type != "cox") {
+          out$RMSE <- tryCatch(
+            {
+              mf <- stats::model.frame(m)
+              y_obs <- stats::model.response(mf)
+              mu_hat <- fitted(m)
+              sqrt(mean((y_obs - mu_hat)^2, na.rm = TRUE))
+            },
+            error = function(e) NA_real_
+          )
+        }
+
+        ## ---- C-index (Cox only, when supported) ----
+        if ("C_index" %in% performance_index && model_type == "cox") {
+          out$C_index <- tryCatch(
+            {
+              # For coxph, survival::concordance() works directly
+              if (inherits(m, "coxph")) {
+                survival::concordance(m)$concordance
+              } else {
+                NA_real_
+              }
+            },
+            error = function(e) NA_real_
+          )
+        }
+
+        out
+      })
+
+      names(performance_per_imp) <- paste0("imp_", actual_imps)
     }
 
     # exponentiation
@@ -781,10 +862,10 @@ IPD_one_stage <- function(data,
     attr(Results_multivariate_analysis, "n_imp")                    <- length(actual_imps)
     attr(Results_multivariate_analysis, "stratified_intercept_var") <- stratified_intercept_var
 
-    # Store models + performance + fit log
+    # Store models + performance + fit_log
     attr(Results_multivariate_analysis, "models")              <- current_models_list
     attr(Results_multivariate_analysis, "performance_per_imp") <- performance_per_imp
-    attr(Results_multivariate_analysis, "fit_log")             <- fit_log_current
+    attr(Results_multivariate_analysis, "fit_log")             <- fit_log_df
 
     # Variance components (for info)
     if (use_random_effects && !is.null(current_models_list) && length(current_models_list) > 0) {
@@ -812,7 +893,7 @@ IPD_one_stage <- function(data,
     Results_multivariate_analysis
   }
 
-  ## ---- Main loop ----
+  ## ---- Main loop over predictors ----
   results_list <- vector("list", length(predictor_vars))
   names(results_list) <- predictor_vars
   for (i in seq_along(predictor_vars)) {
