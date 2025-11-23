@@ -497,12 +497,18 @@ IPD_one_stage <- function(data,
     is_null_model <- (current_predictor == "" || is.null(current_predictor) || is.na(current_predictor))
 
     current_models_list <- NULL
+    fit_log_current <- NULL   # <--- NEW: will store per-imputation fit status
 
     if (use_random_effects) {
 
       models_list <- vector("list", imp_n)
+      ok_vec  <- rep(FALSE, imp_n)
+      err_vec <- rep(NA_character_, imp_n)
+
       for (i in seq_along(actual_imps)) {
         data_i <- implist[[i]]
+        ok_vec[i]  <- TRUE
+        err_vec[i] <- NA_character_
         models_list[[i]] <- tryCatch({
           if (model_type == "lm") {
             lme4::lmer(model_formula, data = data_i)
@@ -528,12 +534,22 @@ IPD_one_stage <- function(data,
             }
           } else stop("Unsupported model type for random effects.")
         }, error = function(e) {
+          ok_vec[i]  <<- FALSE
+          err_vec[i] <<- e$message
           warning(sprintf("Model failed to fit for imputation %s: %s", actual_imps[i], e$message))
           NULL
         })
       }
 
       current_models_list <- models_list
+
+      # Build fit log for this predictor
+      fit_log_current <- data.frame(
+        imp   = actual_imps,
+        ok    = ok_vec,
+        error = ifelse(ok_vec, NA_character_, err_vec),
+        stringsAsFactors = FALSE
+      )
 
       coefs <- lapply(models_list, function(m) {
         if (is.null(m)) return(NULL)
@@ -590,8 +606,13 @@ IPD_one_stage <- function(data,
     } else {
       # ---- Non-random effects ----
       res_comb <- vector("list", length(actual_imps))
+      ok_vec  <- rep(FALSE, length(actual_imps))
+      err_vec <- rep(NA_character_, length(actual_imps))
+
       for (i in seq_along(actual_imps)) {
         data_subset <- implist[[i]]
+        ok_vec[i]  <- TRUE
+        err_vec[i] <- NA_character_
         res_comb[[i]] <- tryCatch({
           switch(model_type,
                  "nb"            = MASS::glm.nb(model_formula, data = data_subset),
@@ -605,12 +626,22 @@ IPD_one_stage <- function(data,
                  stop("Unsupported model type.")
           )
         }, error = function(e) {
+          ok_vec[i]  <<- FALSE
+          err_vec[i] <<- e$message
           warning(sprintf("Model failed to fit for imputation %s: %s", actual_imps[i], e$message))
           NULL
         })
       }
 
       current_models_list <- res_comb
+
+      # Build fit log for this predictor
+      fit_log_current <- data.frame(
+        imp   = actual_imps,
+        ok    = ok_vec,
+        error = ifelse(ok_vec, NA_character_, err_vec),
+        stringsAsFactors = FALSE
+      )
 
       ok_models <- Filter(function(x) !is.null(x), res_comb)
       if (length(ok_models) == 0) {
@@ -735,24 +766,25 @@ IPD_one_stage <- function(data,
     Results_multivariate_analysis$is_polynomial <- grepl("poly\\(", Results_multivariate_analysis$term)
 
     # Attributes
-    attr(Results_multivariate_analysis, "has_random_effects")      <- use_random_effects
-    attr(Results_multivariate_analysis, "random_intercept_var")    <- random_intercept_var
-    attr(Results_multivariate_analysis, "predictor_tested")        <- current_predictor
-    attr(Results_multivariate_analysis, "model_type_used")         <- model_type
-    attr(Results_multivariate_analysis, "formula")                 <- formula_string_current
-    attr(Results_multivariate_analysis, "has_interactions")        <- length(interaction_terms) > 0
-    attr(Results_multivariate_analysis, "interaction_terms")       <- if (length(interaction_terms) > 0) interaction_terms else NULL
-    attr(Results_multivariate_analysis, "has_splines")             <- length(spline_terms_detected) > 0
-    attr(Results_multivariate_analysis, "spline_terms")            <- if (length(spline_terms_detected) > 0) spline_terms_detected else NULL
-    attr(Results_multivariate_analysis, "has_polynomials")         <- length(poly_terms_detected) > 0
-    attr(Results_multivariate_analysis, "polynomial_terms")        <- if (length(poly_terms_detected) > 0) poly_terms_detected else NULL
-    attr(Results_multivariate_analysis, "imputations")             <- actual_imps
-    attr(Results_multivariate_analysis, "n_imp")                   <- length(actual_imps)
-    attr(Results_multivariate_analysis, "stratified_intercept_var")<- stratified_intercept_var
+    attr(Results_multivariate_analysis, "has_random_effects")       <- use_random_effects
+    attr(Results_multivariate_analysis, "random_intercept_var")     <- random_intercept_var
+    attr(Results_multivariate_analysis, "predictor_tested")         <- current_predictor
+    attr(Results_multivariate_analysis, "model_type_used")          <- model_type
+    attr(Results_multivariate_analysis, "formula")                  <- formula_string_current
+    attr(Results_multivariate_analysis, "has_interactions")         <- length(interaction_terms) > 0
+    attr(Results_multivariate_analysis, "interaction_terms")        <- if (length(interaction_terms) > 0) interaction_terms else NULL
+    attr(Results_multivariate_analysis, "has_splines")              <- length(spline_terms_detected) > 0
+    attr(Results_multivariate_analysis, "spline_terms")             <- if (length(spline_terms_detected) > 0) spline_terms_detected else NULL
+    attr(Results_multivariate_analysis, "has_polynomials")          <- length(poly_terms_detected) > 0
+    attr(Results_multivariate_analysis, "polynomial_terms")         <- if (length(poly_terms_detected) > 0) poly_terms_detected else NULL
+    attr(Results_multivariate_analysis, "imputations")              <- actual_imps
+    attr(Results_multivariate_analysis, "n_imp")                    <- length(actual_imps)
+    attr(Results_multivariate_analysis, "stratified_intercept_var") <- stratified_intercept_var
 
-    # Store models + performance
+    # Store models + performance + fit log
     attr(Results_multivariate_analysis, "models")              <- current_models_list
     attr(Results_multivariate_analysis, "performance_per_imp") <- performance_per_imp
+    attr(Results_multivariate_analysis, "fit_log")             <- fit_log_current
 
     # Variance components (for info)
     if (use_random_effects && !is.null(current_models_list) && length(current_models_list) > 0) {
