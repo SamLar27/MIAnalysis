@@ -2,8 +2,9 @@
 #'
 #' Fits models to multiply imputed datasets and pools results using Rubin's Rules.
 #' Supports GLM, mixed models (via lme4 / glmmTMB / coxme), interactions,
-#' restricted cubic splines (rcs) and polynomial terms. Designed for IPD
-#' one-stage analyses with optional random effects / stratified intercepts.
+#' and restricted cubic splines (rcs) built as explicit basis columns.
+#' Designed for IPD one-stage analyses with optional random effects /
+#' stratified intercepts.
 #'
 #' Intercept / slope structure is inferred automatically:
 #'   - If `stratified_intercept_var` is provided:
@@ -21,34 +22,24 @@
 #' Restricted cubic splines:
 #'   - Use `spline_terms` (character vector of variable names).
 #'   - Knots are defined via:
-#'       * `spline_knots_percentile`: numeric vector of percentiles (e.g. c(10,35,65,90)),
+#'       * `spline_knots_percentile`: numeric vector of percentiles (e.g. c(5,50,95)),
 #'         applied to the whole distribution of each variable, OR
 #'       * `spline_knots_n`: number of knots; default percentiles are spread between 5 and 95.
-#'   - If `rms` is installed, uses `rms::rcs()`; otherwise falls back to `splines::bs()`.
-#'   - The spline coefficients in the output are renamed as:
-#'       `<var>_rcs_linear`, `<var>_rcs_nl1`, `<var>_rcs_nl2`, ...
-#'
-#' Polynomial terms:
-#'   - Use `poly_terms` and `poly_degree` (2 or 3).
-#'   - Internally uses `poly(var, degree, raw = TRUE)`.
+#'   - Internally, for each `spline_terms` variable, this function:
+#'       * Computes knots on all rows of `data` (all imputations combined)
+#'       * Builds an rcs basis via `rms::rcs()`
+#'       * Adds columns named `<var>_rcs_linear`, `<var>_rcs_nl1`, `<var>_rcs_nl2`, ...
+#'       * Replaces the original variable in `predictor_vars` / `covariables`
+#'         and in `*_random_slope` by these basis columns.
 #'
 #' Performance indices:
-#'   - Controlled by `performance_index`, which can be:
-#'       * NULL (no performance metrics computed)
-#'       * Any subset of:
-#'         `c("Log_lik","AIC","AICc","BIC","BICc","RMSE","C_index")`
-#'   - Metrics are computed per imputation using base R:
-#'       * `Log_lik` : `logLik()`
-#'       * `AIC`     : `AIC()`
-#'       * `AICc`    : small-sample correction from AIC, using `nobs()` and df
-#'       * `BIC`     : `BIC()`
-#'       * `BICc`    : simple corrected BIC (approximate)
-#'       * `RMSE`    : sqrt(mean((y - fitted)^2)), for non-Cox models
-#'       * `C_index` : `survival::concordance()` (C-index) for Cox models (when supported)
+#'   - Controlled by `model_performance` (logical).
+#'   - When `TRUE`, per-imputation performance is computed using `performance::model_performance()`
+#'     and stored in the `"performance_per_imp"` attribute.
 #'
 #' @param data Data frame with all imputations stacked.
 #' @param outcome_var Dependent variable (for non-Cox models).
-#' @param predictor_vars Character vector of predictors to be tested one by one.
+#' @param predictor_vars Character vector of predictors.
 #' @param covariables Character vector of covariables (always included as fixed effects).
 #' @param imp_col Column name indicating imputation index (default ".imp").
 #' @param imp_n Number of imputations (if NULL, detected automatically).
@@ -61,30 +52,28 @@
 #' @param time_col Time variable for Cox models.
 #' @param event_col Event variable for Cox models.
 #' @param formula_string Optional custom formula (overrides automatic building).
-#' @param highlight_interactions Logical, add flags for interactions/splines/polynomials.
-#' @param spline_terms Character vector of variable names for rcs() / bs() terms.
-#' @param spline_knots_n Number of knots (if percentiles are not given).
+#' @param highlight_interactions Logical, add flags for interactions/splines.
+#' @param spline_terms Character vector of variable names to model with RCS.
+#' @param spline_knots_n Number of knots (if percentiles not given).
 #' @param spline_knots_percentile Numeric vector of percentiles for knots (0–100).
-#' @param poly_terms Character vector of variables with polynomial terms.
-#' @param poly_degree Scalar or vector (2 or 3) giving polynomial degree(s).
-#' @param include_poly_terms Logical, keep polynomial basis terms (default TRUE).
 #' @param random_intercept_var Grouping variable for random effects (NULL = no random effects).
 #' @param predictor_vars_random_slope Character vector of predictors with random slope.
 #' @param covariables_random_slope Character vector of covariables with random slope.
 #' @param stratified_intercept_var Variable defining stratified intercept (GLM) / baseline hazard (Cox).
-#' @param performance_index Either NULL (no performance metrics) or a character vector
-#'   with any subset of:
-#'   `c("Log_lik","AIC","AICc","BIC","BICc","RMSE","C_index")`.
+#' @param model_performance Logical; if TRUE, per-imputation performance indices are computed.
+#' @param weighted_intercept Logical; if TRUE and `stratified_intercept_var` is not NULL,
+#'   computes a sample-size–weighted intercept across strata.
 #'
 #' @return
-#'  If one predictor: a data.frame of pooled coefficients with attributes:
-#'    - "models"              : list of fitted models (one per imputation)
-#'    - "performance_per_imp" : list of lists with requested performance indices
-#'    - "fit_log"             : data.frame with columns `imp`, `ok`, `error` (one row per imputation)
-#'    - plus other metadata flags.
-#'
-#'  If multiple predictors: list of such data.frames with class "IPD_one_stage_multi"
-#'    and attribute "combined_results".
+#'  A list of class "IPD_one_stage" with:
+#'    - $table: pooled fixed effects (excluding intercept / strata terms)
+#'    - $Intercept: intercept and stratum-specific intercepts
+#'    - $Weighted_intercept: one-row data.frame with weighted intercept (if requested)
+#'  And attributes:
+#'    - "models"              : list of fitted models (per imputation)
+#'    - "performance_per_imp" : list of performance objects (per imputation)
+#'    - "fit_log"             : data.frame with columns `imp`, `ok`, `error`
+#'    - various metadata (formula, model_type, etc.)
 #'
 #' @export
 IPD_one_stage <- function(data,
@@ -102,6 +91,11 @@ IPD_one_stage <- function(data,
                           event_col = NULL,
                           formula_string = NULL,
                           highlight_interactions = TRUE,
+                          # --- NEW: spline arguments ---
+                          spline_terms = NULL,
+                          spline_knots_n = NULL,
+                          spline_knots_percentile = NULL,
+                          # ------------------------------
                           random_intercept_var = NULL,
                           predictor_vars_random_slope = NULL,
                           covariables_random_slope = NULL,
@@ -162,7 +156,84 @@ IPD_one_stage <- function(data,
            paste(miss, collapse = ", "))
     }
   }
+
   use_random_effects <- !is.null(random_intercept_var)
+
+  ## ------------------------------------------------------------
+  ## 0. If requested: create spline basis columns (rcs) in data
+  ## ------------------------------------------------------------
+  # We'll build new columns in `data` and update predictor_vars / covariables /
+  # *_random_slope to use them.
+  replace_var_with_basis <- function(vec, v, new_names) {
+    if (is.null(vec)) return(NULL)
+    if (!(v %in% vec)) return(vec)
+    out <- character(0)
+    for (nm in vec) {
+      if (nm == v) {
+        out <- c(out, new_names)
+      } else {
+        out <- c(out, nm)
+      }
+    }
+    unique(out)
+  }
+
+  spline_basis_map <- list()  # store variable -> new_names for flags later
+
+  if (!is.null(spline_terms)) {
+    if (!requireNamespace("rms", quietly = TRUE)) {
+      stop("spline_terms requested, but package 'rms' is not installed.")
+    }
+
+    for (v in spline_terms) {
+      if (!v %in% names(data)) {
+        stop("Spline term '", v, "' not found in data.")
+      }
+      x <- data[[v]]
+
+      # Choose knots
+      if (!is.null(spline_knots_percentile)) {
+        probs <- spline_knots_percentile / 100
+      } else if (!is.null(spline_knots_n)) {
+        if (spline_knots_n < 3) {
+          stop("spline_knots_n must be >= 3.")
+        }
+        probs <- seq(0.05, 0.95, length.out = spline_knots_n)
+      } else {
+        # default: 3 knots at 5,50,95 percentiles
+        probs <- c(0.05, 0.50, 0.95)
+      }
+
+      knots <- stats::quantile(x, probs = probs, na.rm = TRUE)
+      knots <- as.numeric(knots)
+
+      # rcs basis
+      basis <- rms::rcs(x, knots = knots)
+      K <- ncol(basis)
+      if (K < 2) {
+        stop("RCS basis for '", v, "' has fewer than 2 columns; check knots/data.")
+      }
+
+      new_names <- c(
+        paste0(v, "_rcs_linear"),
+        paste0(v, "_rcs_nl", seq_len(K - 1))
+      )
+      colnames(basis) <- new_names
+
+      # Attach to data
+      for (j in seq_along(new_names)) {
+        data[[new_names[j]]] <- basis[, j]
+      }
+
+      spline_basis_map[[v]] <- new_names
+
+      # Update predictor/covariables/random-slope lists
+      predictor_vars           <- replace_var_with_basis(predictor_vars,           v, new_names)
+      covariables              <- replace_var_with_basis(covariables,              v, new_names)
+      predictor_vars_random_slope <- replace_var_with_basis(predictor_vars_random_slope, v, new_names)
+      covariables_random_slope    <- replace_var_with_basis(covariables_random_slope,    v, new_names)
+    }
+  }
 
   ## ------------------------------------------------------------
   ## Imputation list
@@ -393,7 +464,7 @@ IPD_one_stage <- function(data,
   ok_models <- models_list[ok_idx]
 
   if (length(ok_models) == 0) {
-    stop("All models failed to fit in IPD_one_stage (random-effects block).")
+    stop("All models failed to fit in IPD_one_stage.")
   }
 
   ## ------------------------------------------------------------
@@ -410,7 +481,7 @@ IPD_one_stage <- function(data,
         c_se   <- sqrt(diag(c_vcov))
       } else if (inherits(m, "glmmTMB")) {
         c_est <- glmmTMB::fixef(m)$cond
-        v     <- stats::vcov(m)$cond   # <- FIX HERE
+        v     <- stats::vcov(m)$cond
         c_se  <- sqrt(diag(v))
       } else if (inherits(m, "lmerMod") || inherits(m, "glmerMod")) {
         c_est <- lme4::fixef(m)
@@ -498,7 +569,17 @@ IPD_one_stage <- function(data,
   } else {
     Results$is_interaction <- FALSE
   }
-  Results$is_spline     <- FALSE
+
+  # spline flag: any term that comes from a spline basis
+  if (!is.null(spline_terms) && length(spline_basis_map) > 0) {
+    spline_pattern <- paste0(
+      "(", paste(paste0(names(spline_basis_map), "_rcs"), collapse = "|"), ")"
+    )
+    Results$is_spline <- grepl(spline_pattern, Results$term)
+  } else {
+    Results$is_spline <- FALSE
+  }
+
   Results$is_polynomial <- grepl("poly\\(", Results$term)
 
   ## ------------------------------------------------------------
@@ -619,6 +700,8 @@ IPD_one_stage <- function(data,
   attr(out, "has_random_effects")  <- use_random_effects
   attr(out, "random_intercept_var")    <- random_intercept_var
   attr(out, "stratified_intercept_var")<- stratified_intercept_var
+  attr(out, "spline_terms")        <- spline_terms
+  attr(out, "spline_basis_map")    <- spline_basis_map
 
   out
 }
