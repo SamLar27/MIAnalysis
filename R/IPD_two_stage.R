@@ -7,15 +7,18 @@
 #' trials (via \pkg{metafor}). Optionally, it computes pooled model performance
 #' indices and produces a forest plot for a selected term.
 #'
-#' NEW (modifications included):
+#' MODIFICATIONS INCLUDED:
 #' - predictor_vars can include interaction shorthand using "*" (e.g. "x*y").
 #'   These are expanded internally for collapsed-predictor checks (so x and y can
 #'   be checked as columns), while the formula still uses the original strings.
 #' - Forest plot: CIs that cross the ref line (usually 1) are drawn in grey.
 #' - Forest plot: if CI exceeds x_limits, the truncated side uses an arrowhead
 #'   and the tick is NOT drawn on that side.
-#' - NEW: builds \code{$table} = pooled meta-analysed estimates for ALL terms
+#' - Builds \code{$table} = pooled meta-analysed estimates for ALL terms
 #'   (excluding intercept and trial fixed-effect dummies, if any).
+#' - IMPROVED HETEROGENEITY ASSESSMENT IN TABLE:
+#'   Adds Q-test p-value (p_Q), heterogeneity_significant (p_Q<0.05),
+#'   I2_category, and 95% prediction interval on exp-scale (pred_int_exp_*).
 #'
 #' @export
 IPD_two_stage <- function(data,
@@ -45,6 +48,16 @@ IPD_two_stage <- function(data,
                           bold_pooled        = FALSE,
                           margin_plot        = c(5.5, 2, 5.5, 5.5)
 ) {
+
+  ## ------------------------------------------------------------------
+  ## Required packages (fail early with clear messages)
+  ## ------------------------------------------------------------------
+  pkgs <- c("dplyr", "tibble", "broom", "ggplot2", "cowplot", "metafor", "MASS", "grid")
+  missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing_pkgs) > 0) {
+    stop("Missing packages: ", paste(missing_pkgs, collapse = ", "),
+         ". Please install them before running IPD_two_stage().")
+  }
 
   ## ------------------------------------------------------------------
   ## Internal helpers
@@ -155,7 +168,7 @@ IPD_two_stage <- function(data,
     )
   }
 
-  ## Rubin pooling of performance across imputations (unchanged)
+  ## Rubin pooling of performance across imputations
   pool_IPD_two_stage_performance_inner <- function(perf_list) {
     perf_df <- dplyr::bind_rows(
       lapply(names(perf_list), function(nm) {
@@ -192,7 +205,7 @@ IPD_two_stage <- function(data,
     list(per_imputation = perf_df, pooled_summary = pooled)
   }
 
-  ## NEW: pooled table for ALL terms (Rubin within trial, then rma across trials)
+  ## NEW: pooled table for ALL terms + improved heterogeneity inference
   build_table_IPD_two_stage_inner <- function(coefs_per_trial, fit_log_tbl, trial_levels, method = "REML") {
     if (nrow(coefs_per_trial) == 0L) return(NULL)
 
@@ -226,6 +239,25 @@ IPD_two_stage <- function(data,
     trial_term <- trial_term %>%
       dplyr::filter(!Reduce(`|`, lapply(drop_patterns, function(p) grepl(p, .data$term))))
 
+    I2_cat <- function(I2) {
+      dplyr::case_when(
+        is.na(I2) ~ NA_character_,
+        I2 < 25   ~ "low",
+        I2 < 50   ~ "moderate",
+        I2 < 75   ~ "substantial",
+        TRUE      ~ "considerable"
+      )
+    }
+
+    pred_int_exp <- function(meta_fit) {
+      pr <- tryCatch(
+        metafor::predict(meta_fit, transf = exp, digits = 6),
+        error = function(e) NULL
+      )
+      if (is.null(pr)) return(c(NA_real_, NA_real_))
+      c(pr$pi.lb, pr$pi.ub)
+    }
+
     terms <- sort(unique(trial_term$term))
 
     out_list <- lapply(terms, function(tt) {
@@ -233,93 +265,62 @@ IPD_two_stage <- function(data,
       k <- dplyr::n_distinct(d$trial)
       if (k < 2) return(NULL)
 
-      mf <- metafor::rma(yi = d$Q_bar, sei = d$SE_mi, method = method)
+      meta_fit <- metafor::rma(yi = d$Q_bar, sei = d$SE_mi, method = method)
 
-      est <- as.numeric(mf$b)
-      se  <- as.numeric(mf$se)
+      est <- as.numeric(meta_fit$b)
+      se  <- as.numeric(meta_fit$se)
       ci  <- c(est - 1.96 * se, est + 1.96 * se)
 
-      # weights (%)
-      wt <- tryCatch(as.numeric(stats::weights(mf)), error = function(e) rep(NA_real_, nrow(d)))
-      if (length(wt) == nrow(d) && all(is.finite(wt))) {
-        w_perc <- 100 * wt / sum(wt)
-      } else {
-        wt2 <- 1 / (d$SE_mi^2)
-        w_perc <- 100 * wt2 / sum(wt2)
-      }
+      Q   <- meta_fit$QE
+      dfQ <- meta_fit$k - 1
+      pQ  <- stats::pchisq(Q, df = dfQ, lower.tail = FALSE)
 
-      # trial-level summary table for this term
+      pi_exp <- pred_int_exp(meta_fit)
+
       trial_tbl <- d %>%
-        dplyr::left_join(N_by_trial, by = c("trial")) %>%
+        dplyr::left_join(N_by_trial, by = "trial") %>%
         dplyr::mutate(
           RR    = exp(.data$Q_bar),
           RR_lo = exp(.data$Q_bar - 1.96 * .data$SE_mi),
-          RR_hi = exp(.data$Q_bar + 1.96 * .data$SE_mi),
-          Weight_percent = w_perc
+          RR_hi = exp(.data$Q_bar + 1.96 * .data$SE_mi)
         ) %>%
         dplyr::arrange(factor(.data$trial, levels = trial_levels))
 
-      # pooled row
-      pooled_row <- tibble::tibble(
-        trial = "Pooled (REML)",
-        term  = tt,
-        estimate = est,
-        std.error = se,
-        ci_low = ci[1],
-        ci_high = ci[2],
-        exp_estimate = exp(est),
-        exp_ci_low = exp(ci[1]),
-        exp_ci_high = exp(ci[2]),
-        tau2 = mf$tau2,
-        I2   = mf$I2,
-        H2   = mf$H2,
-        Q    = mf$QE,
-        df_Q = mf$k - 1,
-        k    = mf$k,
-        N_total = sum(trial_tbl$N, na.rm = TRUE)
-      )
-
-      # term-level summary (one row per term) + attach trial table as list-column
       tibble::tibble(
         term = tt,
-        pooled_log = est,
+
+        pooled_exp    = exp(est),
+        ci_exp_low    = exp(ci[1]),
+        ci_exp_high   = exp(ci[2]),
+
+        pooled_log    = est,
         pooled_log_se = se,
-        ci_log_low = ci[1],
-        ci_log_high = ci[2],
-        pooled_exp = exp(est),
-        ci_exp_low = exp(ci[1]),
-        ci_exp_high = exp(ci[2]),
-        p_value = 2 * stats::pnorm(abs(est / se), lower.tail = FALSE),
-        tau2 = mf$tau2,
-        I2   = mf$I2,
-        H2   = mf$H2,
-        Q    = mf$QE,
-        df_Q = mf$k - 1,
-        k    = mf$k,
+        p_value       = 2 * stats::pnorm(abs(est / se), lower.tail = FALSE),
+
+        tau2 = meta_fit$tau2,
+        I2   = meta_fit$I2,
+        H2   = meta_fit$H2,
+        I2_category = I2_cat(meta_fit$I2),
+
+        Q    = Q,
+        df_Q = dfQ,
+        p_Q  = pQ,
+        heterogeneity_significant = is.finite(pQ) && (pQ < 0.05),
+
+        pred_int_exp_low  = pi_exp[1],
+        pred_int_exp_high = pi_exp[2],
+
+        k = meta_fit$k,
         N_total = sum(trial_tbl$N, na.rm = TRUE),
-        trials = list(trial_tbl),
-        pooled_row = list(pooled_row)
+
+        trials = list(trial_tbl)
       )
     })
 
     out <- dplyr::bind_rows(out_list)
     if (nrow(out) == 0L) return(NULL)
 
-    # Provide a "flat" version too (easy to view)
-    out_flat <- out %>%
-      dplyr::select(
-        .data$term,
-        .data$pooled_exp, .data$ci_exp_low, .data$ci_exp_high,
-        .data$pooled_log, .data$pooled_log_se,
-        .data$p_value,
-        .data$tau2, .data$I2, .data$H2, .data$Q, .data$df_Q, .data$k,
-        .data$N_total
-      )
-
-    list(
-      summary = out_flat,
-      full = out
-    )
+    list(summary = out, full = out)
   }
 
   forest_IPD_two_stage_inner <- function(coefs_per_trial,
@@ -639,6 +640,7 @@ IPD_two_stage <- function(data,
       H2   = meta_fit$H2,
       Q    = meta_fit$QE,
       df_Q = meta_fit$k - 1,
+      p_Q  = stats::pchisq(meta_fit$QE, df = meta_fit$k - 1, lower.tail = FALSE),
       k    = meta_fit$k
     )
 
@@ -874,7 +876,7 @@ IPD_two_stage <- function(data,
   pooled_perf <- if (!is.null(performance_per_imp)) pool_IPD_two_stage_performance_inner(performance_per_imp) else NULL
 
   ## ------------------------------------------------------------------
-  ## 4) Build pooled TABLE for all terms (NEW)
+  ## 4) Build pooled TABLE for all terms (NEW + heterogeneity)
   ## ------------------------------------------------------------------
   table_obj <- build_table_IPD_two_stage_inner(
     coefs_per_trial = coefs_per_trial,
@@ -905,7 +907,6 @@ IPD_two_stage <- function(data,
     Pooled_performance  = pooled_perf,
     perf_pool           = pooled_perf,
 
-    # NEW:
     table              = if (is.null(table_obj)) NULL else table_obj$summary,
     table_full         = if (is.null(table_obj)) NULL else table_obj$full
   )
