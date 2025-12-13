@@ -1,18 +1,24 @@
-#' Two-stage IPD meta-analysis with multiple imputation + forest plot
+#' Two-stage IPD meta-analysis with multiple imputation and forest plot
 #'
 #' @description
-#' Fits trial-specific models within each imputation, pools within-trial across
-#' imputations (Rubin), then performs random-effects meta-analysis across trials
-#' (metafor::rma). Optionally builds a forest plot for a selected term and a
-#' pooled table for ALL terms.
+#' IPD_two_stage() fits separate regression models within each trial and each
+#' imputed dataset, pools trial-specific coefficients across imputations using
+#' Rubin's rules, then performs a random-effects meta-analysis across trials
+#' (metafor::rma). Optionally computes pooled model performance and produces a
+#' forest plot for a selected term.
 #'
-#' Included modifications:
-#' - predictor_vars can include "*" shorthand (expanded for collapse checks).
+#' Implemented features (current version):
+#' - predictor_vars can include interaction shorthand using "*" (e.g. "x*y").
+#'   These are expanded internally for collapsed-predictor checks (so x and y can
+#'   be checked as columns), while the formula still uses the original strings.
 #' - Forest plot:
-#'   * CIs crossing ref line are grey.
-#'   * Truncated CIs show arrowheads (no ticks on truncated side).
-#'   * Adds a BLUE "Heterogeneity" row below "Pooled (REML)" with I², τ², Q, p(Q).
-#' - Builds $table (flat pooled summary for all terms) + $table_full (list-cols).
+#'   * CIs that cross the ref line are drawn in grey.
+#'   * Truncated CIs use arrowheads and DO NOT draw ticks on truncated sides.
+#'   * NEW: heterogeneity summary (I², τ², Q test) is printed directly UNDER
+#'     the pooled row (no additional "Heterogeneity" row/line).
+#' - NEW: builds $table = pooled meta-analysed estimates for ALL terms (excluding
+#'   intercept and trial fixed-effect dummies, if any), including heterogeneity
+#'   stats and Cochran’s Q p-value.
 #'
 #' @export
 IPD_two_stage <- function(data,
@@ -40,7 +46,15 @@ IPD_two_stage <- function(data,
                           diamond_color      = "blue",
                           pooled_color       = "black",
                           bold_pooled        = FALSE,
-                          margin_plot        = c(5.5, 2, 5.5, 5.5)
+                          margin_plot        = c(5.5, 2, 5.5, 5.5),
+                          ## ---- NEW: heterogeneity annotation under pooled ----
+                          show_heterogeneity_under_pooled = TRUE,
+                          heterogeneity_digits_I2  = 1,
+                          heterogeneity_digits_tau2 = 4,
+                          heterogeneity_digits_Q   = 2,
+                          heterogeneity_digits_pQ  = 3,
+                          heterogeneity_y_nudge    = -0.60,  # negative = below pooled row
+                          heterogeneity_x_mult     = 1.02    # left anchor at final_limits[1] * mult
 ) {
 
   ## ------------------------------------------------------------------
@@ -91,6 +105,20 @@ IPD_two_stage <- function(data,
       }
     }
     unique(out)
+  }
+
+  I2_category <- function(I2) {
+    # simple, widely used cutoffs (Cochrane-style)
+    if (is.na(I2)) return(NA_character_)
+    if (I2 < 25) "low"
+    else if (I2 < 50) "moderate"
+    else if (I2 < 75) "substantial"
+    else "considerable"
+  }
+
+  safe_pchisq_Q <- function(Q, df_Q) {
+    if (!is.finite(Q) || !is.finite(df_Q) || df_Q <= 0) return(NA_real_)
+    stats::pchisq(Q, df_Q, lower.tail = FALSE)
   }
 
   predictor_vars_expanded <- expand_star_terms(predictor_vars)
@@ -236,53 +264,38 @@ IPD_two_stage <- function(data,
       se  <- as.numeric(mf$se)
       ci  <- c(est - 1.96 * se, est + 1.96 * se)
 
-      p_Q <- as.numeric(mf$QEp)
+      p_Q <- safe_pchisq_Q(mf$QE, mf$k - 1)
 
-      I2_cat <- dplyr::case_when(
-        is.na(mf$I2) ~ NA_character_,
-        mf$I2 < 25   ~ "low",
-        mf$I2 < 50   ~ "moderate",
-        mf$I2 < 75   ~ "substantial",
-        TRUE         ~ "considerable"
-      )
-
-      trial_tbl <- d %>%
-        dplyr::left_join(N_by_trial, by = c("trial")) %>%
-        dplyr::mutate(
-          RR    = exp(.data$Q_bar),
-          RR_lo = exp(.data$Q_bar - 1.96 * .data$SE_mi),
-          RR_hi = exp(.data$Q_bar + 1.96 * .data$SE_mi)
-        ) %>%
-        dplyr::arrange(factor(.data$trial, levels = trial_levels))
+      # a quick "significance" flag for heterogeneity (Cochran Q)
+      heterogeneity_signif <- is.finite(p_Q) && !is.na(p_Q) && (p_Q < 0.05)
 
       tibble::tibble(
-        term = tt,
-        pooled_exp     = exp(est),
-        ci_exp_low     = exp(ci[1]),
-        ci_exp_high    = exp(ci[2]),
-        pooled_log     = est,
-        pooled_log_se  = se,
-        p_value        = 2 * stats::pnorm(abs(est / se), lower.tail = FALSE),
-        tau2           = as.numeric(mf$tau2),
-        I2             = as.numeric(mf$I2),
-        H2             = as.numeric(mf$H2),
-        I2_category    = I2_cat,
-        Q              = as.numeric(mf$QE),
-        df_Q           = as.numeric(mf$k - 1),
-        p_Q            = p_Q,
-        heterogeneity_significant = is.finite(p_Q) && p_Q < 0.05,
-        k              = as.integer(mf$k),
-        N_total        = sum(trial_tbl$N, na.rm = TRUE),
-        trials         = list(trial_tbl)
+        term       = tt,
+        pooled_exp = exp(est),
+        ci_exp_low  = exp(ci[1]),
+        ci_exp_high = exp(ci[2]),
+        pooled_log  = est,
+        pooled_log_se = se,
+        p_value     = 2 * stats::pnorm(abs(est / se), lower.tail = FALSE),
+        tau2        = mf$tau2,
+        I2          = mf$I2,
+        H2          = mf$H2,
+        I2_category = I2_category(mf$I2),
+        Q           = mf$QE,
+        df_Q        = mf$k - 1,
+        p_Q         = p_Q,
+        heterogeneity_significant = heterogeneity_signif,
+        k           = mf$k,
+        N_total     = sum((N_by_trial %>% dplyr::filter(.data$trial %in% d$trial))$N, na.rm = TRUE)
       )
     })
 
     out <- dplyr::bind_rows(out_list)
     if (nrow(out) == 0L) return(NULL)
+
     out
   }
 
-  ## Forest plot builder (WITH heterogeneity row under pooled, in blue)
   forest_IPD_two_stage_inner <- function(coefs_per_trial,
                                          fit_log_tbl,
                                          trial_levels,
@@ -299,7 +312,14 @@ IPD_two_stage <- function(data,
                                          pooled_color,
                                          bold_pooled,
                                          meta_method,
-                                         margin_plot) {
+                                         margin_plot,
+                                         show_heterogeneity_under_pooled,
+                                         heterogeneity_digits_I2,
+                                         heterogeneity_digits_tau2,
+                                         heterogeneity_digits_Q,
+                                         heterogeneity_digits_pQ,
+                                         heterogeneity_y_nudge,
+                                         heterogeneity_x_mult) {
 
     coefs_term <- coefs_per_trial %>%
       dplyr::filter(.data$term == !!term) %>%
@@ -345,12 +365,6 @@ IPD_two_stage <- function(data,
     pooled_se  <- as.numeric(meta_fit$se)
     pooled_ci  <- c(pooled_log - 1.96 * pooled_se, pooled_log + 1.96 * pooled_se)
 
-    tau2_val <- as.numeric(meta_fit$tau2)
-    I2_val   <- as.numeric(meta_fit$I2)
-    Q_val    <- as.numeric(meta_fit$QE)
-    dfQ_val  <- as.numeric(meta_fit$k - 1)
-    pQ_val   <- as.numeric(meta_fit$QEp)
-
     wt <- tryCatch(as.numeric(stats::weights(meta_fit)), error = function(e) numeric(0))
     if (length(wt) == nrow(trial_effects) && all(is.finite(wt))) {
       Weight_percent <- 100 * wt / sum(wt)
@@ -370,18 +384,16 @@ IPD_two_stage <- function(data,
         Weight_percent = Weight_percent,
         aRR_CI = sprintf("%.2f [%.2f–%.2f]", .data$RR, .data$RR_lo, .data$RR_hi),
         N_col  = ifelse(is.finite(.data$N), format(.data$N, big.mark = ","), ""),
-        W_col  = paste0(format_num(.data$Weight_percent), "%"),
-        is_pooled = FALSE,
-        is_hetero = FALSE
+        W_col  = paste0(format_num(.data$Weight_percent), "%")
       ) %>%
       dplyr::select(.data$Trial, .data$RR, .data$RR_lo, .data$RR_hi,
                     .data$aRR_CI, .data$N_col, .data$W_col,
-                    .data$Weight_percent, .data$is_pooled, .data$is_hetero)
+                    .data$Weight_percent)
 
     ## pooled row
     pooled_row <- df_plot[1, , drop = FALSE]
     pooled_row[] <- NA
-    pooled_row$Trial          <- "Pooled (REML)"
+    pooled_row$Trial          <- paste0("Pooled (", meta_method, ")")
     pooled_row$RR             <- exp(pooled_log)
     pooled_row$RR_lo          <- exp(pooled_ci[1])
     pooled_row$RR_hi          <- exp(pooled_ci[2])
@@ -390,50 +402,35 @@ IPD_two_stage <- function(data,
     pooled_row$N_col          <- format(sum(trial_effects$N, na.rm = TRUE), big.mark = ",")
     pooled_row$W_col          <- ""
     pooled_row$Weight_percent <- max(Weight_percent, na.rm = TRUE)
-    pooled_row$is_pooled      <- TRUE
-    pooled_row$is_hetero      <- FALSE
 
-    ## heterogeneity row (text-only)
-    hetero_row <- df_plot[1, , drop = FALSE]
-    hetero_row[] <- NA
-    hetero_row$Trial          <- "Heterogeneity"
-    hetero_row$aRR_CI         <- sprintf(
-      "I\u00B2 = %.1f%%   \u03C4\u00B2 = %.4f   Q = %.2f (df=%d), p = %.3g",
-      I2_val, tau2_val, Q_val, dfQ_val, pQ_val
-    )
-    hetero_row$N_col          <- ""
-    hetero_row$W_col          <- ""
-    hetero_row$Weight_percent <- NA_real_
-    hetero_row$is_pooled      <- FALSE
-    hetero_row$is_hetero      <- TRUE
+    pooled_label <- pooled_row$Trial[1]
 
-    df_plot <- dplyr::bind_rows(df_plot, pooled_row, hetero_row)
+    df_plot <- dplyr::bind_rows(df_plot, pooled_row)
 
-    ## x limits (based only on non-heterogeneity)
-    df_nonhet <- df_plot %>% dplyr::filter(!.data$is_hetero)
-
+    ## x limits
     if (is.null(x_limits)) {
-      lower <- min(df_nonhet$RR_lo, na.rm = TRUE)
-      upper <- max(df_nonhet$RR_hi, na.rm = TRUE)
+      lower <- min(df_plot$RR_lo, na.rm = TRUE)
+      upper <- max(df_plot$RR_hi, na.rm = TRUE)
     } else {
       lower <- x_limits[1]; upper <- x_limits[2]
     }
 
     final_limits <- compute_centered_limits(
       lims            = c(lower, upper),
-      from_data_lower = min(df_nonhet$RR_lo, na.rm = TRUE),
-      from_data_upper = max(df_nonhet$RR_hi, na.rm = TRUE),
+      from_data_lower = min(df_plot$RR_lo, na.rm = TRUE),
+      from_data_upper = max(df_plot$RR_hi, na.rm = TRUE),
       center          = center_axis_at_one
     )
 
-    ## truncation flags + plotting values (skip heterogeneity row)
+    ## truncation flags + plotting values
     df_plot <- df_plot %>%
       dplyr::mutate(
-        lo_trunc   = (!.data$is_hetero) & (.data$RR_lo < final_limits[1]),
-        hi_trunc   = (!.data$is_hetero) & (.data$RR_hi > final_limits[2]),
-        RR_lo_plot = dplyr::if_else(.data$is_hetero, NA_real_, pmax(.data$RR_lo, final_limits[1])),
-        RR_hi_plot = dplyr::if_else(.data$is_hetero, NA_real_, pmin(.data$RR_hi, final_limits[2])),
-        RR_plot    = dplyr::if_else(.data$is_hetero, NA_real_, pmin(pmax(.data$RR, final_limits[1]), final_limits[2]))
+        lo_trunc   = .data$RR_lo < final_limits[1],
+        hi_trunc   = .data$RR_hi > final_limits[2],
+        RR_lo_plot = pmax(.data$RR_lo, final_limits[1]),
+        RR_hi_plot = pmin(.data$RR_hi, final_limits[2]),
+        RR_plot    = pmin(pmax(.data$RR, final_limits[1]), final_limits[2]),
+        is_pooled  = (.data$Trial == pooled_label)
       )
 
     ## breaks
@@ -444,23 +441,19 @@ IPD_two_stage <- function(data,
       x_breaks_final <- auto_log_breaks(final_limits)
     }
 
-    ## y order: trials, pooled, heterogeneity
+    ## y order
     trials_ord <- trial_levels[trial_levels %in% df_plot$Trial]
-    levels_vec <- c(trials_ord, "Pooled (REML)", "Heterogeneity")
+    levels_vec <- c(trials_ord, pooled_label)
+    levels_vec <- levels_vec[!duplicated(levels_vec)]
     y_levels_rev <- rev(levels_vec)
     df_plot$Trial <- factor(df_plot$Trial, levels = y_levels_rev)
 
-    if (is.null(margin_plot) || length(margin_plot) != 4L) {
-      margin_plot <- c(5.5, 2, 5.5, 5.5)
-    }
-
-    ## CI colour logic (grey if crosses ref line; pooled/hetero in pooled_color)
+    ## CI colour logic (grey if crosses ref line)
     df_plot <- df_plot %>%
       dplyr::mutate(
-        crosses_ref = (!.data$is_hetero) & (.data$RR_lo <= ref_line & .data$RR_hi >= ref_line),
+        crosses_ref = (.data$RR_lo <= ref_line & .data$RR_hi >= ref_line),
         ci_col = dplyr::case_when(
           .data$is_pooled ~ pooled_color,
-          .data$is_hetero ~ pooled_color,
           .data$crosses_ref ~ "grey60",
           TRUE ~ "black"
         )
@@ -469,10 +462,11 @@ IPD_two_stage <- function(data,
     arrow_len <- grid::unit(0.18, "cm")
     tick_h    <- 0.20
 
-    ## draw only non-heterogeneity
-    df_draw <- df_plot %>% dplyr::filter(!.data$is_hetero)
+    if (is.null(margin_plot) || length(margin_plot) != 4L) {
+      margin_plot <- c(5.5, 2, 5.5, 5.5)
+    }
 
-    p_forest <- ggplot2::ggplot(df_draw, ggplot2::aes(y = .data$Trial)) +
+    p_forest <- ggplot2::ggplot(df_plot, ggplot2::aes(y = .data$Trial)) +
       ggplot2::geom_segment(
         ggplot2::aes(
           x    = .data$RR_lo_plot,
@@ -483,8 +477,9 @@ IPD_two_stage <- function(data,
         linewidth = 0.6,
         lineend   = "butt"
       ) +
+      # left tick if NOT truncated on left
       ggplot2::geom_segment(
-        data = df_draw %>% dplyr::filter(!.data$lo_trunc),
+        data = df_plot %>% dplyr::filter(!.data$lo_trunc),
         ggplot2::aes(
           x    = .data$RR_lo_plot,
           xend = .data$RR_lo_plot,
@@ -496,8 +491,9 @@ IPD_two_stage <- function(data,
         linewidth = 0.6,
         lineend   = "butt"
       ) +
+      # right tick if NOT truncated on right
       ggplot2::geom_segment(
-        data = df_draw %>% dplyr::filter(!.data$hi_trunc),
+        data = df_plot %>% dplyr::filter(!.data$hi_trunc),
         ggplot2::aes(
           x    = .data$RR_hi_plot,
           xend = .data$RR_hi_plot,
@@ -509,8 +505,9 @@ IPD_two_stage <- function(data,
         linewidth = 0.6,
         lineend   = "butt"
       ) +
+      # right arrow if truncated (no tick)
       ggplot2::geom_segment(
-        data = df_draw %>% dplyr::filter(.data$hi_trunc),
+        data = df_plot %>% dplyr::filter(.data$hi_trunc),
         ggplot2::aes(
           x    = final_limits[2] / 1.12,
           xend = final_limits[2],
@@ -523,8 +520,9 @@ IPD_two_stage <- function(data,
         linewidth = 0.6,
         lineend   = "butt"
       ) +
+      # left arrow if truncated (no tick)
       ggplot2::geom_segment(
-        data = df_draw %>% dplyr::filter(.data$lo_trunc),
+        data = df_plot %>% dplyr::filter(.data$lo_trunc),
         ggplot2::aes(
           x    = final_limits[1] * 1.12,
           xend = final_limits[1],
@@ -543,8 +541,9 @@ IPD_two_stage <- function(data,
       ) +
       ggplot2::scale_size_continuous(range = point_size_range, name = "Weight (%)") +
       ggplot2::scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18), guide = "none") +
+      # pooled diamond
       ggplot2::geom_point(
-        data = df_draw %>% dplyr::filter(.data$is_pooled),
+        data = df_plot %>% dplyr::filter(.data$is_pooled),
         ggplot2::aes(y = .data$Trial, x = .data$RR_plot),
         inherit.aes = FALSE,
         colour = diamond_color,
@@ -554,7 +553,7 @@ IPD_two_stage <- function(data,
       ggplot2::geom_vline(xintercept = ref_line, linetype = "dashed", linewidth = 0.5) +
       ggplot2::scale_colour_identity() +
       ggplot2::scale_x_log10(breaks = x_breaks_final, limits = final_limits) +
-      ggplot2::scale_y_discrete(limits = levels(df_plot$Trial)) +
+      ggplot2::scale_y_discrete(limits = y_levels_rev) +
       ggplot2::labs(x = xlab, y = NULL) +
       ggplot2::theme_minimal(base_size = 12) +
       ggplot2::theme(
@@ -565,13 +564,50 @@ IPD_two_stage <- function(data,
         axis.ticks.y     = ggplot2::element_blank()
       )
 
-    ## left labels include heterogeneity row; pooled+hetero in pooled_color
+    ## Add heterogeneity UNDER pooled row (NO new "row"/factor level)
+    heterogeneity_df <- data.frame(
+      tau2 = meta_fit$tau2,
+      I2   = meta_fit$I2,
+      H2   = meta_fit$H2,
+      Q    = meta_fit$QE,
+      df_Q = meta_fit$k - 1,
+      k    = meta_fit$k
+    )
+
+    if (isTRUE(show_heterogeneity_under_pooled)) {
+      p_Q <- safe_pchisq_Q(heterogeneity_df$Q, heterogeneity_df$df_Q)
+
+      heterogeneity_label <- sprintf(
+        "I² = %.*f%%   τ² = %.*f   Q = %.*f (df = %d), p = %.*f",
+        heterogeneity_digits_I2,  heterogeneity_df$I2,
+        heterogeneity_digits_tau2, heterogeneity_df$tau2,
+        heterogeneity_digits_Q,   heterogeneity_df$Q,
+        heterogeneity_df$df_Q,
+        heterogeneity_digits_pQ,  p_Q
+      )
+
+      y_pooled <- which(levels(df_plot$Trial) == pooled_label)
+      x_text   <- final_limits[1] * heterogeneity_x_mult
+
+      p_forest <- p_forest +
+        ggplot2::annotate(
+          "text",
+          x = x_text,
+          y = y_pooled + heterogeneity_y_nudge,
+          label = heterogeneity_label,
+          hjust = 0,
+          size  = 3.2,
+          colour = pooled_color,
+          fontface = if (isTRUE(bold_pooled)) "bold" else "plain"
+        )
+    }
+
+    ## left labels
     df_left <- data.frame(
       Trial = df_plot$Trial,
       lab   = as.character(df_plot$Trial),
-      col   = ifelse(as.character(df_plot$Trial) %in% c("Pooled (REML)", "Heterogeneity"),
-                     pooled_color, "black"),
-      face  = ifelse(as.character(df_plot$Trial) == "Pooled (REML)" & bold_pooled, "bold", "plain")
+      col   = ifelse(as.character(df_plot$Trial) == pooled_label, pooled_color, "black"),
+      face  = ifelse(as.character(df_plot$Trial) == pooled_label & bold_pooled, "bold", "plain")
     )
 
     p_left <- ggplot2::ggplot(
@@ -607,8 +643,8 @@ IPD_two_stage <- function(data,
         ggplot2::coord_cartesian(clip = "off")
     }
 
-    blue_mask <- as.character(df_plot$Trial) %in% c("Pooled (REML)", "Heterogeneity")
-    col_vec   <- ifelse(blue_mask, pooled_color, "black")
+    pooled_mask <- as.character(df_plot$Trial) == pooled_label
+    col_vec <- ifelse(pooled_mask, pooled_color, "black")
 
     p_col1 <- make_text_col(df_plot$aRR_CI, "aRR (95% CI)", col_vec)
     p_col2 <- make_text_col(df_plot$N_col,  "N",            col_vec)
@@ -617,19 +653,9 @@ IPD_two_stage <- function(data,
     full_plot <- cowplot::plot_grid(
       p_left, p_forest, p_col1, p_col2, p_col3,
       nrow       = 1,
-      rel_widths = c(0.9, 2.2, 0.95, 0.25, 0.5),
+      rel_widths = c(0.9, 2.2, 0.6, 0.25, 0.5),
       align      = "hv",
       axis       = "tb"
-    )
-
-    heterogeneity_df <- data.frame(
-      tau2 = meta_fit$tau2,
-      I2   = meta_fit$I2,
-      H2   = meta_fit$H2,
-      Q    = meta_fit$QE,
-      df_Q = meta_fit$k - 1,
-      p_Q  = meta_fit$QEp,
-      k    = meta_fit$k
     )
 
     list(plot = full_plot, pooled_log = pooled_log, pooled_ci = pooled_ci,
@@ -866,7 +892,7 @@ IPD_two_stage <- function(data,
   ## ------------------------------------------------------------------
   ## 4) Build pooled TABLE for all terms (NEW)
   ## ------------------------------------------------------------------
-  table_obj <- build_table_IPD_two_stage_inner(
+  table_tbl <- build_table_IPD_two_stage_inner(
     coefs_per_trial = coefs_per_trial,
     fit_log_tbl     = fit_log_tbl,
     trial_levels    = trial_levels,
@@ -893,8 +919,7 @@ IPD_two_stage <- function(data,
     fit_log             = fit_log_tbl,
     trial_levels        = trial_levels,
     perf_pool           = pooled_perf,
-
-    table              = table_obj
+    table               = table_tbl
   )
 
   ## ------------------------------------------------------------------
@@ -920,7 +945,14 @@ IPD_two_stage <- function(data,
       pooled_color       = pooled_color,
       bold_pooled        = bold_pooled,
       meta_method        = meta_method,
-      margin_plot        = margin_plot
+      margin_plot        = margin_plot,
+      show_heterogeneity_under_pooled = show_heterogeneity_under_pooled,
+      heterogeneity_digits_I2  = heterogeneity_digits_I2,
+      heterogeneity_digits_tau2 = heterogeneity_digits_tau2,
+      heterogeneity_digits_Q   = heterogeneity_digits_Q,
+      heterogeneity_digits_pQ  = heterogeneity_digits_pQ,
+      heterogeneity_y_nudge    = heterogeneity_y_nudge,
+      heterogeneity_x_mult     = heterogeneity_x_mult
     )
 
     out$forest_plot        <- forest_res$plot
