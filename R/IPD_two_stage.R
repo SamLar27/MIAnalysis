@@ -7,81 +7,15 @@
 #' trials (via \pkg{metafor}). Optionally, it computes pooled model performance
 #' indices and produces a forest plot for a selected term.
 #'
-#' The function supports multiply imputed data (identified by \code{imp_col}),
-#' clustered by trial (\code{intercept_var}), and several generalized linear
-#' model families (negative binomial, Poisson, quasipoisson, Gaussian,
-#' binomial). The forest plot is built with \pkg{ggplot2} and \pkg{cowplot}.
-#'
 #' NEW (modifications included):
 #' - predictor_vars can include interaction shorthand using "*" (e.g. "x*y").
-#'   These are expanded internally for formula building (so x, y, and x:y exist).
+#'   These are expanded internally for collapsed-predictor checks (so x and y can
+#'   be checked as columns), while the formula still uses the original strings.
 #' - Forest plot: CIs that cross the ref line (usually 1) are drawn in grey.
 #' - Forest plot: if CI exceeds x_limits, the truncated side uses an arrowhead
 #'   and the tick is NOT drawn on that side.
-#'
-#' @param data A \code{data.frame} containing the individual patient data
-#'   (one row per subject per imputation).
-#' @param outcome_var Character string; name of the outcome variable in
-#'   \code{data}. Must be numeric for count outcomes or 0/1 for binomial.
-#' @param predictor_vars Character vector of predictor terms to include in the
-#'   model. Entries can be simple variable names present in \code{data} or
-#'   formula-style terms such as interactions (e.g. \code{"x1:x2"},
-#'   \code{"x1*x2"}).
-#' @param covariables Optional character vector of additional covariate variable
-#'   names to include in the model (all must be columns in \code{data}). These
-#'   are checked for being "collapsed" (no variation) within trial/imputation
-#'   and are dropped when necessary.
-#' @param imp_col Character string indicating the name of the imputation
-#'   indicator column in \code{data}. Each distinct value is treated as one
-#'   imputed dataset.
-#' @param followup_offset Character; either \code{"Yes"} or \code{"No"}. When
-#'   \code{"Yes"}, an offset term \code{offset(log(followup_col))} is added to
-#'   all models.
-#' @param followup_col Character string; name of the follow-up time variable in
-#'   \code{data} to be used in the offset (if \code{followup_offset = "Yes"}).
-#'   Must be strictly positive where used.
-#' @param intercept_var Character string; name of the trial identifier variable
-#'   in \code{data}. Models are fit separately within each trial and imputation.
-#' @param model_type Character; type of GLM to fit. One of
-#'   \code{"nb"} (negative binomial via \code{MASS::glm.nb}),
-#'   \code{"poisson"}, \code{"quasipoisson"}, \code{"gaussian"}, or
-#'   \code{"binomial"}.
-#' @param model_performance Logical; if \code{TRUE}, a global model including
-#'   all trials (with trial fixed effects) is fit within each imputation to
-#'   compute basic performance indices (AIC, BIC, RMSE, etc.), which are then
-#'   pooled across imputations.
-#' @param main_term Optional character string giving the name of the model term
-#'   (as returned in \code{broom::tidy()$term}) to pool and display in the
-#'   forest plot. If \code{NULL}, no pooling or forest plot is computed.
-#' @param meta_method Character; method passed to \code{metafor::rma()} for the
-#'   random-effects meta-analysis (default \code{"REML"}).
-#' @param xlab Character; label for the x-axis of the forest plot.
-#' @param ref_line Numeric; position of the vertical reference line in the
-#'   forest plot (typically 1 for aRR / aOR).
-#' @param x_limits Optional numeric vector of length 2 giving the x-axis limits
-#'   (on the original scale) for the forest plot. If \code{NULL}, limits are
-#'   derived from the data and possibly symmetrized on the log scale if
-#'   \code{center_axis_at_one = TRUE}.
-#' @param x_breaks Optional numeric vector of break points for the x-axis
-#'   (original scale). If \code{NULL}, breaks are chosen automatically.
-#' @param center_axis_at_one Logical; if \code{TRUE}, the x-axis is made
-#'   symmetric around 1 on the log scale.
-#' @param point_size_range Numeric vector of length 2 specifying the minimum and
-#'   maximum point sizes for the forest plot (mapped to study weights).
-#' @param show_size_legend Logical; if \code{TRUE}, a legend for point size
-#'   (weights) is displayed in the forest plot.
-#' @param show_headers Logical; if \code{TRUE}, column headers (e.g.
-#'   \code{"aRR (95% CI)"}, \code{"N"}, \code{"Weight"}) are displayed above
-#'   the right-hand text columns.
-#' @param diamond_color Character; color for the pooled effect point symbol in
-#'   the forest plot.
-#' @param pooled_color Character; color for the pooled row label and text
-#'   columns (and pooled CI line/arrow).
-#' @param bold_pooled Logical; if \code{TRUE}, the pooled row label is drawn in
-#'   bold.
-#' @param margin_plot Numeric vector of length 4 giving the plot margins (top,
-#'   right, bottom, left) for the main forest panel, passed to
-#'   \code{ggplot2::margin()}.
+#' - NEW: builds \code{$table} = pooled meta-analysed estimates for ALL terms
+#'   (excluding intercept and trial fixed-effect dummies, if any).
 #'
 #' @export
 IPD_two_stage <- function(data,
@@ -147,26 +81,24 @@ IPD_two_stage <- function(data,
     exp(c(-range_max, range_max))
   }
 
-  ## --- NEW: expand predictor_vars that include "*" into the full set of terms ---
+  ## expand "*" shorthand into main + interaction term labels for checks
   expand_star_terms <- function(term_vec) {
     out <- character(0)
-
     for (t in term_vec) {
       if (grepl("\\*", t) && !grepl("I\\(", t)) {
-        # build terms(~ <t>) and extract labels (drops intercept)
-        f <- stats::as.formula(paste0("~", t))
+        f  <- stats::as.formula(paste0("~", t))
         tl <- attr(stats::terms(f), "term.labels")
         out <- c(out, tl)
       } else {
         out <- c(out, t)
       }
     }
-
     unique(out)
   }
 
   predictor_vars_expanded <- expand_star_terms(predictor_vars)
 
+  ## Rubin pooling across imputations AFTER meta fit per imputation (used for main_term only)
   pool_IPD_two_stage_inner <- function(coefs_per_trial, term, method = "REML") {
     coefs_term <- coefs_per_trial %>%
       dplyr::filter(.data$term == !!term) %>%
@@ -223,6 +155,7 @@ IPD_two_stage <- function(data,
     )
   }
 
+  ## Rubin pooling of performance across imputations (unchanged)
   pool_IPD_two_stage_performance_inner <- function(perf_list) {
     perf_df <- dplyr::bind_rows(
       lapply(names(perf_list), function(nm) {
@@ -257,6 +190,136 @@ IPD_two_stage <- function(data,
       )
 
     list(per_imputation = perf_df, pooled_summary = pooled)
+  }
+
+  ## NEW: pooled table for ALL terms (Rubin within trial, then rma across trials)
+  build_table_IPD_two_stage_inner <- function(coefs_per_trial, fit_log_tbl, trial_levels, method = "REML") {
+    if (nrow(coefs_per_trial) == 0L) return(NULL)
+
+    # N per trial (max N across imputations)
+    N_by_trial <- fit_log_tbl %>%
+      dplyr::group_by(.data$trial) %>%
+      dplyr::summarise(N = suppressWarnings(max(.data$n, na.rm = TRUE)), .groups = "drop")
+
+    # Rubin pool within each trial for each term across imputations
+    trial_term <- coefs_per_trial %>%
+      dplyr::filter(!is.na(.data$trial), .data$trial != "") %>%
+      dplyr::group_by(.data$trial, .data$term) %>%
+      dplyr::summarise(
+        M_imp = dplyr::n(),
+        Q_bar = mean(.data$estimate, na.rm = TRUE),
+        U_bar = mean(.data$std.error^2, na.rm = TRUE),
+        B_raw = stats::var(.data$estimate, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        B     = dplyr::if_else(.data$M_imp > 1, .data$B_raw, 0),
+        T_var = .data$U_bar + (1 + 1 / .data$M_imp) * .data$B,
+        SE_mi = sqrt(.data$T_var)
+      ) %>%
+      dplyr::filter(is.finite(.data$SE_mi), .data$SE_mi > 0)
+
+    if (nrow(trial_term) == 0L) return(NULL)
+
+    # exclude intercept and trial FE dummies if ever present
+    drop_patterns <- c("^\\(Intercept\\)$", paste0("^as\\.factor\\(", intercept_var, "\\)"))
+    trial_term <- trial_term %>%
+      dplyr::filter(!Reduce(`|`, lapply(drop_patterns, function(p) grepl(p, .data$term))))
+
+    terms <- sort(unique(trial_term$term))
+
+    out_list <- lapply(terms, function(tt) {
+      d <- trial_term %>% dplyr::filter(.data$term == tt)
+      k <- dplyr::n_distinct(d$trial)
+      if (k < 2) return(NULL)
+
+      mf <- metafor::rma(yi = d$Q_bar, sei = d$SE_mi, method = method)
+
+      est <- as.numeric(mf$b)
+      se  <- as.numeric(mf$se)
+      ci  <- c(est - 1.96 * se, est + 1.96 * se)
+
+      # weights (%)
+      wt <- tryCatch(as.numeric(stats::weights(mf)), error = function(e) rep(NA_real_, nrow(d)))
+      if (length(wt) == nrow(d) && all(is.finite(wt))) {
+        w_perc <- 100 * wt / sum(wt)
+      } else {
+        wt2 <- 1 / (d$SE_mi^2)
+        w_perc <- 100 * wt2 / sum(wt2)
+      }
+
+      # trial-level summary table for this term
+      trial_tbl <- d %>%
+        dplyr::left_join(N_by_trial, by = c("trial")) %>%
+        dplyr::mutate(
+          RR    = exp(.data$Q_bar),
+          RR_lo = exp(.data$Q_bar - 1.96 * .data$SE_mi),
+          RR_hi = exp(.data$Q_bar + 1.96 * .data$SE_mi),
+          Weight_percent = w_perc
+        ) %>%
+        dplyr::arrange(factor(.data$trial, levels = trial_levels))
+
+      # pooled row
+      pooled_row <- tibble::tibble(
+        trial = "Pooled (REML)",
+        term  = tt,
+        estimate = est,
+        std.error = se,
+        ci_low = ci[1],
+        ci_high = ci[2],
+        exp_estimate = exp(est),
+        exp_ci_low = exp(ci[1]),
+        exp_ci_high = exp(ci[2]),
+        tau2 = mf$tau2,
+        I2   = mf$I2,
+        H2   = mf$H2,
+        Q    = mf$QE,
+        df_Q = mf$k - 1,
+        k    = mf$k,
+        N_total = sum(trial_tbl$N, na.rm = TRUE)
+      )
+
+      # term-level summary (one row per term) + attach trial table as list-column
+      tibble::tibble(
+        term = tt,
+        pooled_log = est,
+        pooled_log_se = se,
+        ci_log_low = ci[1],
+        ci_log_high = ci[2],
+        pooled_exp = exp(est),
+        ci_exp_low = exp(ci[1]),
+        ci_exp_high = exp(ci[2]),
+        p_value = 2 * stats::pnorm(abs(est / se), lower.tail = FALSE),
+        tau2 = mf$tau2,
+        I2   = mf$I2,
+        H2   = mf$H2,
+        Q    = mf$QE,
+        df_Q = mf$k - 1,
+        k    = mf$k,
+        N_total = sum(trial_tbl$N, na.rm = TRUE),
+        trials = list(trial_tbl),
+        pooled_row = list(pooled_row)
+      )
+    })
+
+    out <- dplyr::bind_rows(out_list)
+    if (nrow(out) == 0L) return(NULL)
+
+    # Provide a "flat" version too (easy to view)
+    out_flat <- out %>%
+      dplyr::select(
+        .data$term,
+        .data$pooled_exp, .data$ci_exp_low, .data$ci_exp_high,
+        .data$pooled_log, .data$pooled_log_se,
+        .data$p_value,
+        .data$tau2, .data$I2, .data$H2, .data$Q, .data$df_Q, .data$k,
+        .data$N_total
+      )
+
+    list(
+      summary = out_flat,
+      full = out
+    )
   }
 
   forest_IPD_two_stage_inner <- function(coefs_per_trial,
@@ -406,7 +469,7 @@ IPD_two_stage <- function(data,
       margin_plot <- c(5.5, 2, 5.5, 5.5)
     }
 
-    ## ---- NEW: CI significance colouring + arrows without ticks ----
+    ## CI colour logic (grey if crosses ref line)
     df_plot <- df_plot %>%
       dplyr::mutate(
         crosses_ref = (.data$RR_lo <= ref_line & .data$RR_hi >= ref_line),
@@ -420,8 +483,8 @@ IPD_two_stage <- function(data,
     arrow_len <- grid::unit(0.18, "cm")
     tick_h    <- 0.20
 
+    ## forest panel with: segment + (ticks only if not truncated) + arrows (if truncated)
     p_forest <- ggplot2::ggplot(df_plot, ggplot2::aes(y = .data$Trial)) +
-      # CI segment (already truncated)
       ggplot2::geom_segment(
         ggplot2::aes(
           x    = .data$RR_lo_plot,
@@ -432,7 +495,6 @@ IPD_two_stage <- function(data,
         linewidth = 0.6,
         lineend   = "butt"
       ) +
-      # left tick if NOT truncated on left
       ggplot2::geom_segment(
         data = df_plot %>% dplyr::filter(!.data$lo_trunc),
         ggplot2::aes(
@@ -446,7 +508,6 @@ IPD_two_stage <- function(data,
         linewidth = 0.6,
         lineend   = "butt"
       ) +
-      # right tick if NOT truncated on right
       ggplot2::geom_segment(
         data = df_plot %>% dplyr::filter(!.data$hi_trunc),
         ggplot2::aes(
@@ -460,7 +521,6 @@ IPD_two_stage <- function(data,
         linewidth = 0.6,
         lineend   = "butt"
       ) +
-      # right arrow if truncated (no tick)
       ggplot2::geom_segment(
         data = df_plot %>% dplyr::filter(.data$hi_trunc),
         ggplot2::aes(
@@ -475,7 +535,6 @@ IPD_two_stage <- function(data,
         linewidth = 0.6,
         lineend   = "butt"
       ) +
-      # left arrow if truncated (no tick)
       ggplot2::geom_segment(
         data = df_plot %>% dplyr::filter(.data$lo_trunc),
         ggplot2::aes(
@@ -490,14 +549,12 @@ IPD_two_stage <- function(data,
         linewidth = 0.6,
         lineend   = "butt"
       ) +
-      # points (kept default; sizes reflect weights)
       ggplot2::geom_point(
         ggplot2::aes(x = .data$RR_plot, size = .data$Weight_percent, shape = .data$is_pooled),
         show.legend = show_size_legend
       ) +
       ggplot2::scale_size_continuous(range = point_size_range, name = "Weight (%)") +
       ggplot2::scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18), guide = "none") +
-      # pooled diamond (explicit colour)
       ggplot2::geom_point(
         data = df_plot %>% dplyr::filter(.data$is_pooled),
         ggplot2::aes(y = .data$Trial, x = .data$RR_plot),
@@ -686,7 +743,7 @@ IPD_two_stage <- function(data,
         }, logical(1))
       ]
 
-      # check collapse on expanded main effects when possible (columns only)
+      # collapse checks on expanded main-effect terms when those are columns
       predictor_collapsed <- vapply(predictor_vars_expanded, function(v) {
         if (v %in% names(dat_trial)) is_collapsed(dat_trial[[v]]) else FALSE
       }, logical(1))
@@ -817,7 +874,17 @@ IPD_two_stage <- function(data,
   pooled_perf <- if (!is.null(performance_per_imp)) pool_IPD_two_stage_performance_inner(performance_per_imp) else NULL
 
   ## ------------------------------------------------------------------
-  ## 4) Final object
+  ## 4) Build pooled TABLE for all terms (NEW)
+  ## ------------------------------------------------------------------
+  table_obj <- build_table_IPD_two_stage_inner(
+    coefs_per_trial = coefs_per_trial,
+    fit_log_tbl     = fit_log_tbl,
+    trial_levels    = trial_levels,
+    method          = meta_method
+  )
+
+  ## ------------------------------------------------------------------
+  ## 5) Final object
   ## ------------------------------------------------------------------
   out <- list(
     call                = match.call(),
@@ -836,11 +903,15 @@ IPD_two_stage <- function(data,
     fit_log             = fit_log_tbl,
     trial_levels        = trial_levels,
     Pooled_performance  = pooled_perf,
-    perf_pool           = pooled_perf
+    perf_pool           = pooled_perf,
+
+    # NEW:
+    table              = if (is.null(table_obj)) NULL else table_obj$summary,
+    table_full         = if (is.null(table_obj)) NULL else table_obj$full
   )
 
   ## ------------------------------------------------------------------
-  ## 5) Optional: pooled main term + forest plot
+  ## 6) Optional: pooled main term + forest plot
   ## ------------------------------------------------------------------
   if (!is.null(main_term)) {
     out$pool_main <- pool_IPD_two_stage_inner(coefs_per_trial, main_term, meta_method)
