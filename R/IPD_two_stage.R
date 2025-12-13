@@ -193,59 +193,28 @@ IPD_two_stage <- function(data,
                           bold_pooled        = FALSE,
                           margin_plot        = c(5.5, 2, 5.5, 5.5)
 ) {
+
   ## ------------------------------------------------------------------
-  ## Internal helpers (pooling, performance, forest)
+  ## Internal helpers
   ## ------------------------------------------------------------------
 
-  # helper to detect collapsed covariate (no variation / all NA)
   is_collapsed <- function(vec) {
     x <- vec[!is.na(vec)]
     if (length(x) == 0L) TRUE else length(unique(x)) < 2L
   }
 
-  # Expand formula-style terms like "x1*x2" into c("x1","x2","x1:x2")
-  # Leaves plain variable names unchanged.
-  expand_star_terms <- function(term_vec) {
-    if (length(term_vec) == 0) return(character(0))
-
-    out <- unique(unlist(lapply(term_vec, function(tt) {
-      tt <- trimws(tt)
-
-      # simple names (fast path)
-      if (!grepl("[*:+()]", tt)) return(tt)
-
-      # expand using formula parser (handles x*y*z properly)
-      labs <- tryCatch(
-        attr(stats::terms(stats::as.formula(paste0("~ ", tt))), "term.labels"),
-        error = function(e) tt
-      )
-
-      if (length(labs) == 0) tt else labs
-    })))
-
-    out
-  }
-
-  # numerical helpers for forest
   auto_log_breaks <- function(lims) {
     lb <- lims[1]; ub <- lims[2]
     std <- c(0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9,
              1, 1.1, 1.25, 1.4, 1.5, 1.6, 1.75,
-             2, 2.5, 3, 4, 5)
+             2, 2.5, 3, 4, 5, 7, 10, 15, 20)
     br <- std[std >= lb & std <= ub]
-    if (length(br) == 0) {
-      br <- exp(pretty(log(c(lb, ub)), n = 5))
-    }
-    if (!any(abs(br - 1) < 1e-8)) {
-      br <- sort(unique(c(br, 1)))
-    }
+    if (length(br) == 0) br <- exp(pretty(log(c(lb, ub)), n = 5))
+    if (!any(abs(br - 1) < 1e-8)) br <- sort(unique(c(br, 1)))
     br
   }
 
-  compute_centered_limits <- function(lims,
-                                      from_data_lower,
-                                      from_data_upper,
-                                      center = TRUE) {
+  compute_centered_limits <- function(lims, from_data_lower, from_data_upper, center = TRUE) {
     if (!center) {
       if (is.null(lims)) return(c(from_data_lower, from_data_upper))
       return(lims)
@@ -260,7 +229,6 @@ IPD_two_stage <- function(data,
     exp(c(-range_max, range_max))
   }
 
-  # pooling of term across imputations & trials (Rubin + meta-analysis)
   pool_IPD_two_stage_inner <- function(coefs_per_trial, term, method = "REML") {
     coefs_term <- coefs_per_trial %>%
       dplyr::filter(.data$term == !!term) %>%
@@ -292,10 +260,13 @@ IPD_two_stage <- function(data,
     Q_bar <- mean(Q_i)
     U_bar <- mean(U_i)
     B     <- stats::var(Q_i)
+    if (!is.finite(B)) B <- 0
     T_var <- U_bar + (1 + 1 / m) * B
     se_pooled <- sqrt(T_var)
 
     df <- (m - 1) * (1 + U_bar / ((1 + 1/m) * B))^2
+    if (!is.finite(df)) df <- m - 1
+
     t_val <- Q_bar / se_pooled
     p_val <- 2 * stats::pt(abs(t_val), df = df, lower.tail = FALSE)
     ci_log <- Q_bar + c(-1, 1) * stats::qt(0.975, df = df) * se_pooled
@@ -304,13 +275,9 @@ IPD_two_stage <- function(data,
       term                = term,
       method              = method,
       m_imputations       = m,
-      beta_imp            = Q_i,
-      se_imp              = sqrt(U_i),
-      meta_per_imp        = meta_per_imp,
       pooled_log_estimate = Q_bar,
       pooled_log_se       = se_pooled,
       df                  = df,
-      t_value             = t_val,
       p_value             = p_val,
       ci_log              = ci_log,
       pooled_estimate_exp = exp(Q_bar),
@@ -318,7 +285,6 @@ IPD_two_stage <- function(data,
     )
   }
 
-  # pool model-performance indices
   pool_IPD_two_stage_performance_inner <- function(perf_list) {
     perf_df <- dplyr::bind_rows(
       lapply(names(perf_list), function(nm) {
@@ -339,30 +305,22 @@ IPD_two_stage <- function(data,
       dplyr::summarise(
         m = dplyr::n(),
         AIC_mean  = mean(.data$AIC, na.rm = TRUE),
-        AIC_sd    = sd(.data$AIC, na.rm = TRUE),
+        AIC_sd    = stats::sd(.data$AIC, na.rm = TRUE),
         BIC_mean  = mean(.data$BIC, na.rm = TRUE),
-        BIC_sd    = sd(.data$BIC, na.rm = TRUE),
+        BIC_sd    = stats::sd(.data$BIC, na.rm = TRUE),
         logLik_mean = mean(.data$logLik, na.rm = TRUE),
-        logLik_sd   = sd(.data$logLik, na.rm = TRUE),
+        logLik_sd   = stats::sd(.data$logLik, na.rm = TRUE),
         RMSE_mean   = mean(.data$RMSE, na.rm = TRUE),
-        RMSE_sd     = sd(.data$RMSE, na.rm = TRUE),
+        RMSE_sd     = stats::sd(.data$RMSE, na.rm = TRUE),
         Sigma_mean  = mean(.data$Sigma, na.rm = TRUE),
-        Sigma_sd    = sd(.data$Sigma, na.rm = TRUE),
+        Sigma_sd    = stats::sd(.data$Sigma, na.rm = TRUE),
         Score_log_mean = mean(.data$Score_log, na.rm = TRUE),
-        Score_log_sd   = sd(.data$Score_log, na.rm = TRUE),
-        AIC_range  = paste0(min(.data$AIC, na.rm = TRUE), " – ",
-                            max(.data$AIC, na.rm = TRUE)),
-        RMSE_range = paste0(min(.data$RMSE, na.rm = TRUE), " – ",
-                            max(.data$RMSE, na.rm = TRUE))
+        Score_log_sd   = stats::sd(.data$Score_log, na.rm = TRUE)
       )
 
-    list(
-      per_imputation = perf_df,
-      pooled_summary = pooled
-    )
+    list(per_imputation = perf_df, pooled_summary = pooled)
   }
 
-  # Build forest plot + right columns for one term
   forest_IPD_two_stage_inner <- function(coefs_per_trial,
                                          fit_log_tbl,
                                          trial_levels,
@@ -380,7 +338,7 @@ IPD_two_stage <- function(data,
                                          bold_pooled,
                                          meta_method,
                                          margin_plot) {
-    ## ---- keep term of interest ----
+
     coefs_term <- coefs_per_trial %>%
       dplyr::filter(.data$term == !!term) %>%
       dplyr::filter(!is.na(.data$trial), .data$trial != "")
@@ -389,7 +347,7 @@ IPD_two_stage <- function(data,
       stop("No coefficients found for term = ", term)
     }
 
-    ## ---- Rubin pooling per trial (across imputations) -------------
+    ## Rubin pooling per trial across imputations
     trial_effects <- coefs_term %>%
       dplyr::group_by(.data$trial) %>%
       dplyr::summarise(
@@ -406,22 +364,17 @@ IPD_two_stage <- function(data,
       ) %>%
       dplyr::filter(is.finite(.data$SE_mi), .data$SE_mi > 0)
 
-    if (nrow(trial_effects) == 0L) {
-      stop("All trial-specific SEs are non-finite for term = ", term)
-    }
+    if (nrow(trial_effects) == 0L) stop("All trial-specific SEs are non-finite for term = ", term)
 
-    ## ---- Add N per trial from fit_log -----------------------------
+    ## N per trial
     N_by_trial <- fit_log_tbl %>%
       dplyr::group_by(.data$trial) %>%
-      dplyr::summarise(
-        N = suppressWarnings(max(.data$n, na.rm = TRUE)),
-        .groups = "drop"
-      )
+      dplyr::summarise(N = suppressWarnings(max(.data$n, na.rm = TRUE)), .groups = "drop")
 
     trial_effects <- trial_effects %>%
       dplyr::left_join(N_by_trial, by = "trial")
 
-    ## ---- Meta-analysis across trials ------------------------------
+    ## meta across trials
     meta_fit <- metafor::rma(
       yi     = trial_effects$Q_bar,
       sei    = trial_effects$SE_mi,
@@ -430,11 +383,9 @@ IPD_two_stage <- function(data,
 
     pooled_log <- as.numeric(meta_fit$b)
     pooled_se  <- as.numeric(meta_fit$se)
-    pooled_ci  <- c(pooled_log - 1.96 * pooled_se,
-                    pooled_log + 1.96 * pooled_se)
+    pooled_ci  <- c(pooled_log - 1.96 * pooled_se, pooled_log + 1.96 * pooled_se)
 
-    wt <- tryCatch(as.numeric(stats::weights(meta_fit)),
-                   error = function(e) numeric(0))
+    wt <- tryCatch(as.numeric(stats::weights(meta_fit)), error = function(e) numeric(0))
     if (length(wt) == nrow(trial_effects) && all(is.finite(wt))) {
       Weight_percent <- 100 * wt / sum(wt)
     } else {
@@ -442,7 +393,6 @@ IPD_two_stage <- function(data,
       Weight_percent <- 100 * wt2 / sum(wt2)
     }
 
-    ## ---- df_plot with text columns -------------------------------
     format_num <- function(x) ifelse(x >= 10, sprintf("%.0f", x), sprintf("%.1f", x))
 
     df_plot <- trial_effects %>%
@@ -453,8 +403,7 @@ IPD_two_stage <- function(data,
         RR_hi  = exp(.data$Q_bar + 1.96 * .data$SE_mi),
         Weight_percent = Weight_percent,
         aRR_CI = sprintf("%.2f [%.2f–%.2f]", .data$RR, .data$RR_lo, .data$RR_hi),
-        N_col  = ifelse(is.finite(.data$N),
-                        format(.data$N, big.mark = ","), ""),
+        N_col  = ifelse(is.finite(.data$N), format(.data$N, big.mark = ","), ""),
         W_col  = paste0(format_num(.data$Weight_percent), "%")
       ) %>%
       dplyr::select(.data$Trial, .data$RR, .data$RR_lo, .data$RR_hi,
@@ -469,17 +418,14 @@ IPD_two_stage <- function(data,
     pooled_row$RR_lo          <- exp(pooled_ci[1])
     pooled_row$RR_hi          <- exp(pooled_ci[2])
     pooled_row$aRR_CI         <- sprintf("%.2f [%.2f–%.2f]",
-                                         exp(pooled_log),
-                                         exp(pooled_ci[1]),
-                                         exp(pooled_ci[2]))
-    pooled_row$N_col          <- format(sum(trial_effects$N, na.rm = TRUE),
-                                        big.mark = ",")
+                                         exp(pooled_log), exp(pooled_ci[1]), exp(pooled_ci[2]))
+    pooled_row$N_col          <- format(sum(trial_effects$N, na.rm = TRUE), big.mark = ",")
     pooled_row$W_col          <- ""
     pooled_row$Weight_percent <- max(Weight_percent, na.rm = TRUE)
 
     df_plot <- dplyr::bind_rows(df_plot, pooled_row)
 
-    ## ---- Axis limits / breaks, truncation ------------------------
+    ## x limits
     if (is.null(x_limits)) {
       lower <- min(df_plot$RR_lo, na.rm = TRUE)
       upper <- max(df_plot$RR_hi, na.rm = TRUE)
@@ -488,68 +434,88 @@ IPD_two_stage <- function(data,
     }
 
     final_limits <- compute_centered_limits(
-      lims             = c(lower, upper),
-      from_data_lower  = min(df_plot$RR_lo, na.rm = TRUE),
-      from_data_upper  = max(df_plot$RR_hi, na.rm = TRUE),
-      center           = center_axis_at_one
+      lims            = c(lower, upper),
+      from_data_lower = min(df_plot$RR_lo, na.rm = TRUE),
+      from_data_upper = max(df_plot$RR_hi, na.rm = TRUE),
+      center          = center_axis_at_one
     )
 
+    ## ---- truncation flags + plotting values ----
     df_plot <- df_plot %>%
       dplyr::mutate(
+        lo_trunc  = .data$RR_lo < final_limits[1],
+        hi_trunc  = .data$RR_hi > final_limits[2],
         RR_lo_plot = pmax(.data$RR_lo, final_limits[1]),
         RR_hi_plot = pmin(.data$RR_hi, final_limits[2]),
-        RR_plot    = pmin(pmax(.data$RR, final_limits[1]),
-                          final_limits[2]),
-        off_scale  = (.data$RR < final_limits[1]) |
-          (.data$RR > final_limits[2]),
+        RR_plot    = pmin(pmax(.data$RR, final_limits[1]), final_limits[2]),
         is_pooled  = (.data$Trial == "Pooled (REML)")
       )
 
+    ## breaks
     if (!is.null(x_breaks)) {
-      stopifnot(all(is.finite(x_breaks)), all(x_breaks > 0))
-      x_breaks_final <- x_breaks[x_breaks >= final_limits[1] &
-                                   x_breaks <= final_limits[2]]
-      if (length(x_breaks_final) == 0) {
-        x_breaks_final <- auto_log_breaks(final_limits)
-      }
+      x_breaks_final <- x_breaks[x_breaks >= final_limits[1] & x_breaks <= final_limits[2]]
+      if (length(x_breaks_final) == 0) x_breaks_final <- auto_log_breaks(final_limits)
     } else {
       x_breaks_final <- auto_log_breaks(final_limits)
     }
 
-    ## ---- Y-order: trials top → bottom, pooled last ---------------
+    ## y order
     trials_ord <- trial_levels[trial_levels %in% df_plot$Trial]
     levels_vec <- c(trials_ord, "Pooled (REML)")
     levels_vec <- levels_vec[!duplicated(levels_vec)]
     y_levels_rev <- rev(levels_vec)
     df_plot$Trial <- factor(df_plot$Trial, levels = y_levels_rev)
 
-    ## ---- Main forest panel (no left labels) ----------------------
     if (is.null(margin_plot) || length(margin_plot) != 4L) {
       margin_plot <- c(5.5, 2, 5.5, 5.5)
     }
 
+    ## ---- forest panel ----
     p_forest <- ggplot2::ggplot(df_plot,
-                                ggplot2::aes(y = .data$Trial,
-                                             x = .data$RR_plot)) +
+                                ggplot2::aes(y = .data$Trial, x = .data$RR_plot)) +
       ggplot2::geom_errorbarh(
-        ggplot2::aes(xmin = .data$RR_lo_plot, xmax = .data$RR_hi_plot,
-                     colour = .data$RR_lo <= 1 & .data$RR_hi >= 1),
+        ggplot2::aes(xmin = .data$RR_lo_plot, xmax = .data$RR_hi_plot),
         height = 0.2
+      )
+
+    ## ---- NEW: arrowheads for truncated CIs ----
+    arrow_len <- grid::unit(0.18, "cm")
+
+    # draw arrows only for NON-pooled rows (optional, usually preferred)
+    p_forest <- p_forest +
+      ggplot2::geom_segment(
+        data = df_plot %>% dplyr::filter(.data$hi_trunc, !.data$is_pooled),
+        ggplot2::aes(
+          x    = final_limits[2] / 1.12,
+          xend = final_limits[2],
+          y    = .data$Trial,
+          yend = .data$Trial
+        ),
+        inherit.aes = FALSE,
+        arrow = ggplot2::arrow(type = "closed", length = arrow_len),
+        linewidth = 0.6
       ) +
-      ggplot2::scale_color_manual(values = c(`TRUE` = "grey60",
-                                             `FALSE` = "black"),
-                                  guide = "none") +
+      ggplot2::geom_segment(
+        data = df_plot %>% dplyr::filter(.data$lo_trunc, !.data$is_pooled),
+        ggplot2::aes(
+          x    = final_limits[1] * 1.12,
+          xend = final_limits[1],
+          y    = .data$Trial,
+          yend = .data$Trial
+        ),
+        inherit.aes = FALSE,
+        arrow = ggplot2::arrow(type = "closed", length = arrow_len),
+        linewidth = 0.6
+      )
+
+    ## points + pooled diamond
+    p_forest <- p_forest +
       ggplot2::geom_point(
-        ggplot2::aes(size = .data$Weight_percent,
-                     shape = .data$is_pooled,
-                     alpha = ifelse(.data$off_scale, 0.8, 1)),
+        ggplot2::aes(size = .data$Weight_percent, shape = .data$is_pooled),
         show.legend = show_size_legend
       ) +
-      ggplot2::scale_size_continuous(range = point_size_range,
-                                     name = "Weight (%)") +
-      ggplot2::scale_alpha_identity() +
-      ggplot2::scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18),
-                                  guide = "none") +
+      ggplot2::scale_size_continuous(range = point_size_range, name = "Weight (%)") +
+      ggplot2::scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18), guide = "none") +
       ggplot2::geom_point(
         data = df_plot %>% dplyr::filter(.data$is_pooled),
         ggplot2::aes(y = .data$Trial, x = .data$RR_plot),
@@ -558,38 +524,30 @@ IPD_two_stage <- function(data,
         shape  = 18,
         size   = max(point_size_range) * 1.1
       ) +
-      ggplot2::geom_vline(xintercept = ref_line,
-                          linetype = "dashed", linewidth = 0.5) +
-      ggplot2::scale_x_log10(breaks = x_breaks_final,
-                             limits = final_limits) +
+      ggplot2::geom_vline(xintercept = ref_line, linetype = "dashed", linewidth = 0.5) +
+      ggplot2::scale_x_log10(breaks = x_breaks_final, limits = final_limits) +
       ggplot2::scale_y_discrete(limits = y_levels_rev) +
-      ggplot2::labs(x = xlab, y = NULL, title = NULL) +
+      ggplot2::labs(x = xlab, y = NULL) +
       ggplot2::theme_minimal(base_size = 12) +
       ggplot2::theme(
-        plot.margin      = ggplot2::margin(margin_plot[1],
-                                           margin_plot[2],
-                                           margin_plot[3],
-                                           margin_plot[4]),
+        plot.margin      = ggplot2::margin(margin_plot[1], margin_plot[2],
+                                           margin_plot[3], margin_plot[4]),
         panel.grid.minor = ggplot2::element_blank(),
         axis.text.y      = ggplot2::element_blank(),
         axis.ticks.y     = ggplot2::element_blank()
       )
 
-    ## ---- Left column: trial labels, pooled in colour/bold --------
+    ## left labels
     df_left <- data.frame(
       Trial = df_plot$Trial,
       lab   = as.character(df_plot$Trial),
-      col   = ifelse(as.character(df_plot$Trial) == "Pooled (REML)",
-                     pooled_color, "black"),
-      face  = ifelse(as.character(df_plot$Trial) == "Pooled (REML)" &
-                       bold_pooled,
-                     "bold", "plain")
+      col   = ifelse(as.character(df_plot$Trial) == "Pooled (REML)", pooled_color, "black"),
+      face  = ifelse(as.character(df_plot$Trial) == "Pooled (REML)" & bold_pooled, "bold", "plain")
     )
 
     p_left <- ggplot2::ggplot(
       df_left,
-      ggplot2::aes(y = .data$Trial, x = 1,
-                   label = .data$lab, colour = .data$col)
+      ggplot2::aes(y = .data$Trial, x = 1, label = .data$lab, colour = .data$col)
     ) +
       ggplot2::geom_text(hjust = 1, size = 3.2, fontface = df_left$face) +
       ggplot2::scale_x_continuous(limits = c(0, 1), expand = c(0.02, 0)) +
@@ -598,32 +556,22 @@ IPD_two_stage <- function(data,
       ggplot2::theme_void(base_size = 12) +
       ggplot2::theme(
         plot.margin = ggplot2::margin(5.5, 0, 5.5, 5.5),
-        plot.title  = ggplot2::element_text(
-          hjust  = 1, size = 11, face = "bold",
-          margin = ggplot2::margin(b = 4)
-        )
+        plot.title  = ggplot2::element_text(hjust = 1, size = 11, face = "bold",
+                                            margin = ggplot2::margin(b = 4))
       )
 
-    ## ---- Right-hand text columns --------------------------------
     make_text_col <- function(labels, title, color_vec, x_pos = 0.02) {
-      df_txt <- data.frame(Trial = df_plot$Trial,
-                           lab   = labels,
-                           col   = color_vec)
+      df_txt <- data.frame(Trial = df_plot$Trial, lab = labels, col = color_vec)
       ggplot2::ggplot(df_txt,
-                      ggplot2::aes(y = .data$Trial,
-                                   x = x_pos,
-                                   label = .data$lab,
-                                   colour = .data$col)) +
+                      ggplot2::aes(y = .data$Trial, x = x_pos, label = .data$lab, colour = .data$col)) +
         ggplot2::geom_text(hjust = 0, size = 3.2) +
         ggplot2::scale_x_continuous(limits = c(0, 1), expand = c(0.02, 0)) +
         ggplot2::scale_colour_identity() +
-        ggplot2::labs(x = NULL, y = NULL,
-                      title = if (show_headers) title else NULL) +
+        ggplot2::labs(x = NULL, y = NULL, title = if (show_headers) title else NULL) +
         ggplot2::theme_void(base_size = 12) +
         ggplot2::theme(
           plot.margin = ggplot2::margin(5.5, 1, 5.5, 0),
-          plot.title  = ggplot2::element_text(hjust = 0,
-                                              size = 11, face = "bold",
+          plot.title  = ggplot2::element_text(hjust = 0, size = 11, face = "bold",
                                               margin = ggplot2::margin(b = 4)),
           axis.text.y = ggplot2::element_blank()
         ) +
@@ -637,7 +585,6 @@ IPD_two_stage <- function(data,
     p_col2 <- make_text_col(df_plot$N_col,  "N",            col_vec)
     p_col3 <- make_text_col(df_plot$W_col,  "Weight",       col_vec)
 
-    ## ---- Assemble full plot --------------------------------------
     full_plot <- cowplot::plot_grid(
       p_left, p_forest, p_col1, p_col2, p_col3,
       nrow       = 1,
@@ -655,16 +602,12 @@ IPD_two_stage <- function(data,
       k    = meta_fit$k
     )
 
-    list(
-      plot          = full_plot,
-      pooled_log    = pooled_log,
-      pooled_ci     = pooled_ci,
-      heterogeneity = heterogeneity_df
-    )
+    list(plot = full_plot, pooled_log = pooled_log, pooled_ci = pooled_ci,
+         heterogeneity = heterogeneity_df)
   }
 
   ## ------------------------------------------------------------------
-  ## 1) Basic checks and set-up
+  ## 1) Basic checks & set-up
   ## ------------------------------------------------------------------
   stopifnot(is.data.frame(data))
   if (!imp_col %in% names(data)) stop("imp_col '", imp_col, "' not found in data.")
@@ -682,22 +625,15 @@ IPD_two_stage <- function(data,
 
   all_covars <- if (is.null(covariables)) character(0) else covariables
 
-  # --- NEW: expand "*" terms in predictor_vars ---
-  predictor_vars_expanded <- expand_star_terms(predictor_vars)
-
-  rhs_template <- c(predictor_vars_expanded, all_covars)
+  rhs_template <- c(predictor_vars, all_covars)
   rhs_string   <- paste(rhs_template, collapse = " + ")
   if (followup_offset == "Yes") {
     rhs_string <- paste0(rhs_string, " + offset(log(", followup_col, "))")
   }
   form_global <- stats::as.formula(paste0(outcome_var, " ~ ", rhs_string))
 
-  # trial order
-  if (is.factor(data[[intercept_var]])) {
-    trial_levels <- levels(data[[intercept_var]])
-  } else {
-    trial_levels <- unique(as.character(data[[intercept_var]]))
-  }
+  trial_levels <- if (is.factor(data[[intercept_var]])) levels(data[[intercept_var]])
+  else unique(as.character(data[[intercept_var]]))
 
   imp_values   <- sort(unique(data[[imp_col]]))
   trial_values <- trial_levels
@@ -709,43 +645,37 @@ IPD_two_stage <- function(data,
   fit_log   <- list()
   log_index <- 0L
 
-  ## ------------------------------------------------------------------
-  ## 2) Main loop over imputations & trials
-  ## ------------------------------------------------------------------
   fit_one_model <- function(dat_trial, model_type, form) {
     w_msgs <- character(0)
-    res <- tryCatch(
-      {
-        m <- withCallingHandlers(
-          {
-            if (model_type == "nb") {
-              MASS::glm.nb(formula = form, data = dat_trial)
-            } else if (model_type == "poisson") {
-              stats::glm(formula = form, data = dat_trial, family = stats::poisson())
-            } else if (model_type == "quasipoisson") {
-              stats::glm(formula = form, data = dat_trial, family = stats::quasipoisson())
-            } else if (model_type == "gaussian") {
-              stats::glm(formula = form, data = dat_trial, family = stats::gaussian())
-            } else if (model_type == "binomial") {
-              stats::glm(formula = form, data = dat_trial, family = stats::binomial())
-            } else {
-              stop("Unsupported model_type: ", model_type)
-            }
-          },
-          warning = function(w) {
-            w_msgs <<- c(w_msgs, conditionMessage(w))
-            invokeRestart("muffleWarning")
-          }
-        )
-        list(ok = TRUE, model = m, error = NULL, warning = w_msgs)
-      },
-      error = function(e) {
-        list(ok = FALSE, model = NULL, error = conditionMessage(e), warning = w_msgs)
-      }
-    )
+    res <- tryCatch({
+      m <- withCallingHandlers({
+        if (model_type == "nb") {
+          MASS::glm.nb(formula = form, data = dat_trial)
+        } else if (model_type == "poisson") {
+          stats::glm(formula = form, data = dat_trial, family = stats::poisson())
+        } else if (model_type == "quasipoisson") {
+          stats::glm(formula = form, data = dat_trial, family = stats::quasipoisson())
+        } else if (model_type == "gaussian") {
+          stats::glm(formula = form, data = dat_trial, family = stats::gaussian())
+        } else if (model_type == "binomial") {
+          stats::glm(formula = form, data = dat_trial, family = stats::binomial())
+        } else {
+          stop("Unsupported model_type: ", model_type)
+        }
+      }, warning = function(w) {
+        w_msgs <<- c(w_msgs, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      })
+      list(ok = TRUE, model = m, error = NULL, warning = w_msgs)
+    }, error = function(e) {
+      list(ok = FALSE, model = NULL, error = conditionMessage(e), warning = w_msgs)
+    })
     res
   }
 
+  ## ------------------------------------------------------------------
+  ## 2) Loop over imputations & trials
+  ## ------------------------------------------------------------------
   for (imp in imp_values) {
     dat_imp <- data[data[[imp_col]] == imp, , drop = FALSE]
 
@@ -775,8 +705,10 @@ IPD_two_stage <- function(data,
         }, logical(1))
       ]
 
-      # predictors: only check collapsed if it is a literal column in the data
-      predictor_collapsed <- vapply(predictor_vars_expanded, function(v) {
+      # IMPORTANT:
+      # Only check predictor variation if predictor term is an actual column.
+      # Interaction shorthand like "x*y" or "x:y" is NOT a column → we skip collapse check.
+      predictor_collapsed <- vapply(predictor_vars, function(v) {
         if (v %in% names(dat_trial)) is_collapsed(dat_trial[[v]]) else FALSE
       }, logical(1))
 
@@ -789,28 +721,20 @@ IPD_two_stage <- function(data,
           ok             = FALSE,
           error          = paste0(
             "Predictor(s) with no variation in this trial/imp: ",
-            paste(predictor_vars_expanded[predictor_collapsed], collapse = ", ")
+            paste(predictor_vars[predictor_collapsed], collapse = ", ")
           ),
           warning        = NA_character_,
-          dropped_covars = if (length(collapsed_covars) > 0L)
-            paste(collapsed_covars, collapse = "; ")
+          dropped_covars = if (length(collapsed_covars) > 0L) paste(collapsed_covars, collapse = "; ")
           else NA_character_
         )
         next
       }
 
-      rhs_terms_trial <- c(
-        predictor_vars_expanded,
-        setdiff(all_covars, collapsed_covars)
-      )
+      rhs_terms_trial <- c(predictor_vars, setdiff(all_covars, collapsed_covars))
       rhs_trial <- paste(rhs_terms_trial, collapse = " + ")
-
-      if (followup_offset == "Yes") {
-        rhs_trial <- paste0(rhs_trial, " + offset(log(", followup_col, "))")
-      }
+      if (followup_offset == "Yes") rhs_trial <- paste0(rhs_trial, " + offset(log(", followup_col, "))")
 
       form_trial <- stats::as.formula(paste0(outcome_var, " ~ ", rhs_trial))
-
       fit_res <- fit_one_model(dat_trial, model_type, form_trial)
 
       log_index <- log_index + 1L
@@ -820,11 +744,9 @@ IPD_two_stage <- function(data,
         n              = nrow(dat_trial),
         ok             = fit_res$ok,
         error          = if (!is.null(fit_res$error)) fit_res$error else NA_character_,
-        warning        = if (length(fit_res$warning) > 0L)
-          paste(unique(fit_res$warning), collapse = " | ")
+        warning        = if (length(fit_res$warning) > 0L) paste(unique(fit_res$warning), collapse = " | ")
         else NA_character_,
-        dropped_covars = if (length(collapsed_covars) > 0L)
-          paste(collapsed_covars, collapse = "; ")
+        dropped_covars = if (length(collapsed_covars) > 0L) paste(collapsed_covars, collapse = "; ")
         else NA_character_
       )
 
@@ -842,6 +764,7 @@ IPD_two_stage <- function(data,
   }
 
   coefs_per_trial <- dplyr::bind_rows(coefs_list)
+  fit_log_tbl     <- dplyr::bind_rows(fit_log)
 
   ## ------------------------------------------------------------------
   ## 3) Performance per imputation (optional)
@@ -861,46 +784,37 @@ IPD_two_stage <- function(data,
       ]
 
       rhs_perf_terms <- c(
-        predictor_vars_expanded,
+        predictor_vars,
         setdiff(all_covars, collapsed_covars_imp),
         paste0("as.factor(", intercept_var, ")")
       )
       rhs_perf <- paste(rhs_perf_terms, collapse = " + ")
-      if (followup_offset == "Yes") {
-        rhs_perf <- paste0(rhs_perf, " + offset(log(", followup_col, "))")
-      }
+      if (followup_offset == "Yes") rhs_perf <- paste0(rhs_perf, " + offset(log(", followup_col, "))")
+
       form_perf <- stats::as.formula(paste0(outcome_var, " ~ ", rhs_perf))
 
-      perf_fit <- tryCatch(
-        {
-          if (model_type == "nb") {
-            MASS::glm.nb(formula = form_perf, data = dat_imp)
-          } else if (model_type == "poisson") {
-            stats::glm(formula = form_perf, data = dat_imp, family = stats::poisson())
-          } else if (model_type == "quasipoisson") {
-            stats::glm(formula = form_perf, data = dat_imp, family = stats::quasipoisson())
-          } else if (model_type == "gaussian") {
-            stats::glm(formula = form_perf, data = dat_imp, family = stats::gaussian())
-          } else if (model_type == "binomial") {
-            stats::glm(formula = form_perf, data = dat_imp, family = stats::binomial())
-          } else {
-            stop("Unsupported model_type for performance.")
-          }
-        },
-        error = function(e) NULL
-      )
+      perf_fit <- tryCatch({
+        if (model_type == "nb") {
+          MASS::glm.nb(formula = form_perf, data = dat_imp)
+        } else if (model_type == "poisson") {
+          stats::glm(formula = form_perf, data = dat_imp, family = stats::poisson())
+        } else if (model_type == "quasipoisson") {
+          stats::glm(formula = form_perf, data = dat_imp, family = stats::quasipoisson())
+        } else if (model_type == "gaussian") {
+          stats::glm(formula = form_perf, data = dat_imp, family = stats::gaussian())
+        } else if (model_type == "binomial") {
+          stats::glm(formula = form_perf, data = dat_imp, family = stats::binomial())
+        } else {
+          stop("Unsupported model_type for performance.")
+        }
+      }, error = function(e) NULL)
 
       if (!is.null(perf_fit)) {
         y_obs  <- dat_imp[[outcome_var]]
         mu_hat <- stats::predict(perf_fit, type = "response")
         rmse <- sqrt(mean((y_obs - mu_hat)^2, na.rm = TRUE))
 
-        if (inherits(perf_fit, "negbin")) {
-          sigma <- sqrt(1)
-        } else {
-          sigma <- sqrt(summary(perf_fit)$dispersion)
-        }
-
+        sigma <- if (inherits(perf_fit, "negbin")) sqrt(1) else sqrt(summary(perf_fit)$dispersion)
         loglik    <- as.numeric(stats::logLik(perf_fit))
         n_obs     <- length(y_obs)
         score_log <- loglik / n_obs
@@ -921,173 +835,16 @@ IPD_two_stage <- function(data,
     performance_per_imp <- perf_list
   }
 
-  fit_log_tbl <- dplyr::bind_rows(fit_log)
+  pooled_perf <- if (!is.null(performance_per_imp)) pool_IPD_two_stage_performance_inner(performance_per_imp) else NULL
 
   ## ------------------------------------------------------------------
-  ## 4) Build pooled fixed-effects table & intercepts + heterogeneity
+  ## 4) Final object
   ## ------------------------------------------------------------------
-  meta_pool_term <- function(df_term, model_type, meta_method) {
-    if (nrow(df_term) < 1L) return(NULL)
-    df_term <- df_term[is.finite(df_term$SE_mi) & df_term$SE_mi > 0, , drop = FALSE]
-    if (nrow(df_term) < 1L) return(NULL)
-
-    meta_fit <- tryCatch(
-      metafor::rma(yi = df_term$Q_bar, sei = df_term$SE_mi, method = meta_method),
-      error = function(e) NULL
-    )
-
-    if (!is.null(meta_fit)) {
-      est <- as.numeric(meta_fit$b)
-      se  <- as.numeric(meta_fit$se)
-      tau2 <- meta_fit$tau2
-      I2   <- meta_fit$I2
-      H2   <- meta_fit$H2
-      Q    <- meta_fit$QE
-      df_Q <- meta_fit$k - 1
-      k    <- meta_fit$k
-    } else {
-      w <- 1 / (df_term$SE_mi^2)
-      if (!all(is.finite(w)) || sum(w) <= 0) return(NULL)
-      est <- sum(w * df_term$Q_bar) / sum(w)
-      se  <- sqrt(1 / sum(w))
-      tau2 <- I2 <- H2 <- Q <- df_Q <- NA_real_
-      k    <- nrow(df_term)
-    }
-
-    z  <- est / se
-    p  <- 2 * stats::pnorm(abs(z), lower.tail = FALSE)
-    ci_low  <- est - 1.96 * se
-    ci_high <- est + 1.96 * se
-
-    if (model_type %in% c("nb", "poisson", "quasipoisson", "binomial")) {
-      exp_est <- exp(est)
-      exp_low <- exp(ci_low)
-      exp_high <- exp(ci_high)
-    } else {
-      exp_est <- exp_low <- exp_high <- NA_real_
-    }
-
-    data.frame(
-      term           = df_term$term[1],
-      estimate       = est,
-      std.error      = se,
-      `2.5 %`        = ci_low,
-      `97.5 %`       = ci_high,
-      p.value        = p,
-      exp_estimate   = exp_est,
-      exp_CI95_lower = exp_low,
-      exp_CI95_upper = exp_high,
-      tau2           = tau2,
-      I2             = I2,
-      H2             = H2,
-      Q              = Q,
-      df_Q           = df_Q,
-      k              = k,
-      stringsAsFactors = FALSE
-    )
-  }
-
-  trial_term_effects <- NULL
-  if (nrow(coefs_per_trial) > 0) {
-    trial_term_effects <- coefs_per_trial %>%
-      dplyr::filter(!is.na(.data$trial), .data$trial != "") %>%
-      dplyr::group_by(.data$trial, .data$term) %>%
-      dplyr::summarise(
-        M_imp = dplyr::n(),
-        Q_bar = mean(.data$estimate, na.rm = TRUE),
-        U_bar = mean(.data$std.error^2, na.rm = TRUE),
-        B_raw = stats::var(.data$estimate, na.rm = TRUE),
-        .groups = "drop"
-      ) %>%
-      dplyr::mutate(
-        B     = ifelse(.data$M_imp > 1, .data$B_raw, 0),
-        T_var = .data$U_bar + (1 + 1 / .data$M_imp) * .data$B,
-        SE_mi = sqrt(.data$T_var)
-      ) %>%
-      dplyr::filter(is.finite(.data$SE_mi), .data$SE_mi > 0)
-  }
-
-  pooled_table <- NULL
-  intercept_df <- NULL
-  weighted_intercept_df <- NULL
-
-  if (!is.null(trial_term_effects) && nrow(trial_term_effects) > 0) {
-    intercept_effects <- trial_term_effects %>% dplyr::filter(.data$term == "(Intercept)")
-    nonint_effects    <- trial_term_effects %>% dplyr::filter(.data$term != "(Intercept)")
-
-    if (nrow(nonint_effects) > 0) {
-      split_by_term <- split(nonint_effects, nonint_effects$term)
-      pooled_list <- lapply(split_by_term, meta_pool_term,
-                            model_type = model_type,
-                            meta_method = meta_method)
-      pooled_list <- pooled_list[!vapply(pooled_list, is.null, logical(1))]
-      if (length(pooled_list) > 0) {
-        pooled_table <- dplyr::bind_rows(pooled_list)
-
-        term_order <- unique(c(
-          predictor_vars_expanded,
-          setdiff(pooled_table$term, predictor_vars_expanded)
-        ))
-        pooled_table <- pooled_table %>%
-          dplyr::mutate(term = factor(.data$term, levels = term_order)) %>%
-          dplyr::arrange(.data$term) %>%
-          dplyr::mutate(term = as.character(.data$term))
-      }
-    }
-
-    if (nrow(intercept_effects) > 0) {
-      global_row <- meta_pool_term(intercept_effects, model_type = model_type, meta_method = meta_method)
-      if (!is.null(global_row)) {
-        intercept_trials <- intercept_effects
-
-        N_by_trial <- fit_log_tbl %>%
-          dplyr::group_by(.data$trial) %>%
-          dplyr::summarise(
-            N = suppressWarnings(max(.data$n, na.rm = TRUE)),
-            .groups = "drop"
-          )
-
-        intercept_trials <- intercept_trials %>%
-          dplyr::left_join(N_by_trial, by = "trial") %>%
-          dplyr::mutate(
-            term      = paste0("as.factor(", intercept_var, ")", .data$trial),
-            estimate  = .data$Q_bar,
-            std.error = .data$SE_mi,
-            `2.5 %`   = .data$Q_bar - 1.96 * .data$SE_mi,
-            `97.5 %`  = .data$Q_bar + 1.96 * .data$SE_mi,
-            p.value   = 2 * stats::pnorm(abs(.data$Q_bar / .data$SE_mi), lower.tail = FALSE),
-            exp_estimate   = if (model_type %in% c("nb","poisson","quasipoisson","binomial")) exp(.data$Q_bar) else NA_real_,
-            exp_CI95_lower = if (model_type %in% c("nb","poisson","quasipoisson","binomial")) exp(.data$`2.5 %`) else NA_real_,
-            exp_CI95_upper = if (model_type %in% c("nb","poisson","quasipoisson","binomial")) exp(.data$`97.5 %`) else NA_real_,
-            tau2 = NA_real_, I2 = NA_real_, H2 = NA_real_, Q = NA_real_, df_Q = NA_real_, k = NA_real_
-          ) %>%
-          dplyr::select(.data$term, .data$estimate, .data$std.error,
-                        `2.5 %`, `97.5 %`,
-                        .data$p.value, .data$exp_estimate,
-                        .data$exp_CI95_lower, .data$exp_CI95_upper,
-                        .data$tau2, .data$I2, .data$H2, .data$Q, .data$df_Q, .data$k)
-
-        intercept_df <- dplyr::bind_rows(global_row, intercept_trials)
-        weighted_intercept_df <- global_row
-      }
-    }
-  }
-
-  ## ------------------------------------------------------------------
-  ## 5) Build final object
-  ## ------------------------------------------------------------------
-  pooled_perf <- if (!is.null(performance_per_imp)) {
-    pool_IPD_two_stage_performance_inner(performance_per_imp)
-  } else {
-    NULL
-  }
-
   out <- list(
     call                = match.call(),
     formula             = form_global,
     outcome_var         = outcome_var,
-    predictor_vars      = predictor_vars,             # original user input
-    predictor_vars_used = predictor_vars_expanded,    # expanded internal set
+    predictor_vars      = predictor_vars,
     covariables         = all_covars,
     intercept_var       = intercept_var,
     imp_col             = imp_col,
@@ -1099,15 +856,12 @@ IPD_two_stage <- function(data,
     performance_per_imp = performance_per_imp,
     fit_log             = fit_log_tbl,
     trial_levels        = trial_levels,
-    table               = pooled_table,
-    Intercept           = intercept_df,
-    Weighted_intercept  = weighted_intercept_df,
     Pooled_performance  = pooled_perf,
     perf_pool           = pooled_perf
   )
 
   ## ------------------------------------------------------------------
-  ## 6) Optional: pooled main term + forest plot + heterogeneity_main
+  ## 5) Optional: pooled main term + forest plot
   ## ------------------------------------------------------------------
   if (!is.null(main_term)) {
     out$pool_main <- pool_IPD_two_stage_inner(coefs_per_trial, main_term, meta_method)
