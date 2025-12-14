@@ -649,7 +649,7 @@ IPD_two_stage <- function(data,
 
       # τ² with 2 decimals + Greek tau
       tau2_val <- heterogeneity_df$tau2
-      tau2_txt <- if (is.finite(tau2_val)) sprintf("\u03C4\u00B2 = %.2f", tau2_val) else sprintf("\u03C4\u00B2 = NA")
+      tau2_txt <- if (is.finite(tau2_val)) sprintf("Tau\u00B2 = %.2f", tau2_val) else sprintf("Tau\u00B2 = NA")
 
       # Q line
       pQ <- heterogeneity_df$p_Q
