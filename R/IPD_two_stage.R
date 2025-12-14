@@ -20,33 +20,6 @@
 #' - Forest plot: prints heterogeneity text UNDER the "Pooled (REML)" label
 #'   (in blue) WITHOUT adding an extra row/line in the forest.
 #'
-#' @param data data.frame containing IPD across imputations.
-#' @param outcome_var outcome variable (character).
-#' @param predictor_vars character vector of predictors (may include "*" or ":").
-#' @param covariables optional character vector of covariables.
-#' @param imp_col imputation indicator column.
-#' @param followup_offset "Yes"/"No" to include offset(log(followup_col)).
-#' @param followup_col follow-up column used in offset (required if Yes).
-#' @param intercept_var trial identifier column.
-#' @param model_type one of "nb","poisson","quasipoisson","gaussian","binomial".
-#' @param model_performance logical; compute pooled performance across imputations.
-#' @param main_term model term (as in broom::tidy()$term) to forest-plot.
-#' @param meta_method method for metafor::rma() (default REML).
-#' @param xlab x-axis label for forest.
-#' @param ref_line vertical ref line (default 1).
-#' @param x_limits numeric length-2 limits on original scale (optional).
-#' @param x_breaks numeric vector of x breaks (optional).
-#' @param center_axis_at_one make limits symmetric around 1 on log-scale.
-#' @param point_size_range point size range mapped to weights.
-#' @param show_size_legend show weight legend.
-#' @param show_headers show right-side column headers.
-#' @param diamond_color pooled diamond color.
-#' @param pooled_color pooled label + pooled text color.
-#' @param bold_pooled bold pooled label.
-#' @param margin_plot plot margins for forest panel.
-#' @param heterogeneity_text_size size for heterogeneity text under pooled label.
-#' @param heterogeneity_y_offsets numeric vector length 3 for 3 lines of het text.
-#'
 #' @export
 IPD_two_stage <- function(data,
                           outcome_var,
@@ -74,7 +47,7 @@ IPD_two_stage <- function(data,
                           pooled_color       = "black",
                           bold_pooled        = FALSE,
                           margin_plot        = c(5.5, 2, 5.5, 5.5),
-                          ## ---- NEW: heterogeneity annotation positioning ----
+                          ## ---- heterogeneity annotation positioning ----
                           show_heterogeneity_in_forest = TRUE,
                           het_x = 0.08,
                           het_y = 0.085,
@@ -298,7 +271,6 @@ IPD_two_stage <- function(data,
         heterogeneity_significant = isTRUE(p_Q < 0.05),
         k          = mf$k,
         N_total    = {
-          # best-effort total N across the included trials
           sum((d %>% dplyr::left_join(N_by_trial, by = "trial"))$N, na.rm = TRUE)
         }
       )
@@ -307,7 +279,6 @@ IPD_two_stage <- function(data,
     out_flat <- dplyr::bind_rows(out_list)
     if (nrow(out_flat) == 0L) return(NULL)
 
-    # optional richer object (can be extended later)
     list(summary = out_flat, full = out_flat)
   }
 
@@ -376,7 +347,7 @@ IPD_two_stage <- function(data,
     pooled_se  <- as.numeric(meta_fit$se)
     pooled_ci  <- c(pooled_log - 1.96 * pooled_se, pooled_log + 1.96 * pooled_se)
 
-    ## heterogeneity metrics for overlay
+    ## heterogeneity metrics
     heterogeneity_df <- data.frame(
       tau2 = meta_fit$tau2,
       I2   = meta_fit$I2,
@@ -413,7 +384,7 @@ IPD_two_stage <- function(data,
                     .data$aRR_CI, .data$N_col, .data$W_col,
                     .data$Weight_percent)
 
-    ## pooled row (for plotting)
+    ## pooled row
     pooled_row <- df_plot[1, , drop = FALSE]
     pooled_row[] <- NA
     pooled_row$Trial          <- "Pooled (REML)"
@@ -425,7 +396,6 @@ IPD_two_stage <- function(data,
     pooled_row$N_col          <- format(sum(trial_effects$N, na.rm = TRUE), big.mark = ",")
     pooled_row$W_col          <- ""
     pooled_row$Weight_percent <- max(Weight_percent, na.rm = TRUE)
-
     df_plot <- dplyr::bind_rows(df_plot, pooled_row)
 
     ## x limits
@@ -443,7 +413,6 @@ IPD_two_stage <- function(data,
       center          = center_axis_at_one
     )
 
-    ## truncation flags + plotting values
     df_plot <- df_plot %>%
       dplyr::mutate(
         lo_trunc   = .data$RR_lo < final_limits[1],
@@ -454,7 +423,6 @@ IPD_two_stage <- function(data,
         is_pooled  = (.data$Trial == "Pooled (REML)")
       )
 
-    ## breaks
     if (!is.null(x_breaks)) {
       x_breaks_final <- x_breaks[x_breaks >= final_limits[1] & x_breaks <= final_limits[2]]
       if (length(x_breaks_final) == 0) x_breaks_final <- auto_log_breaks(final_limits)
@@ -462,18 +430,12 @@ IPD_two_stage <- function(data,
       x_breaks_final <- auto_log_breaks(final_limits)
     }
 
-    ## y order
     trials_ord <- trial_levels[trial_levels %in% df_plot$Trial]
     levels_vec <- c(trials_ord, "Pooled (REML)")
     levels_vec <- levels_vec[!duplicated(levels_vec)]
     y_levels_rev <- rev(levels_vec)
     df_plot$Trial <- factor(df_plot$Trial, levels = y_levels_rev)
 
-    if (is.null(margin_plot) || length(margin_plot) != 4L) {
-      margin_plot <- c(5.5, 2, 5.5, 5.5)
-    }
-
-    ## CI colour logic (grey if crosses ref line)
     df_plot <- df_plot %>%
       dplyr::mutate(
         crosses_ref = (.data$RR_lo <= ref_line & .data$RR_hi >= ref_line),
@@ -489,68 +451,36 @@ IPD_two_stage <- function(data,
 
     p_forest <- ggplot2::ggplot(df_plot, ggplot2::aes(y = .data$Trial)) +
       ggplot2::geom_segment(
-        ggplot2::aes(
-          x    = .data$RR_lo_plot,
-          xend = .data$RR_hi_plot,
-          yend = .data$Trial,
-          colour = .data$ci_col
-        ),
-        linewidth = 0.6,
-        lineend   = "butt"
+        ggplot2::aes(x = .data$RR_lo_plot, xend = .data$RR_hi_plot, yend = .data$Trial, colour = .data$ci_col),
+        linewidth = 0.6, lineend = "butt"
       ) +
       ggplot2::geom_segment(
         data = df_plot %>% dplyr::filter(!.data$lo_trunc),
-        ggplot2::aes(
-          x    = .data$RR_lo_plot,
-          xend = .data$RR_lo_plot,
-          y    = as.numeric(.data$Trial) - tick_h/2,
-          yend = as.numeric(.data$Trial) + tick_h/2,
-          colour = .data$ci_col
-        ),
-        inherit.aes = FALSE,
-        linewidth = 0.6,
-        lineend   = "butt"
+        ggplot2::aes(x = .data$RR_lo_plot, xend = .data$RR_lo_plot,
+                     y = as.numeric(.data$Trial) - tick_h/2, yend = as.numeric(.data$Trial) + tick_h/2,
+                     colour = .data$ci_col),
+        inherit.aes = FALSE, linewidth = 0.6, lineend = "butt"
       ) +
       ggplot2::geom_segment(
         data = df_plot %>% dplyr::filter(!.data$hi_trunc),
-        ggplot2::aes(
-          x    = .data$RR_hi_plot,
-          xend = .data$RR_hi_plot,
-          y    = as.numeric(.data$Trial) - tick_h/2,
-          yend = as.numeric(.data$Trial) + tick_h/2,
-          colour = .data$ci_col
-        ),
-        inherit.aes = FALSE,
-        linewidth = 0.6,
-        lineend   = "butt"
+        ggplot2::aes(x = .data$RR_hi_plot, xend = .data$RR_hi_plot,
+                     y = as.numeric(.data$Trial) - tick_h/2, yend = as.numeric(.data$Trial) + tick_h/2,
+                     colour = .data$ci_col),
+        inherit.aes = FALSE, linewidth = 0.6, lineend = "butt"
       ) +
       ggplot2::geom_segment(
         data = df_plot %>% dplyr::filter(.data$hi_trunc),
-        ggplot2::aes(
-          x    = final_limits[2] / 1.12,
-          xend = final_limits[2],
-          y    = .data$Trial,
-          yend = .data$Trial,
-          colour = .data$ci_col
-        ),
-        inherit.aes = FALSE,
-        arrow = ggplot2::arrow(type = "closed", length = arrow_len),
-        linewidth = 0.6,
-        lineend   = "butt"
+        ggplot2::aes(x = final_limits[2] / 1.12, xend = final_limits[2], y = .data$Trial, yend = .data$Trial,
+                     colour = .data$ci_col),
+        inherit.aes = FALSE, arrow = ggplot2::arrow(type = "closed", length = arrow_len),
+        linewidth = 0.6, lineend = "butt"
       ) +
       ggplot2::geom_segment(
         data = df_plot %>% dplyr::filter(.data$lo_trunc),
-        ggplot2::aes(
-          x    = final_limits[1] * 1.12,
-          xend = final_limits[1],
-          y    = .data$Trial,
-          yend = .data$Trial,
-          colour = .data$ci_col
-        ),
-        inherit.aes = FALSE,
-        arrow = ggplot2::arrow(type = "closed", length = arrow_len),
-        linewidth = 0.6,
-        lineend   = "butt"
+        ggplot2::aes(x = final_limits[1] * 1.12, xend = final_limits[1], y = .data$Trial, yend = .data$Trial,
+                     colour = .data$ci_col),
+        inherit.aes = FALSE, arrow = ggplot2::arrow(type = "closed", length = arrow_len),
+        linewidth = 0.6, lineend = "butt"
       ) +
       ggplot2::geom_point(
         ggplot2::aes(x = .data$RR_plot, size = .data$Weight_percent, shape = .data$is_pooled),
@@ -561,10 +491,8 @@ IPD_two_stage <- function(data,
       ggplot2::geom_point(
         data = df_plot %>% dplyr::filter(.data$is_pooled),
         ggplot2::aes(y = .data$Trial, x = .data$RR_plot),
-        inherit.aes = FALSE,
-        colour = diamond_color,
-        shape  = 18,
-        size   = max(point_size_range) * 1.1
+        inherit.aes = FALSE, colour = diamond_color, shape = 18,
+        size = max(point_size_range) * 1.1
       ) +
       ggplot2::geom_vline(xintercept = ref_line, linetype = "dashed", linewidth = 0.5) +
       ggplot2::scale_colour_identity() +
@@ -573,14 +501,12 @@ IPD_two_stage <- function(data,
       ggplot2::labs(x = xlab, y = NULL) +
       ggplot2::theme_minimal(base_size = 12) +
       ggplot2::theme(
-        plot.margin      = ggplot2::margin(margin_plot[1], margin_plot[2],
-                                           margin_plot[3], margin_plot[4]),
+        plot.margin      = ggplot2::margin(margin_plot[1], margin_plot[2], margin_plot[3], margin_plot[4]),
         panel.grid.minor = ggplot2::element_blank(),
         axis.text.y      = ggplot2::element_blank(),
         axis.ticks.y     = ggplot2::element_blank()
       )
 
-    ## left labels (keep ONLY the trial labels; do not add heterogeneity rows here)
     df_left <- data.frame(
       Trial = df_plot$Trial,
       lab   = as.character(df_plot$Trial),
@@ -588,10 +514,7 @@ IPD_two_stage <- function(data,
       face  = ifelse(as.character(df_plot$Trial) == "Pooled (REML)" & bold_pooled, "bold", "plain")
     )
 
-    p_left <- ggplot2::ggplot(
-      df_left,
-      ggplot2::aes(y = .data$Trial, x = 1, label = .data$lab, colour = .data$col)
-    ) +
+    p_left <- ggplot2::ggplot(df_left, ggplot2::aes(y = .data$Trial, x = 1, label = .data$lab, colour = .data$col)) +
       ggplot2::geom_text(hjust = 1, size = 3.2, fontface = df_left$face) +
       ggplot2::scale_x_continuous(limits = c(0, 1), expand = c(0.02, 0)) +
       ggplot2::scale_colour_identity() +
@@ -605,8 +528,7 @@ IPD_two_stage <- function(data,
 
     make_text_col <- function(labels, title, color_vec, x_pos = 0.02) {
       df_txt <- data.frame(Trial = df_plot$Trial, lab = labels, col = color_vec)
-      ggplot2::ggplot(df_txt,
-                      ggplot2::aes(y = .data$Trial, x = x_pos, label = .data$lab, colour = .data$col)) +
+      ggplot2::ggplot(df_txt, ggplot2::aes(y = .data$Trial, x = x_pos, label = .data$lab, colour = .data$col)) +
         ggplot2::geom_text(hjust = 0, size = 3.2) +
         ggplot2::scale_x_continuous(limits = c(0, 1), expand = c(0.02, 0)) +
         ggplot2::scale_colour_identity() +
@@ -636,35 +558,33 @@ IPD_two_stage <- function(data,
       axis       = "tb"
     )
 
-    ## Overlay heterogeneity text UNDER pooled row without creating a new row
     full_plot <- full_plot_base
+
+    ## ---- NEW FORMATTING HERE (integer I2, 2-decimal tau2) ----
     if (isTRUE(show_heterogeneity_in_forest)) {
-      I2_txt   <- sprintf("I\u00B2 = %.1f%%", heterogeneity_df$I2)
-      tau2_txt <- sprintf("\u03C4\u00B2 = %.4f", heterogeneity_df$tau2)
-      Q_txt    <- sprintf("Q = %.2f (df=%d), p = %.3f",
-                          heterogeneity_df$Q, heterogeneity_df$df_Q, heterogeneity_df$p_Q)
+
+      I2_txt   <- sprintf("%d%%", round(heterogeneity_df$I2))
+      tau2_txt <- sprintf("%.2f", heterogeneity_df$tau2)
+      Q_txt    <- sprintf("%.2f", heterogeneity_df$Q)
+
+      pQ_txt <- ifelse(heterogeneity_df$p_Q < 0.001, "<0.001", sprintf("%.3f", heterogeneity_df$p_Q))
+
+      het_lines <- c(
+        paste0("I\u00B2 = ", I2_txt),
+        paste0("\u03C4\u00B2 = ", tau2_txt),
+        paste0("Q = ", Q_txt, " (df=", heterogeneity_df$df_Q, "), p = ", pQ_txt)
+      )
 
       full_plot <- cowplot::ggdraw(full_plot_base) +
-        cowplot::draw_label(I2_txt,
-                            x = het_x, y = het_y + 2 * het_line_gap,
-                            hjust = 0, vjust = 1,
-                            colour = pooled_color, size = het_text_size) +
-        cowplot::draw_label(tau2_txt,
-                            x = het_x, y = het_y + 1 * het_line_gap,
-                            hjust = 0, vjust = 1,
-                            colour = pooled_color, size = het_text_size) +
-        cowplot::draw_label(Q_txt,
-                            x = het_x, y = het_y + 0 * het_line_gap,
-                            hjust = 0, vjust = 1,
-                            colour = pooled_color, size = het_text_size)
+        cowplot::draw_label(het_lines[1], x = het_x, y = het_y + 2 * het_line_gap,
+                            hjust = 0, vjust = 1, colour = pooled_color, size = het_text_size) +
+        cowplot::draw_label(het_lines[2], x = het_x, y = het_y + 1 * het_line_gap,
+                            hjust = 0, vjust = 1, colour = pooled_color, size = het_text_size) +
+        cowplot::draw_label(het_lines[3], x = het_x, y = het_y + 0 * het_line_gap,
+                            hjust = 0, vjust = 1, colour = pooled_color, size = het_text_size)
     }
 
-    list(
-      plot = full_plot,
-      pooled_log = pooled_log,
-      pooled_ci = pooled_ci,
-      heterogeneity = heterogeneity_df
-    )
+    list(plot = full_plot, pooled_log = pooled_log, pooled_ci = pooled_ci, heterogeneity = heterogeneity_df)
   }
 
   ## ------------------------------------------------------------------
