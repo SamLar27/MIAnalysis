@@ -1,11 +1,14 @@
 #' Two-stage IPD meta-analysis with multiple imputation and forest plot
 #'
 #' KEY MODIFICATION (N counting):
-#' - We now compute N PER TRIAL from the ACTUAL DATA USED BY THE MODEL
-#'   in each imputation (after glm / glm.nb drops rows with missing data).
-#' - Optionally, if you provide id_col, N is counted as DISTINCT SUBJECTS USED
+#' - N PER TRIAL is computed from the ACTUAL DATA USED BY THE MODEL
+#'   after glm / glm.nb drops rows with missing data.
+#' - If id_col is provided, N is counted as DISTINCT SUBJECTS USED
 #'   (not number of rows).
-#' - Forest pooled N = sum of the trial Ns that contributed to the pooled estimate.
+#' - IMPORTANT CHANGE REQUESTED HERE:
+#'     * N is computed using ONLY THE FIRST IMPUTATION (imp1 / minimum .imp),
+#'       and there is NO n_count_imp argument anymore.
+#' - Forest pooled N = sum of the trial Ns (imp1) that contributed to the pooled estimate.
 #' - Table N_total uses the same logic, so it matches the pooled row in the forest plot.
 #'
 #' @export
@@ -20,9 +23,8 @@ IPD_two_stage <- function(data,
                           model_type = c("nb", "poisson", "quasipoisson",
                                          "gaussian", "binomial"),
                           model_performance = FALSE,
-                          ## ---- NEW: subject counting options ----
+                          ## ---- subject counting options ----
                           id_col = NULL,
-                          n_count_imp = c("min", "max"),
                           ## ---- options for pooled main term & forest plot ----
                           main_term          = NULL,
                           meta_method        = "REML",
@@ -49,8 +51,6 @@ IPD_two_stage <- function(data,
   ## ------------------------------------------------------------------
   ## Internal helpers
   ## ------------------------------------------------------------------
-
-  n_count_imp <- match.arg(n_count_imp)
 
   if (!is.null(id_col)) {
     if (!id_col %in% names(data)) {
@@ -105,6 +105,10 @@ IPD_two_stage <- function(data,
   }
 
   predictor_vars_expanded <- expand_star_terms(predictor_vars)
+
+  ## ---- NEW: first imputation used for ALL N counting ----
+  imp_count <- suppressWarnings(min(data[[imp_col]], na.rm = TRUE))
+  if (!is.finite(imp_count)) imp_count <- 1L
 
   ## Rubin pooling across imputations AFTER meta per imputation (used for pool_main only)
   pool_IPD_two_stage_inner <- function(coefs_per_trial, term, method = "REML") {
@@ -207,38 +211,34 @@ IPD_two_stage <- function(data,
     list(per_imputation = perf_df, pooled_summary = pooled)
   }
 
-  ## ---- NEW helper: compute N by trial using fit_log_tbl, restricted to imputations used
-  compute_N_by_trial_used <- function(fit_log_tbl, trials, imp_values_used) {
+  ## ---- N by trial: ONLY imp_count (first imputation) ----
+  compute_N_by_trial_imp1 <- function(fit_log_tbl, trials) {
+
     df <- fit_log_tbl %>%
-      dplyr::filter(.data$ok, .data$trial %in% trials, .data$imp %in% imp_values_used)
+      dplyr::filter(.data$ok,
+                    .data$trial %in% trials,
+                    .data$imp == imp_count)
 
     if (nrow(df) == 0) {
       return(tibble::tibble(trial = trials, N = NA_real_))
     }
 
-    # Prefer subject counts if available; else row counts
     if (!is.null(id_col)) {
-      # n_used_ids was logged during fitting
       if (!"n_used_ids" %in% names(df)) {
         stop("Internal error: n_used_ids not found in fit_log_tbl, but id_col was set.")
       }
-      if (n_count_imp == "min") {
-        out <- df %>% dplyr::group_by(.data$trial) %>% dplyr::summarise(N = min(.data$n_used_ids, na.rm = TRUE), .groups = "drop")
-      } else {
-        out <- df %>% dplyr::group_by(.data$trial) %>% dplyr::summarise(N = max(.data$n_used_ids, na.rm = TRUE), .groups = "drop")
-      }
+      out <- df %>%
+        dplyr::group_by(.data$trial) %>%
+        dplyr::summarise(N = max(.data$n_used_ids, na.rm = TRUE), .groups = "drop")
     } else {
       if (!"n_used_rows" %in% names(df)) {
         stop("Internal error: n_used_rows not found in fit_log_tbl.")
       }
-      if (n_count_imp == "min") {
-        out <- df %>% dplyr::group_by(.data$trial) %>% dplyr::summarise(N = min(.data$n_used_rows, na.rm = TRUE), .groups = "drop")
-      } else {
-        out <- df %>% dplyr::group_by(.data$trial) %>% dplyr::summarise(N = max(.data$n_used_rows, na.rm = TRUE), .groups = "drop")
-      }
+      out <- df %>%
+        dplyr::group_by(.data$trial) %>%
+        dplyr::summarise(N = max(.data$n_used_rows, na.rm = TRUE), .groups = "drop")
     }
 
-    # ensure all trials present
     out %>% dplyr::right_join(tibble::tibble(trial = trials), by = "trial")
   }
 
@@ -276,12 +276,10 @@ IPD_two_stage <- function(data,
       d <- trial_term %>% dplyr::filter(.data$term == tt)
       k <- dplyr::n_distinct(d$trial)
 
-      # IMPORTANT: N_total is now based on trials + imputations actually used for this term
-      imp_used_for_term <- sort(unique(coefs_per_trial %>% dplyr::filter(.data$term == tt) %>% dplyr::pull(.data$imp)))
-      N_by_trial <- compute_N_by_trial_used(
+      ## N_total: based ONLY on first imputation, and only trials that contributed
+      N_by_trial <- compute_N_by_trial_imp1(
         fit_log_tbl = fit_log_tbl,
-        trials = unique(d$trial),
-        imp_values_used = imp_used_for_term
+        trials      = unique(d$trial)
       )
       N_total <- suppressWarnings(sum(N_by_trial$N, na.rm = TRUE))
 
@@ -405,12 +403,10 @@ IPD_two_stage <- function(data,
 
     k <- nrow(trial_effects)
 
-    ## NEW: N per trial restricted to trials/imputations actually used for this term
-    imp_used_for_term <- sort(unique(coefs_term$imp))
-    N_by_trial <- compute_N_by_trial_used(
+    ## N per trial: ONLY first imputation, only trials contributing
+    N_by_trial <- compute_N_by_trial_imp1(
       fit_log_tbl = fit_log_tbl,
-      trials = trial_effects$trial,
-      imp_values_used = imp_used_for_term
+      trials      = trial_effects$trial
     )
 
     trial_effects <- trial_effects %>%
@@ -492,7 +488,6 @@ IPD_two_stage <- function(data,
       pooled_row$RR_hi          <- exp(pooled_ci[2])
       pooled_row$aRR_CI         <- sprintf("%.2f [%.2f–%.2f]",
                                            exp(pooled_log), exp(pooled_ci[1]), exp(pooled_ci[2]))
-      # IMPORTANT: pooled N is now sum of the Ns of the trials actually contributing
       pooled_row$N_col          <- format(sum(trial_effects$N, na.rm = TRUE), big.mark = ",")
       pooled_row$W_col          <- ""
       pooled_row$Weight_percent <- max(Weight_percent, na.rm = TRUE)
@@ -837,7 +832,6 @@ IPD_two_stage <- function(data,
           error          = "No data or no variation in outcome for this trial/imp.",
           warning        = NA_character_,
           dropped_covars = NA_character_,
-          ## NEW
           n_used_rows    = NA_integer_,
           n_used_ids     = NA_integer_
         )
@@ -868,7 +862,6 @@ IPD_two_stage <- function(data,
           warning        = NA_character_,
           dropped_covars = if (length(collapsed_covars) > 0L) paste(collapsed_covars, collapse = "; ")
           else NA_character_,
-          ## NEW
           n_used_rows    = NA_integer_,
           n_used_ids     = NA_integer_
         )
@@ -882,12 +875,11 @@ IPD_two_stage <- function(data,
       form_trial <- stats::as.formula(paste0(outcome_var, " ~ ", rhs_trial))
       fit_res <- fit_one_model(dat_trial, model_type, form_trial)
 
-      # ---- NEW: count rows/subjects ACTUALLY USED BY THE MODEL ----
+      # ---- count rows/subjects ACTUALLY USED BY THE MODEL ----
       n_used_rows <- NA_integer_
       n_used_ids  <- NA_integer_
       if (isTRUE(fit_res$ok) && !is.null(fit_res$model)) {
-        # which rows were dropped by NA?
-        na_act <- fit_res$model$na.action
+        na_act  <- fit_res$model$na.action
         dropped <- if (is.null(na_act)) integer(0) else as.integer(na_act)
         used_idx <- setdiff(seq_len(nrow(dat_trial)), dropped)
 
@@ -909,7 +901,6 @@ IPD_two_stage <- function(data,
         else NA_character_,
         dropped_covars = if (length(collapsed_covars) > 0L) paste(collapsed_covars, collapse = "; ")
         else NA_character_,
-        ## NEW
         n_used_rows    = n_used_rows,
         n_used_ids     = n_used_ids
       )
@@ -1026,7 +1017,7 @@ IPD_two_stage <- function(data,
     followup_offset     = followup_offset,
     followup_col        = followup_col,
     id_col              = id_col,
-    n_count_imp         = n_count_imp,
+    imp_count_for_N     = imp_count,
     coefs_per_trial     = coefs_per_trial,
     models_per_imp      = models_per_imp,
     performance_per_imp = performance_per_imp,
