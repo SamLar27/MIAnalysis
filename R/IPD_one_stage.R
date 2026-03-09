@@ -1,4 +1,4 @@
-#' IPD One-Stage Modelling on Multiply Imputed Data (with RCS support)
+#' IPD One-Stage Modelling on Multiply Imputed Data (with RCS support + parallelization)
 #'
 #' Fits models to multiply imputed datasets and pools results using Rubin's Rules.
 #' Supports GLM, mixed models (via lme4 / glmmTMB / coxme), interactions, and
@@ -32,9 +32,12 @@
 #'   - If a variable appears in `spline_terms` and also in
 #'     `predictor_vars_random_slope` or `covariables_random_slope`, the raw
 #'     variable name is automatically expanded to its spline basis terms for
-#'     the random-effects part, e.g. random slopes on
-#'     `FEV1_preBD_PCT_0W` become random slopes on:
-#'       `FEV1_preBD_PCT_0W_rcs_linear` and `FEV1_preBD_PCT_0W_rcs_nl*`.
+#'     the random-effects part.
+#'
+#' Parallelization:
+#'   - If `parallel = TRUE`, model fitting across imputations is distributed over `n_cores`.
+#'   - On Unix/macOS/Linux, uses `parallel::mclapply()`.
+#'   - On Windows, uses `parallel::parLapply()` with a PSOCK cluster.
 #'
 #' @param data Data frame with all imputations stacked.
 #' @param outcome_var Dependent variable (for non-Cox models).
@@ -62,6 +65,8 @@
 #' @param model_performance Logical; if TRUE, compute model performance via `performance::model_performance()`.
 #' @param weighted_intercept Logical; if TRUE and `stratified_intercept_var` is not NULL,
 #'   computes a single weighted intercept across strata.
+#' @param parallel Logical; if TRUE, fit imputations in parallel.
+#' @param n_cores Number of cores for parallel fitting. If NULL, defaults to detectCores() - 1.
 #'
 #' @return
 #' A list of class "IPD_one_stage" with elements:
@@ -98,7 +103,9 @@ IPD_one_stage <- function(data,
                           covariables_random_slope = NULL,
                           stratified_intercept_var = NULL,
                           model_performance = FALSE,
-                          weighted_intercept = FALSE) {
+                          weighted_intercept = FALSE,
+                          parallel = FALSE,
+                          n_cores = NULL) {
 
   `%||%` <- function(a, b) if (!is.null(a)) a else b
 
@@ -106,74 +113,57 @@ IPD_one_stage <- function(data,
   ## Helpers for interactions
   ## ------------------------------------------------------------
 
-  # Extract variable names appearing in a term like "a", "a:b", "a*b", "as.factor(a)"
   extract_vars_from_term <- function(term) {
     if (is.null(term) || length(term) == 0) return(character(0))
     term <- gsub("\\s+", "", term)
 
-    # Drop wrappers like as.factor(x) -> x
     term <- gsub("as\\.factor\\(|strata\\(|offset\\(|log\\(|survival::Surv\\(|rms::rcs\\(", "", term)
     term <- gsub("\\)", "", term)
 
-    # Split on operators commonly used in formulas
     toks <- unlist(strsplit(term, "[\\+\\-\\*\\:\\/\\^\\,]", perl = TRUE))
-
     toks <- toks[toks != ""]
     toks <- unique(toks)
-
-    # Keep "variable-like" tokens (letters/digits/._)
     toks <- toks[grepl("^[A-Za-z][A-Za-z0-9_\\.]*$", toks)]
     toks
   }
 
-  # Expand interaction strings:
-  #   - "a"       -> "a"
-  #   - "a:b"     -> "a:b"
-  #   - "a*b"     -> c("a", "b", "a:b")
-  # Also expands spline terms inside interactions into basis columns.
   expand_term_with_splines <- function(term, spline_info) {
     term <- gsub("\\s+", "", term)
 
-    # Identify if it's "*" or ":" interaction
-    is_star <- grepl("\\*", term, fixed = FALSE)
+    is_star  <- grepl("\\*", term, fixed = FALSE)
     is_colon <- grepl("\\:", term, fixed = FALSE)
 
-    # If neither star nor colon, maybe plain var
     if (!is_star && !is_colon) {
-      # If plain var is spline term, replace by basis names
       if (!is.null(spline_info) && term %in% names(spline_info)) {
         return(spline_info[[term]]$basis_names)
       }
       return(term)
     }
 
-    # If there is star, split by "*" (assume simple binary for your use)
     if (is_star) {
       parts <- strsplit(term, "\\*", fixed = FALSE)[[1]]
       if (length(parts) != 2) {
         stop("Only simple binary interactions are supported (e.g. A*B). Got: ", term)
       }
-      a <- parts[1]; b <- parts[2]
+      a <- parts[1]
+      b <- parts[2]
 
       a_exp <- if (!is.null(spline_info) && a %in% names(spline_info)) spline_info[[a]]$basis_names else a
       b_exp <- if (!is.null(spline_info) && b %in% names(spline_info)) spline_info[[b]]$basis_names else b
 
-      # main effects
       main_terms <- c(a_exp, b_exp)
-
-      # interaction expansion
-      int_terms <- as.vector(outer(a_exp, b_exp, FUN = function(x, y) paste0(x, ":", y)))
+      int_terms  <- as.vector(outer(a_exp, b_exp, FUN = function(x, y) paste0(x, ":", y)))
 
       return(unique(c(main_terms, int_terms)))
     }
 
-    # If only colon interaction, split by ":" (assume simple binary)
     if (is_colon) {
       parts <- strsplit(term, "\\:", fixed = FALSE)[[1]]
       if (length(parts) != 2) {
         stop("Only simple binary interactions are supported (e.g. A:B). Got: ", term)
       }
-      a <- parts[1]; b <- parts[2]
+      a <- parts[1]
+      b <- parts[2]
 
       a_exp <- if (!is.null(spline_info) && a %in% names(spline_info)) spline_info[[a]]$basis_names else a
       b_exp <- if (!is.null(spline_info) && b %in% names(spline_info)) spline_info[[b]]$basis_names else b
@@ -185,7 +175,6 @@ IPD_one_stage <- function(data,
     stop("Unhandled term: ", term)
   }
 
-  # Expand a vector of terms (some possibly interactions) with spline_info
   expand_terms_vec <- function(vec, spline_info) {
     if (is.null(vec) || length(vec) == 0) return(character(0))
     out <- unlist(lapply(vec, expand_term_with_splines, spline_info = spline_info))
@@ -222,7 +211,9 @@ IPD_one_stage <- function(data,
   }
 
   if (model_type == "cox") {
-    if (is.null(time_col) || is.null(event_col)) stop("For Cox models, time_col and event_col must be provided.")
+    if (is.null(time_col) || is.null(event_col)) {
+      stop("For Cox models, time_col and event_col must be provided.")
+    }
     if (!time_col %in% names(data))  stop("time_col not found in data.")
     if (!event_col %in% names(data)) stop("event_col not found in data.")
   }
@@ -265,21 +256,23 @@ IPD_one_stage <- function(data,
       x_all <- data[[var]]
 
       if (!is.null(spline_knots_percentile)) {
-        probs  <- spline_knots_percentile / 100
-        knots  <- as.numeric(stats::quantile(x_all, probs = probs, na.rm = TRUE))
-        knots  <- sort(unique(knots))
+        probs <- spline_knots_percentile / 100
+        knots <- as.numeric(stats::quantile(x_all, probs = probs, na.rm = TRUE))
+        knots <- sort(unique(knots))
       } else if (!is.null(spline_knots_n)) {
-        k      <- spline_knots_n
-        probs  <- seq(5, 95, length.out = k) / 100
-        knots  <- as.numeric(stats::quantile(x_all, probs = probs, na.rm = TRUE))
-        knots  <- sort(unique(knots))
+        k     <- spline_knots_n
+        probs <- seq(5, 95, length.out = k) / 100
+        knots <- as.numeric(stats::quantile(x_all, probs = probs, na.rm = TRUE))
+        knots <- sort(unique(knots))
       } else {
-        probs  <- c(5, 35, 65, 95) / 100
-        knots  <- as.numeric(stats::quantile(x_all, probs = probs, na.rm = TRUE))
-        knots  <- sort(unique(knots))
+        probs <- c(5, 35, 65, 95) / 100
+        knots <- as.numeric(stats::quantile(x_all, probs = probs, na.rm = TRUE))
+        knots <- sort(unique(knots))
       }
 
-      if (length(knots) < 3L) stop("Not enough distinct knot locations for spline term '", var, "'.")
+      if (length(knots) < 3L) {
+        stop("Not enough distinct knot locations for spline term '", var, "'.")
+      }
 
       K           <- length(knots)
       n_basis     <- K - 1L
@@ -288,14 +281,17 @@ IPD_one_stage <- function(data,
         if (n_basis > 1L) paste0(var, "_rcs_nl", seq_len(n_basis - 1L)) else character(0)
       )
 
-      spline_info[[var]] <- list(var = var, knots = knots, basis_names = basis_names)
+      spline_info[[var]] <- list(
+        var = var,
+        knots = knots,
+        basis_names = basis_names
+      )
     }
   }
 
   ## ------------------------------------------------------------
-  ## 2b) Validate variables referenced in terms (INCLUDING interactions)
+  ## 2b) Validate variables referenced in terms
   ## ------------------------------------------------------------
-  # Collect all term strings from all arguments
   all_term_strings <- unique(c(
     predictor_vars %||% character(0),
     covariables %||% character(0),
@@ -304,14 +300,14 @@ IPD_one_stage <- function(data,
   ))
 
   referenced_vars <- unique(unlist(lapply(all_term_strings, extract_vars_from_term)))
-
-  # Allow spline raw vars even though basis columns are built later
-  allowed_vars <- c(names(data), spline_terms %||% character(0))
+  allowed_vars    <- c(names(data), spline_terms %||% character(0))
 
   miss_vars <- setdiff(referenced_vars, allowed_vars)
   if (length(miss_vars) > 0) {
-    stop("Some variables used inside terms are not found in data (or spline_terms): ",
-         paste(miss_vars, collapse = ", "))
+    stop(
+      "Some variables used inside terms are not found in data (or spline_terms): ",
+      paste(miss_vars, collapse = ", ")
+    )
   }
 
   ## ------------------------------------------------------------
@@ -389,12 +385,10 @@ IPD_one_stage <- function(data,
       )
     }
   } else {
-    # If user supplies a custom formula_string, we assume they know what they are doing.
-    # We still append strata/trial/random terms if missing (same as your original logic).
     formula_str <- formula_string
 
     if (model_type == "cox") {
-      if (!grepl("^Surv\\(", formula_str)) {
+      if (!grepl("^Surv\\(", formula_str) && !grepl("^survival::Surv\\(", formula_str)) {
         formula_str <- paste0("survival::Surv(", time_col, ",", event_col, ") ~ ", formula_str)
       }
       if (!identical(trial_term, "") &&
@@ -433,32 +427,30 @@ IPD_one_stage <- function(data,
   model_formula <- stats::as.formula(formula_str)
 
   ## ------------------------------------------------------------
-  ## 6) Fit per imputation (adding spline basis columns inside each dat_i)
+  ## 6) Helper: fit one imputation
   ## ------------------------------------------------------------
-  models_list <- vector("list", length(actual_imps))
-  names(models_list) <- paste0("imp_", actual_imps)
+  fit_one_imputation <- function(i,
+                                 implist,
+                                 actual_imps,
+                                 spline_info,
+                                 use_random_effects,
+                                 model_type,
+                                 model_formula) {
 
-  fit_log <- data.frame(
-    imp   = actual_imps,
-    ok    = FALSE,
-    error = NA_character_,
-    stringsAsFactors = FALSE
-  )
-
-  for (i in seq_along(actual_imps)) {
     dat_i   <- implist[[i]]
     imp_val <- actual_imps[i]
 
-    # add spline basis columns (same knots for all imputations)
     if (!is.null(spline_info)) {
       for (var in names(spline_info)) {
         info  <- spline_info[[var]]
         x     <- dat_i[[var]]
         basis <- rms::rcs(x, parms = info$knots)
         basis <- as.matrix(basis)
+
         if (ncol(basis) != length(info$basis_names)) {
           stop("Mismatch between expected and actual number of spline basis columns for '", var, "'.")
         }
+
         colnames(basis) <- info$basis_names
         dat_i[, info$basis_names] <- basis
       }
@@ -467,28 +459,44 @@ IPD_one_stage <- function(data,
     fit <- tryCatch({
       if (use_random_effects) {
         if (model_type == "lm") {
-          if (!requireNamespace("lme4", quietly = TRUE)) stop("Package 'lme4' is required for lm with random effects.")
+          if (!requireNamespace("lme4", quietly = TRUE)) {
+            stop("Package 'lme4' is required for lm with random effects.")
+          }
           lme4::lmer(model_formula, data = dat_i)
+
         } else if (model_type %in% c("bin")) {
-          if (!requireNamespace("lme4", quietly = TRUE)) stop("Package 'lme4' is required for binomial mixed models.")
+          if (!requireNamespace("lme4", quietly = TRUE)) {
+            stop("Package 'lme4' is required for binomial mixed models.")
+          }
           lme4::glmer(model_formula, family = stats::binomial(), data = dat_i)
+
         } else if (model_type %in% c("poisson", "quasipoisson")) {
-          if (!requireNamespace("lme4", quietly = TRUE)) stop("Package 'lme4' is required for Poisson mixed models.")
+          if (!requireNamespace("lme4", quietly = TRUE)) {
+            stop("Package 'lme4' is required for Poisson mixed models.")
+          }
           lme4::glmer(model_formula, family = stats::poisson(), data = dat_i)
+
         } else if (model_type == "nb") {
           if (requireNamespace("glmmTMB", quietly = TRUE)) {
             glmmTMB::glmmTMB(model_formula, family = glmmTMB::nbinom2, data = dat_i)
           } else {
             warning("glmmTMB not installed; using Poisson GLMM (approximation to NB).")
-            if (!requireNamespace("lme4", quietly = TRUE)) stop("Package 'lme4' is required for Poisson mixed models.")
+            if (!requireNamespace("lme4", quietly = TRUE)) {
+              stop("Package 'lme4' is required for Poisson mixed models.")
+            }
             lme4::glmer(model_formula, family = stats::poisson(), data = dat_i)
           }
+
         } else if (model_type == "cox") {
-          if (!requireNamespace("coxme", quietly = TRUE)) stop("Package 'coxme' is required for Cox models with random effects.")
+          if (!requireNamespace("coxme", quietly = TRUE)) {
+            stop("Package 'coxme' is required for Cox models with random effects.")
+          }
           coxme::coxme(model_formula, data = dat_i)
+
         } else {
           stop("Unsupported model_type with random effects.")
         }
+
       } else {
         switch(model_type,
                "nb"            = MASS::glm.nb(model_formula, data = dat_i),
@@ -502,21 +510,123 @@ IPD_one_stage <- function(data,
                stop("Unsupported model_type.")
         )
       }
-    }, error = function(e) {
-      fit_log$error[fit_log$imp == imp_val] <<- e$message
-      NULL
-    })
+    }, error = function(e) e)
 
-    if (!is.null(fit)) fit_log$ok[fit_log$imp == imp_val] <- TRUE
-    models_list[[i]] <- fit
+    if (inherits(fit, "error")) {
+      return(list(
+        imp   = imp_val,
+        ok    = FALSE,
+        error = fit$message,
+        model = NULL
+      ))
+    }
+
+    list(
+      imp   = imp_val,
+      ok    = TRUE,
+      error = NA_character_,
+      model = fit
+    )
+  }
+
+  ## ------------------------------------------------------------
+  ## 7) Fit per imputation (sequential or parallel)
+  ## ------------------------------------------------------------
+  models_list <- vector("list", length(actual_imps))
+  names(models_list) <- paste0("imp_", actual_imps)
+
+  fit_log <- data.frame(
+    imp   = actual_imps,
+    ok    = FALSE,
+    error = NA_character_,
+    stringsAsFactors = FALSE
+  )
+
+  if (is.null(n_cores)) {
+    n_cores <- max(1L, parallel::detectCores(logical = TRUE) - 1L)
+  }
+  n_cores <- max(1L, min(as.integer(n_cores), length(actual_imps)))
+
+  if (!isTRUE(parallel) || n_cores == 1L) {
+
+    fit_results <- lapply(
+      seq_along(actual_imps),
+      FUN = fit_one_imputation,
+      implist = implist,
+      actual_imps = actual_imps,
+      spline_info = spline_info,
+      use_random_effects = use_random_effects,
+      model_type = model_type,
+      model_formula = model_formula
+    )
+
+  } else {
+
+    if (.Platform$OS.type == "windows") {
+
+      cl <- parallel::makeCluster(n_cores)
+      on.exit(parallel::stopCluster(cl), add = TRUE)
+
+      parallel::clusterEvalQ(cl, {
+        NULL
+      })
+
+      parallel::clusterExport(
+        cl,
+        varlist = c("implist",
+                    "actual_imps",
+                    "spline_info",
+                    "use_random_effects",
+                    "model_type",
+                    "model_formula",
+                    "fit_one_imputation"),
+        envir = environment()
+      )
+
+      fit_results <- parallel::parLapply(
+        cl,
+        X = seq_along(actual_imps),
+        fun = fit_one_imputation,
+        implist = implist,
+        actual_imps = actual_imps,
+        spline_info = spline_info,
+        use_random_effects = use_random_effects,
+        model_type = model_type,
+        model_formula = model_formula
+      )
+
+    } else {
+
+      fit_results <- parallel::mclapply(
+        seq_along(actual_imps),
+        FUN = fit_one_imputation,
+        implist = implist,
+        actual_imps = actual_imps,
+        spline_info = spline_info,
+        use_random_effects = use_random_effects,
+        model_type = model_type,
+        model_formula = model_formula,
+        mc.cores = n_cores
+      )
+    }
+  }
+
+  for (i in seq_along(fit_results)) {
+    res <- fit_results[[i]]
+    fit_log$ok[fit_log$imp == res$imp]    <- res$ok
+    fit_log$error[fit_log$imp == res$imp] <- res$error
+    models_list[[i]] <- res$model
   }
 
   ok_idx    <- which(fit_log$ok)
   ok_models <- models_list[ok_idx]
-  if (length(ok_models) == 0) stop("All models failed to fit in IPD_one_stage.")
+
+  if (length(ok_models) == 0) {
+    stop("All models failed to fit in IPD_one_stage.")
+  }
 
   ## ------------------------------------------------------------
-  ## 7) Pool coefficients across imputations (same as your original)
+  ## 8) Pool coefficients across imputations
   ## ------------------------------------------------------------
   if (use_random_effects) {
 
@@ -527,13 +637,16 @@ IPD_one_stage <- function(data,
         c_est  <- coxme::fixef(m)
         c_vcov <- stats::vcov(m)
         c_se   <- sqrt(diag(c_vcov))
+
       } else if (inherits(m, "glmmTMB")) {
         c_est <- glmmTMB::fixef(m)$cond
         v     <- stats::vcov(m)$cond
         c_se  <- sqrt(diag(as.matrix(v)))
+
       } else if (inherits(m, "lmerMod") || inherits(m, "glmerMod")) {
         c_est <- lme4::fixef(m)
         c_se  <- sqrt(diag(as.matrix(stats::vcov(m))))
+
       } else {
         c_est <- stats::coef(m)
         c_se  <- sqrt(diag(as.matrix(stats::vcov(m))))
@@ -560,11 +673,16 @@ IPD_one_stage <- function(data,
     )
 
     for (tt in all_terms) {
-      est_vec <- sapply(coefs_list, function(df) if (tt %in% df$term) df$estimate[df$term == tt] else NA_real_)
-      se_vec  <- sapply(coefs_list, function(df) if (tt %in% df$term) df$std.error[df$term == tt] else NA_real_)
+      est_vec <- sapply(coefs_list, function(df) {
+        if (tt %in% df$term) df$estimate[df$term == tt] else NA_real_
+      })
+      se_vec <- sapply(coefs_list, function(df) {
+        if (tt %in% df$term) df$std.error[df$term == tt] else NA_real_
+      })
 
       est_vec <- est_vec[!is.na(est_vec)]
       se_vec  <- se_vec[!is.na(se_vec)]
+
       if (length(est_vec) < 1 || length(se_vec) < 1) next
 
       Q_bar <- mean(est_vec)
@@ -582,7 +700,9 @@ IPD_one_stage <- function(data,
     Results$p.value  <- 2 * stats::pnorm(-abs(Results$estimate / Results$std.error))
 
   } else {
-    if (!requireNamespace("mice", quietly = TRUE)) stop("Package 'mice' is required to pool non-mixed models.")
+    if (!requireNamespace("mice", quietly = TRUE)) {
+      stop("Package 'mice' is required to pool non-mixed models.")
+    }
     ok_models_clean <- Filter(Negate(is.null), models_list)
     pooled <- mice::pool(ok_models_clean)
     Results <- summary(pooled, conf.int = TRUE, exponentiate = FALSE)
@@ -591,7 +711,7 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## 8) Exponentiate + flags (same as yours)
+  ## 9) Exponentiate + flags
   ## ------------------------------------------------------------
   Results$exp_estimate   <- exp(Results$estimate)
   Results$exp_CI95_lower <- exp(Results$`2.5 %`)
@@ -602,7 +722,7 @@ IPD_one_stage <- function(data,
   Results$is_polynomial  <- FALSE
 
   ## ------------------------------------------------------------
-  ## 9) Split intercept vs other terms
+  ## 10) Split intercept vs other terms
   ## ------------------------------------------------------------
   pattern_strata <- if (!is.null(stratified_intercept_var)) {
     paste0("^as\\.factor\\(", stratified_intercept_var, "\\)")
@@ -611,13 +731,17 @@ IPD_one_stage <- function(data,
   }
 
   is_intercept_row <- Results$term == "(Intercept)"
-  is_strata_row <- if (!is.null(pattern_strata)) grepl(pattern_strata, Results$term) else rep(FALSE, nrow(Results))
+  is_strata_row <- if (!is.null(pattern_strata)) {
+    grepl(pattern_strata, Results$term)
+  } else {
+    rep(FALSE, nrow(Results))
+  }
 
   Intercept_table <- Results[is_intercept_row | is_strata_row, , drop = FALSE]
   Table_no_int    <- Results[!(is_intercept_row | is_strata_row), , drop = FALSE]
 
   ## ------------------------------------------------------------
-  ## 10) Weighted intercept (same logic as yours)
+  ## 11) Weighted intercept
   ## ------------------------------------------------------------
   Weighted_intercept <- NULL
   if (isTRUE(weighted_intercept) && !is.null(stratified_intercept_var)) {
@@ -632,8 +756,11 @@ IPD_one_stage <- function(data,
 
       if (!is.null(pattern_strata)) {
         strata_coefs <- Results[grepl(pattern_strata, Results$term), c("term", "estimate"), drop = FALSE]
-        if (nrow(strata_coefs) > 0L) strata_coefs$level <- sub(pattern_strata, "", strata_coefs$term)
-        else strata_coefs <- data.frame(level = character(0), estimate = numeric(0))
+        if (nrow(strata_coefs) > 0L) {
+          strata_coefs$level <- sub(pattern_strata, "", strata_coefs$term)
+        } else {
+          strata_coefs <- data.frame(level = character(0), estimate = numeric(0))
+        }
       } else {
         strata_coefs <- data.frame(level = character(0), estimate = numeric(0))
       }
@@ -663,7 +790,7 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## 11) Performance per imputation (same as yours)
+  ## 12) Performance per imputation
   ## ------------------------------------------------------------
   performance_per_imp <- NULL
   if (isTRUE(model_performance)) {
@@ -680,7 +807,7 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## 12) Return
+  ## 13) Return
   ## ------------------------------------------------------------
   out <- list(
     table              = Table_no_int,
@@ -690,17 +817,19 @@ IPD_one_stage <- function(data,
   )
 
   class(out) <- c("IPD_one_stage", "list")
-  attr(out, "fit_log")                <- fit_log
-  attr(out, "models")                 <- models_list
-  attr(out, "performance_per_imp")    <- performance_per_imp
-  attr(out, "model_type")             <- model_type
-  attr(out, "formula")                <- formula_str
-  attr(out, "imputations")            <- actual_imps
-  attr(out, "n_imp")                  <- length(actual_imps)
-  attr(out, "has_random_effects")     <- use_random_effects
-  attr(out, "random_intercept_var")   <- random_intercept_var
+  attr(out, "fit_log")                  <- fit_log
+  attr(out, "models")                   <- models_list
+  attr(out, "performance_per_imp")      <- performance_per_imp
+  attr(out, "model_type")               <- model_type
+  attr(out, "formula")                  <- formula_str
+  attr(out, "imputations")              <- actual_imps
+  attr(out, "n_imp")                    <- length(actual_imps)
+  attr(out, "has_random_effects")       <- use_random_effects
+  attr(out, "random_intercept_var")     <- random_intercept_var
   attr(out, "stratified_intercept_var") <- stratified_intercept_var
-  attr(out, "spline_info")            <- spline_info
+  attr(out, "spline_info")              <- spline_info
+  attr(out, "parallel")                 <- parallel
+  attr(out, "n_cores")                  <- n_cores
 
   out
 }
