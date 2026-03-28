@@ -70,14 +70,14 @@
 #'
 #' @return
 #' A list of class "IPD_one_stage" with elements:
-#'   - table              : pooled fixed-effect estimates (without stratified intercept rows)
-#'   - term               : same as table$term
-#'   - Intercept          : intercept + stratified intercept rows
-#'   - Weighted_intercept : one-row data.frame with weighted intercept (if requested)
-#' and attributes:
-#'   - "fit_log", "models", "performance_per_imp", "model_type", "formula",
-#'     "imputations", "n_imp", "has_random_effects", "random_intercept_var",
-#'     "stratified_intercept_var", "spline_info".
+#'   - table                  : pooled fixed-effect estimates (without stratified intercept rows)
+#'   - term                   : same as table$term
+#'   - Intercept              : intercept + stratified intercept rows
+#'   - Weighted_intercept     : one-row data.frame with weighted intercept (if requested)
+#'   - Random_effects_per_imp : extracted random-effects parameters per imputation
+#'   - Random_effects_summary : summary of random-effects parameters across imputations
+#'   - Tau2_per_imp           : extracted tau-squared values per imputation
+#'   - Tau2_summary           : summary of tau-squared values across imputations
 #'
 #' @export
 IPD_one_stage <- function(data,
@@ -188,75 +188,155 @@ IPD_one_stage <- function(data,
   extract_random_effects_parameters <- function(model, group_var) {
     if (is.null(model) || is.null(group_var)) return(NULL)
 
-    vc_df <- tryCatch({
-      if (inherits(model, "glmmTMB")) {
-        as.data.frame(VarCorr(model)$cond)
-      } else if (inherits(model, "lmerMod") || inherits(model, "glmerMod")) {
-        as.data.frame(lme4::VarCorr(model))
-      } else {
-        NULL
+    ## -----------------------------
+    ## glmmTMB case
+    ## -----------------------------
+    if (inherits(model, "glmmTMB")) {
+      vc_obj <- tryCatch(VarCorr(model)$cond[[group_var]], error = function(e) NULL)
+      if (is.null(vc_obj)) return(NULL)
+
+      vc_mat <- as.matrix(vc_obj)
+      if (is.null(vc_mat) || nrow(vc_mat) == 0) return(NULL)
+
+      effect_names <- rownames(vc_mat)
+      if (is.null(effect_names)) effect_names <- colnames(vc_mat)
+      if (is.null(effect_names)) return(NULL)
+
+      sd_vec <- attr(vc_obj, "stddev")
+      if (is.null(sd_vec)) sd_vec <- sqrt(diag(vc_mat))
+
+      cor_mat <- attr(vc_obj, "correlation")
+      if (is.null(cor_mat)) {
+        cor_mat <- vc_mat / outer(sd_vec, sd_vec)
+        diag(cor_mat) <- 1
       }
-    }, error = function(e) NULL)
 
-    if (is.null(vc_df) || nrow(vc_df) == 0) return(NULL)
-    if (!"grp" %in% names(vc_df)) return(NULL)
+      out_list <- list()
 
-    vc_df <- vc_df[vc_df$grp == group_var, , drop = FALSE]
-    if (nrow(vc_df) == 0) return(NULL)
-
-    out_list <- list()
-
-    ## Tau² / variances + SDs
-    var_rows <- vc_df[is.na(vc_df$var2), , drop = FALSE]
-    if (nrow(var_rows) > 0) {
       out_tau2 <- data.frame(
-        parameter = paste0("tau2__", var_rows$var1),
+        parameter = paste0("tau2__", effect_names),
         component = "tau2",
-        effect    = var_rows$var1,
+        effect    = effect_names,
         effect2   = NA_character_,
-        estimate  = as.numeric(var_rows$vcov),
+        estimate  = as.numeric(diag(vc_mat)),
         stringsAsFactors = FALSE
       )
 
       out_sd <- data.frame(
-        parameter = paste0("sd__", var_rows$var1),
+        parameter = paste0("sd__", effect_names),
         component = "sd",
-        effect    = var_rows$var1,
+        effect    = effect_names,
         effect2   = NA_character_,
-        estimate  = as.numeric(var_rows$sdcor),
+        estimate  = as.numeric(sd_vec),
         stringsAsFactors = FALSE
       )
 
       out_list <- c(out_list, list(out_tau2, out_sd))
+
+      if (length(effect_names) > 1) {
+        cov_rows <- list()
+        cor_rows <- list()
+        idx <- 1
+
+        for (i in seq_len(length(effect_names) - 1)) {
+          for (j in (i + 1):length(effect_names)) {
+            cov_rows[[idx]] <- data.frame(
+              parameter = paste0("cov__", effect_names[i], "__", effect_names[j]),
+              component = "covariance",
+              effect    = effect_names[i],
+              effect2   = effect_names[j],
+              estimate  = vc_mat[i, j],
+              stringsAsFactors = FALSE
+            )
+
+            cor_rows[[idx]] <- data.frame(
+              parameter = paste0("cor__", effect_names[i], "__", effect_names[j]),
+              component = "correlation",
+              effect    = effect_names[i],
+              effect2   = effect_names[j],
+              estimate  = cor_mat[i, j],
+              stringsAsFactors = FALSE
+            )
+
+            idx <- idx + 1
+          }
+        }
+
+        out_list <- c(out_list, list(
+          do.call(rbind, cov_rows),
+          do.call(rbind, cor_rows)
+        ))
+      }
+
+      out <- do.call(rbind, out_list)
+      out$group_var <- group_var
+      return(out)
     }
 
-    ## Covariances / correlations
-    cov_rows <- vc_df[!is.na(vc_df$var2), , drop = FALSE]
-    if (nrow(cov_rows) > 0) {
-      out_cov <- data.frame(
-        parameter = paste0("cov__", cov_rows$var1, "__", cov_rows$var2),
-        component = "covariance",
-        effect    = cov_rows$var1,
-        effect2   = cov_rows$var2,
-        estimate  = as.numeric(cov_rows$vcov),
-        stringsAsFactors = FALSE
-      )
+    ## -----------------------------
+    ## lme4 case
+    ## -----------------------------
+    if (inherits(model, "lmerMod") || inherits(model, "glmerMod")) {
+      vc_df <- tryCatch(as.data.frame(lme4::VarCorr(model)), error = function(e) NULL)
+      if (is.null(vc_df) || nrow(vc_df) == 0) return(NULL)
 
-      out_cor <- data.frame(
-        parameter = paste0("cor__", cov_rows$var1, "__", cov_rows$var2),
-        component = "correlation",
-        effect    = cov_rows$var1,
-        effect2   = cov_rows$var2,
-        estimate  = as.numeric(cov_rows$sdcor),
-        stringsAsFactors = FALSE
-      )
+      vc_df <- vc_df[vc_df$grp == group_var, , drop = FALSE]
+      if (nrow(vc_df) == 0) return(NULL)
 
-      out_list <- c(out_list, list(out_cov, out_cor))
+      out_list <- list()
+
+      var_rows <- vc_df[is.na(vc_df$var2), , drop = FALSE]
+      if (nrow(var_rows) > 0) {
+        out_tau2 <- data.frame(
+          parameter = paste0("tau2__", var_rows$var1),
+          component = "tau2",
+          effect    = var_rows$var1,
+          effect2   = NA_character_,
+          estimate  = as.numeric(var_rows$vcov),
+          stringsAsFactors = FALSE
+        )
+
+        out_sd <- data.frame(
+          parameter = paste0("sd__", var_rows$var1),
+          component = "sd",
+          effect    = var_rows$var1,
+          effect2   = NA_character_,
+          estimate  = as.numeric(var_rows$sdcor),
+          stringsAsFactors = FALSE
+        )
+
+        out_list <- c(out_list, list(out_tau2, out_sd))
+      }
+
+      cov_rows <- vc_df[!is.na(vc_df$var2), , drop = FALSE]
+      if (nrow(cov_rows) > 0) {
+        out_cov <- data.frame(
+          parameter = paste0("cov__", cov_rows$var1, "__", cov_rows$var2),
+          component = "covariance",
+          effect    = cov_rows$var1,
+          effect2   = cov_rows$var2,
+          estimate  = as.numeric(cov_rows$vcov),
+          stringsAsFactors = FALSE
+        )
+
+        out_cor <- data.frame(
+          parameter = paste0("cor__", cov_rows$var1, "__", cov_rows$var2),
+          component = "correlation",
+          effect    = cov_rows$var1,
+          effect2   = cov_rows$var2,
+          estimate  = as.numeric(cov_rows$sdcor),
+          stringsAsFactors = FALSE
+        )
+
+        out_list <- c(out_list, list(out_cov, out_cor))
+      }
+
+      out <- do.call(rbind, out_list)
+      out$group_var <- group_var
+      return(out)
     }
 
-    out <- do.call(rbind, out_list)
-    out$group_var <- group_var
-    out
+    NULL
   }
 
   summarize_random_effects_parameters <- function(re_long_df) {
@@ -319,12 +399,12 @@ IPD_one_stage <- function(data,
   if (!followup_offset %in% c("Yes", "No")) stop("followup_offset must be 'Yes' or 'No'.")
 
   if (followup_offset == "Yes") {
-    if (is.null(followup_col) || !followup_col %in% names(data)) {
+    if (is.null(followup_col) || !followup_col %in% names(data))) {
       stop("followup_offset = 'Yes' but followup_col is missing or not in data.")
     }
-    if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
-      stop("followup_col must be strictly positive for offset(log(followup_col)).")
-    }
+if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
+  stop("followup_col must be strictly positive for offset(log(followup_col)).")
+}
   }
 
   if (!trial_factor %in% c("Yes", "No")) stop("trial_factor must be 'Yes' or 'No'.")
@@ -556,7 +636,7 @@ IPD_one_stage <- function(data,
   model_formula <- stats::as.formula(formula_str)
 
   ## ------------------------------------------------------------
-  ## 6) Fit one imputation
+  ## 6) Helper: fit one imputation
   ## ------------------------------------------------------------
   fit_one_imputation <- function(i,
                                  implist,
@@ -659,7 +739,7 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## 7) Fit per imputation
+  ## 7) Fit per imputation (sequential or parallel)
   ## ------------------------------------------------------------
   models_list <- vector("list", length(actual_imps))
   names(models_list) <- paste0("imp_", actual_imps)
@@ -739,7 +819,7 @@ IPD_one_stage <- function(data,
   for (i in seq_along(fit_results)) {
     res <- fit_results[[i]]
     fit_log$ok[fit_log$imp == res$imp]    <- res$ok
-    fit_log$error[fit_log$imp == res$imp] <- res$error
+    fit_log$error[fit_log$imp == res$error] <- res$error
     models_list[[i]] <- res$model
   }
 
