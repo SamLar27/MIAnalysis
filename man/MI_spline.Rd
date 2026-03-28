@@ -2,7 +2,7 @@
 % Please edit documentation in R/MI_spline.R
 \name{MI_spline}
 \alias{MI_spline}
-\title{Create Spline Plots from Multiple Imputed Data (with Random Effects Support)}
+\title{Create Spline Plots from Multiple Imputed Data (with Random Effects & Group Fits)}
 \usage{
 MI_spline(
   data,
@@ -10,7 +10,8 @@ MI_spline(
   variable_x,
   subgroups = NULL,
   covariables = NULL,
-  knot_n = 4,
+  spline_knots_n = 4,
+  spline_knots_percentile = NULL,
   imp_col = ".imp",
   MI_method = "first",
   model_type = "nb",
@@ -22,67 +23,91 @@ MI_spline(
   event_col = NULL,
   random_intercept = "No",
   random_intercept_var = NULL,
-  plot_options = NULL,
-  subgroup_as_factor = TRUE,
-  subgroup_labels = NULL,
+  random_slope = "No",
+  predictor_vars_random_slope = NULL,
+  covariables_random_slope = NULL,
   prediction_range = c(0.01, 0.99),
   calculate_derivatives = FALSE,
   derivative_points = NULL,
-  derivative_method = "basis"
+  plot_options = NULL,
+  group_fits = FALSE
 )
 }
 \arguments{
-\item{data}{A data frame containing the imputed dataset.}
+\item{data}{Data frame containing all imputations.}
 
-\item{outcome_var}{The dependent variable for the model.}
+\item{outcome_var}{Name of outcome variable (string).}
 
-\item{variable_x}{The continuous predictor variable to be modeled with splines.}
+\item{variable_x}{Continuous predictor modelled with rcs().}
 
-\item{subgroups}{Optional variable for stratification (default is NULL).}
+\item{subgroups}{Optional subgroup variable for interaction with spline.}
 
-\item{covariables}{Optional vector of covariates to adjust for.}
+\item{covariables}{Optional vector of additional covariates (strings). Can contain
+interaction terms like "A*B".}
 
-\item{knot_n}{Number of knots for the restricted cubic spline (default is 4).}
+\item{imp_col}{Column name with imputation index (default ".imp").}
 
-\item{imp_col}{The column name indicating imputation indices (default is ".imp").}
+\item{MI_method}{"first", "average", or "Rubin".}
 
-\item{MI_method}{Method for using multiply imputed data: "first" (use only first imputation), "average" (average predictions and variances separately), or "Rubin" (pool predictions using Rubin's rules for total variance).}
+\item{model_type}{"nb", "poisson", "logistic", "lm", or "cox".}
 
-\item{model_type}{The model type: "nb" for Negative Binomial, "poisson" for Poisson, "cox" for Cox, or "logistic" for Logistic.}
+\item{followup_offset}{"Yes"/"No" for offset(log(followup_col)) in count models.}
 
-\item{followup_offset}{Whether to include offset for follow-up duration ("Yes" or "No").}
+\item{followup_col}{Name of follow-up time column (required if offset = "Yes").}
 
-\item{followup_col}{The column representing follow-up duration (required if followup_offset = "Yes").}
+\item{trial_factor}{"Yes"/"No": add trial as fixed factor.}
 
-\item{trial_factor}{Whether to include trial as a factor ("Yes" or "No").}
+\item{trial_col}{Trial factor name (required if trial_factor = "Yes").}
 
-\item{trial_col}{The column for trial factor adjustment (required if trial_factor = "Yes").}
+\item{time_col}{Time variable for Cox models.}
 
-\item{time_col}{The time variable for Cox regression (only required if model_type = "cox").}
+\item{event_col}{Event variable for Cox models.}
 
-\item{event_col}{The event variable for Cox regression (only required if model_type = "cox").}
+\item{random_intercept}{"Yes"/"No" for random intercept.}
 
-\item{random_intercept}{Whether to include a random intercept in the model ("Yes" or "No").}
+\item{random_intercept_var}{Grouping variable for random effects.}
 
-\item{random_intercept_var}{The grouping variable for the random intercept (required if random_intercept = "Yes").}
+\item{random_slope}{"Yes"/"No" for random slopes.}
 
-\item{plot_options}{List of options for plot customization.}
+\item{predictor_vars_random_slope}{Variables with random slopes (character vector).}
 
-\item{subgroup_as_factor}{Whether to convert subgroups to factors (default is TRUE).}
+\item{covariables_random_slope}{Additional covariates with random slopes.}
 
-\item{subgroup_labels}{Optional labels for subgroup levels.}
+\item{prediction_range}{Quantiles for x-range (default c(0.01, 0.99)).}
 
-\item{prediction_range}{Range for predictions as quantiles (default is c(0.01, 0.99)).}
+\item{calculate_derivatives}{Whether to compute derivatives (default FALSE).}
 
-\item{calculate_derivatives}{Whether to calculate derivatives of the predictions (default is FALSE).}
+\item{derivative_points}{Optional explicit x-values for derivatives.}
 
-\item{derivative_points}{Optional specific points to calculate derivatives at.}
+\item{plot_options}{List of ggplot options.}
+
+\item{group_fits}{If TRUE, refit independent models per group (e.g. per trial)
+using the same global knots; returns spline per group.}
+
+\item{knot_n}{Number of knots for rcs (default 4).}
+
+\item{subgroup_as_factor}{Convert subgroups to factor (default TRUE).}
+
+\item{subgroup_labels}{Optional custom labels for subgroup levels.}
+
+\item{derivative_method}{Currently ignored; numeric finite-difference is used.}
 }
 \value{
-A list containing predictions, model object, plot, and optionally derivatives and thresholds.
+A list with:
+\itemize{
+\item predictions: prediction data for population curve
+\item model: fitted global model
+\item plot: ggplot object for population curve
+\item plot_data: same as predictions
+\item prediction_range_values: numeric range used for x
+\item derivatives: derivative data (if requested)
+\item derivative_plot: reserved (currently NULL)
+\item threshold: approximate threshold where derivative CI>0 (if requested)
+\item group_fits: data frame of trial-specific fits (if group_fits = TRUE)
+}
 }
 \description{
-This function fits restricted cubic spline models to multiply imputed datasets and creates
-visualization of the relationships between a continuous predictor and an outcome, with optional
-stratification by subgroups. The function now supports random effects models.
+Fits restricted cubic spline models to multiply imputed datasets and creates
+visualizations of the relationship between a continuous predictor and the outcome,
+with optional random effects and trial-specific "group_fits".
 }
