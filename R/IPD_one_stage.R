@@ -182,6 +182,104 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
+  ## NEW helpers: extract random-effects variability parameters
+  ## ------------------------------------------------------------
+
+  extract_random_effects_parameters <- function(model, group_var) {
+    if (is.null(model) || is.null(group_var)) return(NULL)
+
+    vc_df <- tryCatch({
+      if (inherits(model, "glmmTMB")) {
+        as.data.frame(VarCorr(model)$cond)
+      } else if (inherits(model, "lmerMod") || inherits(model, "glmerMod")) {
+        as.data.frame(lme4::VarCorr(model))
+      } else {
+        NULL
+      }
+    }, error = function(e) NULL)
+
+    if (is.null(vc_df) || nrow(vc_df) == 0) return(NULL)
+    if (!"grp" %in% names(vc_df)) return(NULL)
+
+    vc_df <- vc_df[vc_df$grp == group_var, , drop = FALSE]
+    if (nrow(vc_df) == 0) return(NULL)
+
+    out_list <- list()
+
+    ## Variances / SDs
+    var_rows <- vc_df[is.na(vc_df$var2), , drop = FALSE]
+    if (nrow(var_rows) > 0) {
+      out_var <- data.frame(
+        parameter = paste0("var__", var_rows$var1),
+        component = "variance",
+        effect    = var_rows$var1,
+        effect2   = NA_character_,
+        estimate  = as.numeric(var_rows$vcov),
+        stringsAsFactors = FALSE
+      )
+      out_sd <- data.frame(
+        parameter = paste0("sd__", var_rows$var1),
+        component = "sd",
+        effect    = var_rows$var1,
+        effect2   = NA_character_,
+        estimate  = as.numeric(var_rows$sdcor),
+        stringsAsFactors = FALSE
+      )
+      out_list <- c(out_list, list(out_var, out_sd))
+    }
+
+    ## Covariances / correlations
+    cov_rows <- vc_df[!is.na(vc_df$var2), , drop = FALSE]
+    if (nrow(cov_rows) > 0) {
+      out_cov <- data.frame(
+        parameter = paste0("cov__", cov_rows$var1, "__", cov_rows$var2),
+        component = "covariance",
+        effect    = cov_rows$var1,
+        effect2   = cov_rows$var2,
+        estimate  = as.numeric(cov_rows$vcov),
+        stringsAsFactors = FALSE
+      )
+      out_cor <- data.frame(
+        parameter = paste0("cor__", cov_rows$var1, "__", cov_rows$var2),
+        component = "correlation",
+        effect    = cov_rows$var1,
+        effect2   = cov_rows$var2,
+        estimate  = as.numeric(cov_rows$sdcor),
+        stringsAsFactors = FALSE
+      )
+      out_list <- c(out_list, list(out_cov, out_cor))
+    }
+
+    out <- do.call(rbind, out_list)
+    out$group_var <- group_var
+    out
+  }
+
+  summarize_random_effects_parameters <- function(re_long_df) {
+    if (is.null(re_long_df) || nrow(re_long_df) == 0) return(NULL)
+
+    split_list <- split(re_long_df, re_long_df$parameter)
+
+    summary_list <- lapply(split_list, function(df) {
+      data.frame(
+        group_var  = unique(df$group_var)[1],
+        parameter  = unique(df$parameter)[1],
+        component  = unique(df$component)[1],
+        effect     = unique(df$effect)[1],
+        effect2    = unique(df$effect2)[1],
+        n_imp      = sum(!is.na(df$estimate)),
+        mean       = mean(df$estimate, na.rm = TRUE),
+        median     = stats::median(df$estimate, na.rm = TRUE),
+        min        = min(df$estimate, na.rm = TRUE),
+        max        = max(df$estimate, na.rm = TRUE),
+        stringsAsFactors = FALSE
+      )
+    })
+
+    do.call(rbind, summary_list)
+  }
+
+  ## ------------------------------------------------------------
   ## Basic checks
   ## ------------------------------------------------------------
   if (!is.data.frame(data)) stop("data must be a data.frame.")
@@ -240,7 +338,7 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## 2) Global spline info (knots on full stacked data)
+  ## 2) Global spline info
   ## ------------------------------------------------------------
   spline_info <- NULL
   if (!is.null(spline_terms)) {
@@ -311,18 +409,18 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## 3) Expand rhs_main_terms with interactions + spline basis
+  ## 3) Expand fixed terms
   ## ------------------------------------------------------------
   rhs_main_terms <- expand_terms_vec(c(predictor_vars, covariables), spline_info)
 
   ## ------------------------------------------------------------
-  ## 4) Expand random slopes w.r.t. interactions + spline basis
+  ## 4) Expand random slopes
   ## ------------------------------------------------------------
   predictor_vars_random_slope_exp <- expand_terms_vec(predictor_vars_random_slope, spline_info)
   covariables_random_slope_exp    <- expand_terms_vec(covariables_random_slope, spline_info)
 
   ## ------------------------------------------------------------
-  ## 5) Build formula (fixed + random parts)
+  ## 5) Build formula
   ## ------------------------------------------------------------
   trial_term <- if (trial_factor == "Yes") paste0("+ as.factor(", trial_col, ")") else ""
 
@@ -427,7 +525,7 @@ IPD_one_stage <- function(data,
   model_formula <- stats::as.formula(formula_str)
 
   ## ------------------------------------------------------------
-  ## 6) Helper: fit one imputation
+  ## 6) Fit one imputation
   ## ------------------------------------------------------------
   fit_one_imputation <- function(i,
                                  implist,
@@ -530,7 +628,7 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## 7) Fit per imputation (sequential or parallel)
+  ## 7) Fit per imputation
   ## ------------------------------------------------------------
   models_list <- vector("list", length(actual_imps))
   names(models_list) <- paste0("imp_", actual_imps)
@@ -566,10 +664,6 @@ IPD_one_stage <- function(data,
 
       cl <- parallel::makeCluster(n_cores)
       on.exit(parallel::stopCluster(cl), add = TRUE)
-
-      parallel::clusterEvalQ(cl, {
-        NULL
-      })
 
       parallel::clusterExport(
         cl,
@@ -626,7 +720,7 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## 8) Pool coefficients across imputations
+  ## 8) Pool fixed coefficients across imputations
   ## ------------------------------------------------------------
   if (use_random_effects) {
 
@@ -708,6 +802,38 @@ IPD_one_stage <- function(data,
     Results <- summary(pooled, conf.int = TRUE, exponentiate = FALSE)
     if (!"term" %in% names(Results)) Results$term <- rownames(Results)
     Results <- Results[, c("term", "estimate", "std.error", "2.5 %", "97.5 %", "p.value")]
+  }
+
+  ## ------------------------------------------------------------
+  ## 8b) NEW: extract random-effects variability parameters
+  ## ------------------------------------------------------------
+  Random_effects_per_imp <- NULL
+  Random_effects_summary <- NULL
+
+  if (use_random_effects && model_type != "cox") {
+    re_list <- lapply(seq_along(models_list), function(i) {
+      m <- models_list[[i]]
+      if (is.null(m)) return(NULL)
+
+      re_df <- extract_random_effects_parameters(
+        model = m,
+        group_var = random_intercept_var
+      )
+
+      if (is.null(re_df) || nrow(re_df) == 0) return(NULL)
+
+      re_df$imp <- actual_imps[i]
+      re_df
+    })
+
+    re_list <- Filter(Negate(is.null), re_list)
+
+    if (length(re_list) > 0) {
+      Random_effects_per_imp <- do.call(rbind, re_list)
+      rownames(Random_effects_per_imp) <- NULL
+      Random_effects_summary <- summarize_random_effects_parameters(Random_effects_per_imp)
+      rownames(Random_effects_summary) <- NULL
+    }
   }
 
   ## ------------------------------------------------------------
@@ -810,10 +936,12 @@ IPD_one_stage <- function(data,
   ## 13) Return
   ## ------------------------------------------------------------
   out <- list(
-    table              = Table_no_int,
-    term               = Table_no_int$term,
-    Intercept          = Intercept_table,
-    Weighted_intercept = Weighted_intercept
+    table                  = Table_no_int,
+    term                   = Table_no_int$term,
+    Intercept              = Intercept_table,
+    Weighted_intercept     = Weighted_intercept,
+    Random_effects_per_imp = Random_effects_per_imp,
+    Random_effects_summary = Random_effects_summary
   )
 
   class(out) <- c("IPD_one_stage", "list")
@@ -833,4 +961,3 @@ IPD_one_stage <- function(data,
 
   out
 }
-
