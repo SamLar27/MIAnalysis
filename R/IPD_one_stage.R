@@ -39,6 +39,13 @@
 #'   - On Unix/macOS/Linux, uses `parallel::mclapply()`.
 #'   - On Windows, uses `parallel::parLapply()` with a PSOCK cluster.
 #'
+#' Estimation method:
+#'   - `estimation_method = "REML"` or `"ML"` is only applicable to Gaussian
+#'     mixed models (`model_type = "lm"` with random effects), where it is passed
+#'     to `lme4::lmer(REML = ...)`.
+#'   - For other model types (`glmer`, `glmmTMB`, `coxme`), the model is fit
+#'     with the package's default likelihood-based method.
+#'
 #' @param data Data frame with all imputations stacked.
 #' @param outcome_var Dependent variable (for non-Cox models).
 #' @param predictor_vars Character vector of predictors to be included as fixed effects.
@@ -65,6 +72,8 @@
 #' @param model_performance Logical; if TRUE, compute model performance via `performance::model_performance()`.
 #' @param weighted_intercept Logical; if TRUE and `stratified_intercept_var` is not NULL,
 #'   computes a single weighted intercept across strata.
+#' @param estimation_method Character string: `"ML"` or `"REML"`.
+#'   Only used for Gaussian mixed models (`model_type = "lm"` with random effects).
 #' @param parallel Logical; if TRUE, fit imputations in parallel.
 #' @param n_cores Number of cores for parallel fitting. If NULL, defaults to detectCores() - 1.
 #'
@@ -78,6 +87,12 @@
 #'   - Random_effects_summary : summary of random-effects parameters across imputations
 #'   - Tau2_per_imp           : extracted tau-squared values per imputation
 #'   - Tau2_summary           : summary of tau-squared values across imputations
+#'
+#' and attributes:
+#'   - "fit_log", "models", "performance_per_imp", "model_type", "formula",
+#'     "imputations", "n_imp", "has_random_effects", "random_intercept_var",
+#'     "stratified_intercept_var", "spline_info", "parallel", "n_cores",
+#'     "estimation_method"
 #'
 #' @export
 IPD_one_stage <- function(data,
@@ -104,10 +119,13 @@ IPD_one_stage <- function(data,
                           stratified_intercept_var = NULL,
                           model_performance = FALSE,
                           weighted_intercept = FALSE,
+                          estimation_method = c("ML", "REML"),
                           parallel = FALSE,
                           n_cores = NULL) {
 
   `%||%` <- function(a, b) if (!is.null(a)) a else b
+
+  estimation_method <- match.arg(estimation_method)
 
   ## ------------------------------------------------------------
   ## Helpers for interactions
@@ -399,12 +417,12 @@ IPD_one_stage <- function(data,
   if (!followup_offset %in% c("Yes", "No")) stop("followup_offset must be 'Yes' or 'No'.")
 
   if (followup_offset == "Yes") {
-    if (is.null(followup_col) || !followup_col %in% names(data))) {
+    if (is.null(followup_col) || !followup_col %in% names(data)) {
       stop("followup_offset = 'Yes' but followup_col is missing or not in data.")
     }
-if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
-  stop("followup_col must be strictly positive for offset(log(followup_col)).")
-}
+    if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
+      stop("followup_col must be strictly positive for offset(log(followup_col)).")
+    }
   }
 
   if (!trial_factor %in% c("Yes", "No")) stop("trial_factor must be 'Yes' or 'No'.")
@@ -428,6 +446,13 @@ if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
   }
 
   use_random_effects <- !is.null(random_intercept_var)
+
+  if (use_random_effects && model_type != "lm" && identical(estimation_method, "REML")) {
+    warning(
+      "estimation_method = 'REML' is only applicable to Gaussian mixed models (model_type = 'lm'). ",
+      "For model_type = '", model_type, "', the model will be fit with its default method."
+    )
+  }
 
   ## ------------------------------------------------------------
   ## 1) Prepare imputation list
@@ -644,7 +669,8 @@ if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
                                  spline_info,
                                  use_random_effects,
                                  model_type,
-                                 model_formula) {
+                                 model_formula,
+                                 estimation_method) {
 
     dat_i   <- implist[[i]]
     imp_val <- actual_imps[i]
@@ -671,7 +697,11 @@ if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
           if (!requireNamespace("lme4", quietly = TRUE)) {
             stop("Package 'lme4' is required for lm with random effects.")
           }
-          lme4::lmer(model_formula, data = dat_i)
+          lme4::lmer(
+            model_formula,
+            data = dat_i,
+            REML = identical(estimation_method, "REML")
+          )
 
         } else if (model_type %in% c("bin")) {
           if (!requireNamespace("lme4", quietly = TRUE)) {
@@ -766,7 +796,8 @@ if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
       spline_info = spline_info,
       use_random_effects = use_random_effects,
       model_type = model_type,
-      model_formula = model_formula
+      model_formula = model_formula,
+      estimation_method = estimation_method
     )
 
   } else {
@@ -784,6 +815,7 @@ if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
                     "use_random_effects",
                     "model_type",
                     "model_formula",
+                    "estimation_method",
                     "fit_one_imputation"),
         envir = environment()
       )
@@ -797,7 +829,8 @@ if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
         spline_info = spline_info,
         use_random_effects = use_random_effects,
         model_type = model_type,
-        model_formula = model_formula
+        model_formula = model_formula,
+        estimation_method = estimation_method
       )
 
     } else {
@@ -811,6 +844,7 @@ if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
         use_random_effects = use_random_effects,
         model_type = model_type,
         model_formula = model_formula,
+        estimation_method = estimation_method,
         mc.cores = n_cores
       )
     }
@@ -819,7 +853,7 @@ if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
   for (i in seq_along(fit_results)) {
     res <- fit_results[[i]]
     fit_log$ok[fit_log$imp == res$imp]    <- res$ok
-    fit_log$error[fit_log$imp == res$error] <- res$error
+    fit_log$error[fit_log$imp == res$imp] <- res$error
     models_list[[i]] <- res$model
   }
 
@@ -1084,6 +1118,7 @@ if (any(data[[followup_col]] <= 0, na.rm = TRUE)) {
   attr(out, "spline_info")              <- spline_info
   attr(out, "parallel")                 <- parallel
   attr(out, "n_cores")                  <- n_cores
+  attr(out, "estimation_method")        <- estimation_method
 
   out
 }
