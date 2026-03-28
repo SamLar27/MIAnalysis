@@ -833,3 +833,4 @@ IPD_one_stage <- function(data,
 
   out
 }
+
