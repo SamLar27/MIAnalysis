@@ -182,7 +182,7 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## NEW helpers: extract random-effects variability parameters
+  ## Helpers for random-effects extraction
   ## ------------------------------------------------------------
 
   extract_random_effects_parameters <- function(model, group_var) {
@@ -206,17 +206,18 @@ IPD_one_stage <- function(data,
 
     out_list <- list()
 
-    ## Variances / SDs
+    ## Tau² / variances + SDs
     var_rows <- vc_df[is.na(vc_df$var2), , drop = FALSE]
     if (nrow(var_rows) > 0) {
-      out_var <- data.frame(
-        parameter = paste0("var__", var_rows$var1),
-        component = "variance",
+      out_tau2 <- data.frame(
+        parameter = paste0("tau2__", var_rows$var1),
+        component = "tau2",
         effect    = var_rows$var1,
         effect2   = NA_character_,
         estimate  = as.numeric(var_rows$vcov),
         stringsAsFactors = FALSE
       )
+
       out_sd <- data.frame(
         parameter = paste0("sd__", var_rows$var1),
         component = "sd",
@@ -225,7 +226,8 @@ IPD_one_stage <- function(data,
         estimate  = as.numeric(var_rows$sdcor),
         stringsAsFactors = FALSE
       )
-      out_list <- c(out_list, list(out_var, out_sd))
+
+      out_list <- c(out_list, list(out_tau2, out_sd))
     }
 
     ## Covariances / correlations
@@ -239,6 +241,7 @@ IPD_one_stage <- function(data,
         estimate  = as.numeric(cov_rows$vcov),
         stringsAsFactors = FALSE
       )
+
       out_cor <- data.frame(
         parameter = paste0("cor__", cov_rows$var1, "__", cov_rows$var2),
         component = "correlation",
@@ -247,6 +250,7 @@ IPD_one_stage <- function(data,
         estimate  = as.numeric(cov_rows$sdcor),
         stringsAsFactors = FALSE
       )
+
       out_list <- c(out_list, list(out_cov, out_cor))
     }
 
@@ -277,6 +281,33 @@ IPD_one_stage <- function(data,
     })
 
     do.call(rbind, summary_list)
+  }
+
+  summarize_tau2_parameters <- function(re_long_df) {
+    if (is.null(re_long_df) || nrow(re_long_df) == 0) return(NULL)
+
+    tau2_df <- re_long_df[re_long_df$component == "tau2", , drop = FALSE]
+    if (nrow(tau2_df) == 0) return(NULL)
+
+    split_list <- split(tau2_df, tau2_df$parameter)
+
+    summary_list <- lapply(split_list, function(df) {
+      data.frame(
+        group_var   = unique(df$group_var)[1],
+        parameter   = unique(df$parameter)[1],
+        effect      = unique(df$effect)[1],
+        n_imp       = sum(!is.na(df$estimate)),
+        mean_tau2   = mean(df$estimate, na.rm = TRUE),
+        median_tau2 = stats::median(df$estimate, na.rm = TRUE),
+        min_tau2    = min(df$estimate, na.rm = TRUE),
+        max_tau2    = max(df$estimate, na.rm = TRUE),
+        stringsAsFactors = FALSE
+      )
+    })
+
+    out <- do.call(rbind, summary_list)
+    rownames(out) <- NULL
+    out
   }
 
   ## ------------------------------------------------------------
@@ -805,10 +836,12 @@ IPD_one_stage <- function(data,
   }
 
   ## ------------------------------------------------------------
-  ## 8b) NEW: extract random-effects variability parameters
+  ## 8b) Extract random-effects parameters + tau²
   ## ------------------------------------------------------------
   Random_effects_per_imp <- NULL
   Random_effects_summary <- NULL
+  Tau2_per_imp <- NULL
+  Tau2_summary <- NULL
 
   if (use_random_effects && model_type != "cox") {
     re_list <- lapply(seq_along(models_list), function(i) {
@@ -831,8 +864,19 @@ IPD_one_stage <- function(data,
     if (length(re_list) > 0) {
       Random_effects_per_imp <- do.call(rbind, re_list)
       rownames(Random_effects_per_imp) <- NULL
+
       Random_effects_summary <- summarize_random_effects_parameters(Random_effects_per_imp)
       rownames(Random_effects_summary) <- NULL
+
+      Tau2_per_imp <- Random_effects_per_imp[
+        Random_effects_per_imp$component == "tau2",
+        c("imp", "group_var", "parameter", "effect", "estimate"),
+        drop = FALSE
+      ]
+      rownames(Tau2_per_imp) <- NULL
+      names(Tau2_per_imp)[names(Tau2_per_imp) == "estimate"] <- "tau2"
+
+      Tau2_summary <- summarize_tau2_parameters(Random_effects_per_imp)
     }
   }
 
@@ -941,7 +985,9 @@ IPD_one_stage <- function(data,
     Intercept              = Intercept_table,
     Weighted_intercept     = Weighted_intercept,
     Random_effects_per_imp = Random_effects_per_imp,
-    Random_effects_summary = Random_effects_summary
+    Random_effects_summary = Random_effects_summary,
+    Tau2_per_imp           = Tau2_per_imp,
+    Tau2_summary           = Tau2_summary
   )
 
   class(out) <- c("IPD_one_stage", "list")
